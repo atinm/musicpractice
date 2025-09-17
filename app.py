@@ -42,6 +42,16 @@ class WaveformView(QtWidgets.QWidget):
         self.timer.setInterval(33)  # ~30 FPS
         self.timer.timeout.connect(self.update)
         self.timer.start()
+        # Interaction geometry & multi-loop scaffolding (safe if unused)
+        self.HANDLE_PX = 6
+        self.FLAG_W = 10
+        self.FLAG_H = 10
+        self.saved_loops = []            # optional: list of dicts {id,a,b,label}
+        self.selected_loop_id = None
+        # drag state
+        self._press_kind = None          # 'new' | 'flag' | 'edgeA' | 'edgeB' | None
+        self._press_loop_id = None
+        self._press_dx = 0.0             # offset used when moving a loop via flag
 
     def set_beats(self, beats: list | None, bars: list | None):
         self.beats = beats or []
@@ -73,6 +83,37 @@ class WaveformView(QtWidgets.QWidget):
     def set_snap_enabled(self, enabled: bool):
         self.snap_enabled = bool(enabled)
         self.update()
+
+    def _x_from_time(self, t: float, t0: float, t1: float, w: int) -> int:
+        """Convert time to pixel column, clamped to [0, w-1]."""
+        return int(max(0, min(w - 1, (t - t0) / (t1 - t0) * w)))
+
+    def _hit_test(self, pos: QtCore.QPoint, t0: float, t1: float, w: int, wf_h: int):
+        """Return (kind, loop_id) if hit on a flag or edge."""
+        x = pos.x()
+        y = pos.y()
+        flag_top = -2 - self.FLAG_H
+        if hasattr(self, 'saved_loops'):
+            for L in self.saved_loops:
+                a = float(L['a'])
+                b = float(L['b'])
+                fx = self._x_from_time(a, t0, t1, w)
+                # START flag hit-test
+                if abs(x - fx) <= self.FLAG_W and y <= wf_h and y >= flag_top:
+                    return ("flag", int(L['id']))
+                # END flag hit-test (acts like grabbing edgeB for resize)
+                fxb = self._x_from_time(b, t0, t1, w)
+                if abs(x - fxb) <= self.FLAG_W and y <= wf_h and y >= flag_top:
+                    return ("edgeB", int(L['id']))
+                # edge hit zones (within waveform)
+                if 0 <= y <= wf_h:
+                    xa = self._x_from_time(a, t0, t1, w)
+                    xb = self._x_from_time(b, t0, t1, w)
+                    if abs(x - xa) <= self.HANDLE_PX:
+                        return ("edgeA", int(L['id']))
+                    if abs(x - xb) <= self.HANDLE_PX:
+                        return ("edgeB", int(L['id']))
+        return (None, None)
 
     def _time_at_x(self, x: int, t0: float, t1: float, w: int) -> float:
         x = max(0, min(w - 1, x))
@@ -134,45 +175,74 @@ class WaveformView(QtWidgets.QWidget):
         if not self.player:
             return
         t0, t1 = self._current_window()
-        t = self._time_at_x(int(e.position().x()), t0, t1, self.width())
+        w = self.width(); h = self.height(); wf_h = int(h * 0.7)
+        kind, lid = self._hit_test(e.position().toPoint(), t0, t1, w, wf_h)
+        t = self._time_at_x(int(e.position().x()), t0, t1, w)
         self._press_t = t
-        # start a new loop at this position
-        self.set_loop_visual(t, t)
+        if kind is None:
+            # start a new loop by drag in empty space
+            self._press_kind = 'new'
+            self._press_loop_id = None
+            self.set_loop_visual(t, t)
+        else:
+            # grabbed an existing loop handle/flag
+            self._press_kind = kind
+            self._press_loop_id = lid
+            # Preview edit by setting visual loop to the grabbed loop's extents
+            L = next((x for x in self.saved_loops if x.get('id') == lid), None)
+            if L is not None:
+                a = float(min(L['a'], L['b'])); b = float(max(L['a'], L['b']))
+                self.set_loop_visual(a, b)
+                if kind == 'flag':
+                    # moving whole loop: store offset from mouse to loop start
+                    self._press_dx = t - a
         e.accept()
 
     def mouseMoveEvent(self, e: QtGui.QMouseEvent):
         if not self.player or self._press_t is None:
             return
-        t0, t1 = self._current_window()
-        t = self._time_at_x(int(e.position().x()), t0, t1, self.width())
-        a = min(self._press_t, t)
-        b = max(self._press_t, t)
-        if b - a < 0.01:
-            b = a + 0.01
-        self.set_loop_visual(a, b)
+        t0, t1 = self._current_window(); w = self.width(); h = self.height()
+        t = self._time_at_x(int(e.position().x()), t0, t1, w)
+        if self._press_kind == 'new':
+            a = min(self._press_t, t); b = max(self._press_t, t)
+            if b - a < 0.01: b = a + 0.01
+            self.set_loop_visual(a, b)
+        elif self._press_kind in ('edgeA', 'edgeB', 'flag') and self._press_loop_id is not None:
+            L = next((x for x in self.saved_loops if x.get('id') == self._press_loop_id), None)
+            if L is None:
+                return
+            a = float(min(L['a'], L['b'])); b = float(max(L['a'], L['b']))
+            if self._press_kind == 'edgeA':
+                a = min(t, b - 0.01)
+            elif self._press_kind == 'edgeB':
+                b = max(t, a + 0.01)
+            elif self._press_kind == 'flag':
+                width = b - a
+                a = max(0.0, t - self._press_dx)
+                b = a + width
+            self.set_loop_visual(a, b)
         e.accept()
 
     def mouseReleaseEvent(self, e: QtGui.QMouseEvent):
         if self._press_t is None or self.loopA is None or self.loopB is None:
-            self._press_t = None
+            # reset
+            self._press_kind = None; self._press_loop_id = None; self._press_t = None
             return
-        a = float(min(self.loopA, self.loopB))
-        b = float(max(self.loopA, self.loopB))
-        # Snap A/B to nearest beats if available
+        a = float(min(self.loopA, self.loopB)); b = float(max(self.loopA, self.loopB))
+        # Optional snap to beats
         if self.beats and self.snap_enabled:
             arr = np.asarray(self.beats, dtype=float)
             ia = int(np.argmin(np.abs(arr - a)))
             ib = int(np.argmin(np.abs(arr - b)))
             a_s = float(arr[min(ia, len(arr) - 1)])
             b_s = float(arr[min(ib, len(arr) - 1)])
-            if b_s < a_s:
-                a_s, b_s = b_s, a_s
-            # ensure non-zero loop
-            if abs(b_s - a_s) < 1e-3:
-                b_s = a_s + 1e-2
+            if b_s < a_s: a_s, b_s = b_s, a_s
+            if abs(b_s - a_s) < 1e-3: b_s = a_s + 1e-2
             a, b = a_s, b_s
+        # Commit by telling Main to set the active loop (works for new or edited)
         self.requestSetLoop.emit(a, b)
-        self._press_t = None
+        # reset
+        self._press_kind = None; self._press_loop_id = None; self._press_t = None
         e.accept()
 
     def wheelEvent(self, e: QtGui.QWheelEvent):
@@ -329,6 +399,31 @@ class WaveformView(QtWidgets.QWidget):
                 p.drawRect(rect)
                 p.setPen(QtGui.QPen(QtGui.QColor(230, 230, 230)))
                 p.drawText(rect.adjusted(4, 0, -4, 0), Qt.AlignVCenter | Qt.AlignLeft, seg['label'])
+
+        # Draw saved loops and flags (start and end)
+        if hasattr(self, 'saved_loops'):
+            flag_top = -2 - self.FLAG_H
+            for L in self.saved_loops:
+                a = float(L['a'])
+                b = float(L['b'])
+                x0 = self._x_from_time(a, t0, t1, w)
+                x1 = self._x_from_time(b, t0, t1, w)
+                # flag at start
+                flag_poly = QtGui.QPolygon([
+                    QtCore.QPoint(x0, -2),
+                    QtCore.QPoint(x0 - self.FLAG_W//2, -2 - self.FLAG_H),
+                    QtCore.QPoint(x0 + self.FLAG_W//2, -2 - self.FLAG_H),
+                ])
+                p.setBrush(QtGui.QColor(120, 170, 220))
+                p.drawPolygon(flag_poly)
+                # flag at end
+                flag_poly_b = QtGui.QPolygon([
+                    QtCore.QPoint(x1, -2),
+                    QtCore.QPoint(x1 - self.FLAG_W//2, -2 - self.FLAG_H),
+                    QtCore.QPoint(x1 + self.FLAG_W//2, -2 - self.FLAG_H),
+                ])
+                p.setBrush(QtGui.QColor(120, 170, 220))
+                p.drawPolygon(flag_poly_b)
 
 
 class ChordWorker(QThread):
