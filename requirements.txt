@@ -1,0 +1,9 @@
+numpy
+scipy
+librosa
+sounddevice
+torch==2.*          # optional; CPU okay (Demucs still works, slower)
+demucs
+PySide6
+tqdm
+ffmpeg-python
