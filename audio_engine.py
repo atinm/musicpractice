@@ -123,6 +123,22 @@ class LoopPlayer:
         with self.lock:
             return self.pos / float(self.sr)
 
+    def duration_seconds(self) -> float:
+        """Total duration of the loaded buffer in seconds."""
+        return self.n / float(self.sr)
+
+    def set_position_seconds(self, t: float, within_loop: bool = True):
+        """Seek playback position to time `t` seconds.
+        If `within_loop` is True, clamp to the current loop [lo, hi), else clamp to full buffer.
+        """
+        if within_loop:
+            lo, hi = self.lo, self.hi
+        else:
+            lo, hi = 0, self.n
+        with self.lock:
+            sample = int(round(max(lo, min(hi - 1, t * self.sr))))
+            self.pos = sample
+
     def _cb(self, outdata, frames, time, status):
         if status:
             pass
