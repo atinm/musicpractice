@@ -1307,7 +1307,55 @@ class Main(QtWidgets.QMainWindow):
 
     # === Actions ===
     def _rate_changed(self, val: float):
-        self.rate_label.setText(f"Rate: {val:.2f}x")
+        """Update playback rate on the player and keep the UI/transport coherent."""
+        try:
+            r = float(val)
+        except Exception:
+            r = 1.0
+        # Clamp to supported range
+        r = max(0.5, min(1.5, r))
+        # Update label
+        if hasattr(self, 'rate_label') and self.rate_label is not None:
+            self.rate_label.setText(f"Rate: {r:.2f}x")
+        # Apply to player
+        if getattr(self, 'player', None) and hasattr(self.player, 'set_rate'):
+            ok = self.player.set_rate(r)
+            if ok is False:
+                msg = getattr(self.player, 'last_rate_error', None) or "Time-stretch unavailable — using normal speed."
+                # Print to console for visibility while debugging
+                try:
+                    print(f"[rate] set_rate({r}) failed: {msg}")
+                except Exception:
+                    pass
+                self.statusBar().showMessage(msg, 6000)
+                # Nudge transport so UI ↔ audio mapping stays stable
+            try:
+                pos = float(self.player.position_seconds())
+                self.player.set_position_seconds(pos, within_loop=True)
+            except Exception:
+                pass
+
+    def render_rate(self):
+        """Render a pitch-preserving stretched WAV using the current rate (if available)."""
+        if not getattr(self, 'current_path', None) or not getattr(self, 'player', None):
+            self.statusBar().showMessage("No audio loaded")
+            return
+        try:
+            rate = float(self.rate_spin.value())
+        except Exception:
+            rate = 1.0
+        if abs(rate - 1.0) < 1e-6:
+            self.statusBar().showMessage("Rate is 1.0x — nothing to render")
+            return
+        if not HAS_STRETCH:
+            QtWidgets.QMessageBox.information(self, "Time-stretch", "Time-stretch engine not available.")
+            return
+        try:
+            out_wav = temp_wav_path(prefix="render_", suffix=".wav")
+            render_time_stretch(self.current_path, out_wav, rate)
+            self.statusBar().showMessage(f"Rendered stretched audio → {Path(out_wav).name}")
+        except Exception as e:
+            self.statusBar().showMessage(f"Render failed: {e}")
 
     def load_audio(self):
         start_dir = self.settings.value("last_dir", str(Path.home()))
@@ -1325,6 +1373,8 @@ class Main(QtWidgets.QMainWindow):
             self.player.stop(); self.player.close()
         self.player = LoopPlayer(fn)
         self.wave.set_player(self.player)
+        # Apply current UI rate to fresh player (keeps UI and audio consistent)
+        self._rate_changed(self.rate_spin.value())
 
         # Align visual time 0 to first non-silent audio and position the transport
         lead = self._detect_leading_silence_seconds(self.player.y, self.player.sr)
@@ -1431,68 +1481,59 @@ class Main(QtWidgets.QMainWindow):
             self.wave.set_loop_visual(self.A, self.B)
             self.statusBar().showMessage(f"B set to {self.B:.2f}s")
 
-    def render_rate(self):
-        if not (self.player and self.current_path and HAS_STRETCH):
-            return
-        rate = float(self.rate_spin.value())
-        out = temp_wav_path("openpractice_render")
-        self.statusBar().showMessage("Rendering…")
-        QtWidgets.QApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            render_time_stretch(self.current_path, rate, out)
-            # Reload rendered file but keep same A/B seconds
-            self.player.reload(out)
-            self.player.set_loop_seconds(self.A, self.B)
-        finally:
-            QtWidgets.QApplication.restoreOverrideCursor()
-            self.statusBar().showMessage("Ready")
-
-    def dragEnterEvent(self, e):
+    def dragEnterEvent(self, e: QtGui.QDragEnterEvent):
         if e.mimeData().hasUrls():
-            for url in e.mimeData().urls():
-                if url.toLocalFile().lower().endswith((".wav", ".mp3", ".flac", ".m4a")):
-                    e.acceptProposedAction()
-                    return
+            for u in e.mimeData().urls():
+                if u.isLocalFile():
+                    suf = Path(u.toLocalFile()).suffix.lower()
+                    if suf in {'.wav', '.mp3', '.flac', '.m4a'}:
+                        e.acceptProposedAction()
+                        return
         e.ignore()
 
-    def dropEvent(self, e):
-        for url in e.mimeData().urls():
-            fn = url.toLocalFile()
-            if fn.lower().endswith((".wav", ".mp3", ".flac", ".m4a")):
-                # mimic File→Open
-                self.current_path = fn
-                self.settings.setValue("last_dir", str(Path(fn).parent))
-                name = Path(fn).name
-                if self.player:
-                    self.player.stop(); self.player.close()
-                self.player = LoopPlayer(fn)
-                self.wave.set_player(self.player)
-                # Reset saved loops for this file; we will add new ones as the user creates them
-                self.saved_loops.clear()
-                self._loop_id_seq = 1
-                self._active_saved_loop_id = None
-                self._sync_saved_loops_to_view()
-                lead = self._detect_leading_silence_seconds(self.player.y, self.player.sr)
-                tail = self._detect_trailing_silence_seconds(self.player.y, self.player.sr)
-                self.wave.set_music_span(lead, tail)
-                try:
-                    self.player.set_position_seconds(lead, within_loop=False)
-                except Exception:
-                    pass
-                total_s = self.player.n / self.player.sr
-                self.A = lead
-                self.B = max(lead + 0.1, min(total_s, tail))
-                self.player.set_loop_seconds(self.A, self.B)
-                self.wave.set_loop_visual(self.A, self.B)
-                self.wave.setFocus()
-                mus_len = max(0.0, self.B - self.A)
-                self.statusBar().showMessage(f"Loaded: {name} [music {mus_len:.1f}s of {total_s:.1f}s]")
-                self.setWindowTitle(f"OpenPractice — {name}")
-                self.title_label.setText(name)
-                self.populate_chords_async(fn)
-                self.populate_key_async(fn)
-                self.populate_beats_async(fn)
-                break
+    def dropEvent(self, e: QtGui.QDropEvent):
+        urls = [u for u in e.mimeData().urls() if u.isLocalFile()]
+        if not urls:
+            e.ignore(); return
+        path = urls[0].toLocalFile()
+        # Attach player and waveform
+        if self.player:
+            try:
+                self.player.stop(); self.player.close()
+            except Exception:
+                pass
+        self.current_path = path
+        self.settings.setValue("last_dir", str(Path(path).parent))
+        name = Path(path).name
+        self.setWindowTitle(f"OpenPractice — {name}")
+        self.title_label.setText(name)
+        self.player = LoopPlayer(path)
+        self.wave.set_player(self.player)
+        # Apply current UI rate so playback speed matches the control
+        self._rate_changed(self.rate_spin.value())
+        # Align visual time 0 to first non‑silent audio
+        lead = self._detect_leading_silence_seconds(self.player.y, self.player.sr)
+        tail = self._detect_trailing_silence_seconds(self.player.y, self.player.sr)
+        self.wave.set_music_span(lead, tail)
+        try:
+            self.player.set_position_seconds(lead, within_loop=False)
+        except Exception:
+            pass
+        # Restore session and compute only missing analyses
+        try:
+            self.load_session()
+        except Exception:
+            pass
+        if not self.last_beats:
+            self.populate_beats_async(self.current_path)
+        if not self.last_chords:
+            self.populate_chords_async(self.current_path)
+        if not (self.last_key and self.last_key.get('pretty')):
+            self.populate_key_async(self.current_path)
+        total_s = self.player.n / self.player.sr
+        mus_len = max(0.0, (tail - lead))
+        self.statusBar().showMessage(f"Loaded: {Path(path).name} [music {mus_len:.1f}s of {total_s:.1f}s]")
+        e.acceptProposedAction()
 
     def closeEvent(self, event: QtGui.QCloseEvent):
         try:

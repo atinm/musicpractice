@@ -10,9 +10,12 @@ import subprocess
 import os
 
 try:
-    import librosa  # final fallback loader if ffmpeg unavailable
-except Exception:
+    import librosa
+except Exception as e:
     librosa = None
+    _LIBROSA_IMPORT_ERROR = e
+else:
+    _LIBROSA_IMPORT_ERROR = None
 
 # Prefer ffmpeg decode over audioread to avoid deprecation warnings and speed up loads
 _DEF_FFMPEG = shutil.which("ffmpeg")
@@ -84,12 +87,20 @@ class LoopPlayer:
     """
     def __init__(self, path: str):
         self._load(path)
+        # === Time‑stretch / playback state ===
+        self._rate = 1.0                    # original speed by default
+        self._y_base = self.y               # original audio (N, C)
+        self._y_play = self.y               # buffer currently sent to the stream (stretched)
+        self._frames_out = 0                # cursor into _y_play (output domain)
+        self._loop_seconds = None           # (a, b) in ORIGINAL seconds
+        self._loop_frames_out = None        # (a_out, b_out) in output frames
         self.lock = threading.Lock()
         self.lo = 0
         self.hi = self.n
         self.pos = 0
         self._playing = False
         self._pos_samples = 0
+        self.last_rate_error = None
         self.stream = sd.OutputStream(
             samplerate=self.sr,
             channels=self.y.shape[1],
@@ -103,6 +114,10 @@ class LoopPlayer:
         self.sr = sr
         self.n = y.shape[0]
         self.path = path
+        # Reset stretch buffers to newly loaded audio
+        self._y_base = self.y
+        self._y_play = self.y
+        self._frames_out = 0
 
     def reload(self, path: str):
         was_playing = self._playing
@@ -111,60 +126,140 @@ class LoopPlayer:
         self._load(path)
         with self.lock:
             self.lo, self.hi, self.pos = 0, self.n, 0
+        # Reapply current rate to new buffer
+        try:
+            self._rebuild_rate(self._rate)
+        except Exception:
+            self._rate = 1.0
+            self._y_play = self._y_base
+            self._frames_out = 0
         if was_playing:
             self.start()
 
     def set_loop_seconds(self, start_s: float, end_s: float):
-        lo = int(max(0, min(self.n - 1, start_s * self.sr)))
-        hi = int(max(lo + 1, min(self.n, end_s * self.sr)))
-        self.lo, self.hi = lo, hi
+        a = float(min(start_s, end_s))
+        b = float(max(start_s, end_s))
+        # Keep original-sample loop for backwards compatibility (unused when stretched)
+        self.lo = int(max(0, min(self.n - 1, a * self.sr)))
+        self.hi = int(max(self.lo + 1, min(self.n, b * self.sr)))
+        # Store seconds and compute output-domain loop frames for stretched playback
+        self._loop_seconds = (a, b)
+        self._loop_frames_out = (int(a * self.sr / max(self._rate, 1e-6)),
+                                 int(b * self.sr / max(self._rate, 1e-6)))
 
     def duration_seconds(self) -> float:
         """Total duration of the loaded buffer in seconds."""
-        return self.n / float(self.sr)
+        # Original timeline duration
+        n_out = int(self._y_play.shape[0])
+        return (n_out / float(self.sr)) * max(self._rate, 1e-6)
 
     def position_seconds(self) -> float:
-        return float(self._pos_samples) / float(self.sr)
+        return (float(self._frames_out) / float(self.sr)) * max(self._rate, 1e-6)
 
     def set_position_seconds(self, t: float, within_loop: bool = False):
         t = float(max(0.0, t))
-        total = self.y.shape[0] if self.y is not None else 0
-        pos = int(t * self.sr)
-        if within_loop and getattr(self, 'hi', 0) > getattr(self, 'lo', 0):
-            a = max(0, int(self.lo))
-            b = min(total, int(self.hi))
-            pos = max(a, min(max(a, b - 1), pos))
+        # Convert original‑timeline seconds → output frames
+        i_out = int(t * self.sr / max(self._rate, 1e-6))
+        n_out = int(self._y_play.shape[0]) if self._y_play is not None else 0
+        if within_loop and self._loop_frames_out:
+            a_out, b_out = self._loop_frames_out
+            i_out = max(a_out, min(max(a_out, b_out - 1), i_out))
         else:
-            pos = max(0, min(max(0, total - 1), pos))
-        self._pos_samples = pos
+            i_out = max(0, min(max(0, n_out - 1), i_out))
+        self._frames_out = i_out
 
     def clear_loop(self):
         self.lo, self.hi = 0, 0
+        self._loop_seconds = None
+        self._loop_frames_out = None
+
+    def _rebuild_rate(self, rate: float) -> bool:
+        """Rebuild the playback buffer for a new rate, preserving pitch.
+        Keeps UI on original timeline by mapping output frames ⇄ original seconds.
+        """
+        self.last_rate_error = None
+        rate = float(max(0.5, min(1.5, rate)))
+        y = self._y_base
+        if abs(rate - 1.0) < 1e-6:
+            self._y_play = y
+            self._rate = 1.0
+        else:
+            # Prefer librosa fallback if no custom stretcher is available
+            if librosa is None:
+                if '_LIBROSA_IMPORT_ERROR' in globals() and _LIBROSA_IMPORT_ERROR is not None:
+                    self.last_rate_error = f"librosa import failed: {type(_LIBROSA_IMPORT_ERROR).__name__}: {_LIBROSA_IMPORT_ERROR}"
+                else:
+                    self.last_rate_error = "librosa not available"
+                try:
+                    print(f"[rate] rebuild failed → {self.last_rate_error}")
+                except Exception:
+                    pass
+                return False
+            try:
+                if y.ndim == 1 or y.shape[1] == 1:
+                    mono = y[:, 0] if y.ndim == 2 else y
+                    y_st = librosa.effects.time_stretch(y=mono.astype(float), rate=rate)
+                    y_st = y_st.astype(np.float32, copy=False)
+                    self._y_play = np.column_stack([y_st, y_st]) if (y.ndim == 2 and y.shape[1] == 2) else y_st.reshape(-1, 1)
+                else:
+                    # per‑channel stretch and pad to equal length
+                    chans = []
+                    for c in range(y.shape[1]):
+                        ch = librosa.effects.time_stretch(y=y[:, c].astype(float), rate=rate)
+                        chans.append(ch)
+                    L = max(len(cch) for cch in chans)
+                    chans = [np.pad(cch, (0, L - len(cch))) for cch in chans]
+                    y_st = np.stack(chans, axis=1).astype(np.float32, copy=False)
+                    self._y_play = y_st
+                self._rate = rate
+            except Exception as e:
+                self.last_rate_error = f"time_stretch failed: {type(e).__name__}: {e}"
+                try:
+                    print(f"[rate] rebuild failed → {self.last_rate_error}")
+                except Exception:
+                    pass
+                return False
+        # Update loop frames in output domain
+        if self._loop_seconds is not None:
+            a, b = self._loop_seconds
+            self._loop_frames_out = (int(a * self.sr / max(self._rate, 1e-6)),
+                                     int(b * self.sr / max(self._rate, 1e-6)))
+        else:
+            self._loop_frames_out = None
+        # Keep transport position stable in original time
+        t_orig = self.position_seconds()
+        self._frames_out = int(t_orig * self.sr / max(self._rate, 1e-6))
+        return True
+
+    def set_rate(self, rate: float) -> bool:
+        """Set playback rate (0.5–1.5x), pitch‑preserving."""
+        return bool(self._rebuild_rate(rate))
 
     def _cb(self, outdata, frames, time, status):
         if status:
-            # print(status)  # optional
             pass
-        # Zero fill by default
         outdata[:] = 0.0
-        if self.y is None:
+        y = self._y_play
+        if y is None:
             return
-
-        n_total = self.y.shape[0]
-        ch_file = self.y.shape[1] if self.y.ndim == 2 else 1
+        n_total = int(y.shape[0])
+        ch_file = y.shape[1] if y.ndim == 2 else 1
         ch_out = outdata.shape[1]
 
-        # Loop bounds in samples (use lo/hi exclusively)
-        if getattr(self, 'hi', 0) > getattr(self, 'lo', 0):
-            loop_a, loop_b = int(self.lo), int(self.hi)
+        # Output‑domain loop bounds if present, else fall back to original indices
+        if self._loop_frames_out:
+            loop_a, loop_b = int(self._loop_frames_out[0]), int(self._loop_frames_out[1])
+        elif getattr(self, 'hi', 0) > getattr(self, 'lo', 0):
+            # legacy: map original sample indices approximately to output domain by rate
+            loop_a = int(self.lo / max(self._rate, 1e-6))
+            loop_b = int(self.hi / max(self._rate, 1e-6))
         else:
             loop_a, loop_b = 0, n_total
 
-        pos = int(self._pos_samples)
+        pos = int(self._frames_out)
         wrote = 0
         while wrote < frames:
             if pos >= loop_b:
-                # wrap if a loop exists; otherwise leave remaining silence
                 if loop_b > loop_a:
                     pos = loop_a
                 else:
@@ -173,12 +268,11 @@ class LoopPlayer:
             if take <= 0:
                 break
             if ch_file == 1:
-                src = self.y[pos:pos+take]
+                src = y[pos:pos+take]
                 if src.ndim == 1:
                     src = src.reshape(-1, 1)
             else:
-                src = self.y[pos:pos+take, :ch_file]
-            # Fit channels to device
+                src = y[pos:pos+take, :ch_file]
             if ch_file >= ch_out:
                 outdata[wrote:wrote+take, :] = src[:, :ch_out]
             else:
@@ -187,7 +281,7 @@ class LoopPlayer:
                     outdata[wrote:wrote+take, 1:] = src[:, :1]
             wrote += take
             pos += take
-        self._pos_samples = pos
+        self._frames_out = pos
 
     def play(self):
         if self.stream is None:
