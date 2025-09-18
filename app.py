@@ -1,4 +1,5 @@
 import sys
+import json
 from pathlib import Path
 from PySide6 import QtWidgets, QtCore, QtGui
 from PySide6.QtCore import Qt, QThread, Signal, QSettings
@@ -29,6 +30,11 @@ class WaveformView(QtWidgets.QWidget):
 
     def set_saved_loops(self, loops: list[dict] | None):
         self.saved_loops = list(loops or [])
+        # Clear stale selection if the id no longer exists
+        if hasattr(self, 'selected_loop_id') and self.selected_loop_id is not None:
+            existing_ids = {int(L.get('id')) for L in self.saved_loops if 'id' in L}
+            if int(self.selected_loop_id) not in existing_ids:
+                self.selected_loop_id = None
         self.update()
 
     def __init__(self, parent=None, window_s: float = 15.0):
@@ -687,11 +693,13 @@ class ChordWorker(QThread):
         self.path = path
     def run(self):
         try:
+            if self.isInterruptionRequested():
+                return
             segs = estimate_chords(self.path)
         except Exception:
             segs = []
-        self.done.emit(segs)
-
+        if not self.isInterruptionRequested():
+            self.done.emit(segs)
 
 class KeyWorker(QThread):
     done = Signal(dict)
@@ -700,10 +708,13 @@ class KeyWorker(QThread):
         self.path = path
     def run(self):
         try:
+            if self.isInterruptionRequested():
+                return
             info = estimate_key(self.path)
         except Exception:
             info = {"pretty": "unknown"}
-        self.done.emit(info)
+        if not self.isInterruptionRequested():
+            self.done.emit(info)
 
 
 # --- BeatWorker for beat/bar estimation ---
@@ -714,18 +725,35 @@ class BeatWorker(QThread):
         self.path = path
     def run(self):
         try:
+            if self.isInterruptionRequested():
+                return
             info = estimate_beats(self.path)
         except Exception:
             info = {"tempo": 0.0, "beats": [], "bars": []}
-        self.done.emit(info)
+        if not self.isInterruptionRequested():
+            self.done.emit(info)
 
 
 class Main(QtWidgets.QMainWindow):
+    @staticmethod
+    def _feq(a: float | None, b: float | None, eps: float = 1e-3) -> bool:
+        if a is None or b is None:
+            return False
+        return abs(float(a) - float(b)) <= eps
+
     def populate_beats_async(self, path: str):
         self.wave.set_beats([], [])
-        self.beat_worker = BeatWorker(path)
-        self.beat_worker.done.connect(self._beats_ready)
-        self.beat_worker.start()
+        # Stop previous beat worker if still running
+        if self.beat_worker and self.beat_worker.isRunning():
+            self.beat_worker.requestInterruption()
+            self.beat_worker.quit()
+            self.beat_worker.wait(1000)
+        bw = BeatWorker(path)
+        bw.setParent(self)
+        bw.done.connect(self._beats_ready)
+        bw.finished.connect(lambda: setattr(self, "beat_worker", None))
+        self.beat_worker = bw
+        bw.start()
 
     def _beats_ready(self, info: dict):
         beats = info.get("beats", [])
@@ -733,6 +761,34 @@ class Main(QtWidgets.QMainWindow):
         self.wave.set_beats(beats, bars)
         if info.get("tempo"):
             self.statusBar().showMessage(f"Tempo: {info['tempo']:.1f} BPM · Beats: {len(beats)}")
+        # persist
+        try:
+            self.last_tempo = float(info.get("tempo") or 0.0) or None
+        except Exception:
+            self.last_tempo = None
+        self.last_beats = list(beats)
+        self.last_bars = list(bars)
+        self.save_session()
+
+    def _cleanup_on_quit(self):
+        # Stop audio stream if present
+        try:
+            if self.player:
+                if hasattr(self.player, "stop"):
+                    self.player.stop()
+                if hasattr(self.player, "close"):
+                    self.player.close()
+        except Exception:
+            pass
+        # Stop workers
+        for w in (self.beat_worker, self.chord_worker, self.key_worker):
+            try:
+                if w and w.isRunning():
+                    w.requestInterruption()
+                    w.quit()
+                    w.wait(1500)
+            except Exception:
+                pass
 
     def __init__(self):
         super().__init__()
@@ -743,12 +799,21 @@ class Main(QtWidgets.QMainWindow):
 
         self.player: LoopPlayer | None = None
         self.current_path: str | None = None
+        # Saved analysis/session state
+        self.last_tempo: float | None = None
+        self.last_beats: list[float] = []
+        self.last_bars: list[float] = []
+        self.last_key: dict | None = None
+        self.last_chords: list[dict] = []
         self.A = 0.0
         self.B = 10.0
         # Saved loops model
         self.saved_loops: list[dict] = []   # {id:int, a:float, b:float, label:str}
         self._loop_id_seq = 1
         self._active_saved_loop_id: int | None = None
+        self.beat_worker = None
+        self.chord_worker = None
+        self.key_worker = None
 
         # === UI ===
         self.rate_spin = QtWidgets.QDoubleSpinBox()
@@ -841,6 +906,17 @@ class Main(QtWidgets.QMainWindow):
         open_act.triggered.connect(self.load_audio)
         file_menu = self.menuBar().addMenu("File")
         file_menu.addAction(open_act)
+        save_act = QAction("Save Session", self)
+        save_act.setShortcut(QKeySequence.StandardKey.Save)
+        save_act.triggered.connect(self.save_session)
+
+        load_act = QAction("Load Session", self)
+        load_act.setShortcut(QKeySequence("Ctrl+Shift+O"))
+        load_act.triggered.connect(self.load_session)
+
+        file_menu.addSeparator()
+        file_menu.addAction(save_act)
+        file_menu.addAction(load_act)
 
         # Signals
         self.rate_spin.valueChanged.connect(self._rate_changed)
@@ -848,6 +924,7 @@ class Main(QtWidgets.QMainWindow):
 
         self.space_shortcut = QShortcut(QKeySequence(Qt.Key_Space), self)
         self.space_shortcut.activated.connect(self.toggle_play)
+        QtWidgets.QApplication.instance().aboutToQuit.connect(self._cleanup_on_quit)
 
         # Status
         self.statusBar().showMessage("Ready")
@@ -855,8 +932,116 @@ class Main(QtWidgets.QMainWindow):
         self.loop_poll.setInterval(80)  # ~12.5 Hz is plenty
         self.loop_poll.timeout.connect(self._auto_loop_tick)
         self.loop_poll.start()
+
+    def _session_sidecar_path(self, audio_path: str) -> Path:
+        p = Path(audio_path)
+        folder = p.parent / ".openpractice"
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder / f"{p.stem}.openpractice.json"
+
+    def load_session(self):
+        # Use current file’s sidecar if a song is loaded; else prompt for JSON
+        if self.current_path:
+            sidecar = self._session_sidecar_path(self.current_path)
+        else:
+            dlg = QtWidgets.QFileDialog(self, "Open Session JSON")
+            dlg.setNameFilter("OpenPractice Session (*.openpractice.json);;JSON (*.json)")
+            if dlg.exec() != QtWidgets.QDialog.Accepted:
+                return
+            sidecar = Path(dlg.selectedFiles()[0])
+
+        if not Path(sidecar).exists():
+            self.statusBar().showMessage("No session file found for this audio")
+            return
+
+        try:
+            data = json.loads(Path(sidecar).read_text())
+        except Exception as e:
+            self.statusBar().showMessage(f"Load failed: {e}")
+            return
+
+        # View / snap
+        self.wave.set_origin_offset(float(data.get("origin", 0.0)))
+        ce = float(data.get("content_end", 0.0))
+        if ce > 0:
+            self.wave.set_music_span(float(data.get("origin", 0.0)), ce)
+        self.wave.set_snap_enabled(bool(data.get("snap_enabled", True)))
+
+        # Loops
+        self.saved_loops = list(data.get("saved_loops", []))
+        self._active_saved_loop_id = data.get("active_loop_id")
+        self._sync_saved_loops_to_view()
+        # Activate the stored active loop; if none, default to first saved loop
+        L = None
+        if self._active_saved_loop_id is not None:
+            L = next((x for x in self.saved_loops if x.get('id') == self._active_saved_loop_id), None)
+        if L is None and self.saved_loops:
+            L = self.saved_loops[0]
+            self._active_saved_loop_id = int(L.get('id')) if 'id' in L else None
+        if L is not None:
+            a = float(min(L['a'], L['b']))
+            b = float(max(L['a'], L['b']))
+            self.wave.set_loop_visual(a, b)
+            if self.player:
+                self.player.set_loop_seconds(a, b)
+        else:
+            # No loops saved → clear any previous visual
+            self.wave.clear_loop_visual()
+
+        # Beats / bars / tempo
+        self.last_tempo = float(data.get("tempo", 0.0)) or None
+        self.last_beats = list(data.get("beats", []))
+        self.last_bars = list(data.get("bars", []))
+        self.wave.set_beats(self.last_beats, self.last_bars)
+
+        # Key
+        self.last_key = data.get("key") or {}
+        if self.last_key:
+            self.key_header_label.setText(f"Key: {self.last_key.get('pretty','—')}")
+
+        # Chords
+        self.last_chords = list(data.get("chords", []))
+        if self.last_chords:
+            self.wave.set_chords(self.last_chords)
+
+        # Rate
+        if "rate" in data:
+            try:
+                self.rate_spin.setValue(float(data.get("rate", 1.0)))
+            except Exception:
+                pass
+
+        self.statusBar().showMessage(f"Session loaded from {Path(sidecar).name}")
+
+    def save_session(self):
+        if not self.current_path:
+            self.statusBar().showMessage("No audio loaded – nothing to save")
+            return
+        sidecar = self._session_sidecar_path(self.current_path)
+        payload = {
+            "audio_path": str(self.current_path),
+            "origin": float(self.wave.origin or 0.0),
+            "content_end": float(self.wave.content_end or 0.0),
+            "snap_enabled": bool(self.wave.snap_enabled),
+            "saved_loops": self.saved_loops,
+            "active_loop_id": self._active_saved_loop_id,
+            "tempo": float(self.last_tempo or 0.0),
+            "beats": list(self.last_beats or []),
+            "bars": list(self.last_bars or []),
+            "key": self.last_key or {},
+            "chords": list(self.last_chords or []),
+            "rate": float(self.rate_spin.value()),
+        }
+        try:
+            Path(sidecar).write_text(json.dumps(payload, indent=2))
+            self.statusBar().showMessage(f"Session saved → {sidecar.name}")
+        except Exception as e:
+            self.statusBar().showMessage(f"Save failed: {e}")
+
     def _sync_saved_loops_to_view(self):
-        self.wave.set_saved_loops(self.saved_loops)
+        if hasattr(self, 'wave'):
+            self.wave.set_saved_loops(self.saved_loops)
+            self.wave.update()
 
     def _next_loop_label(self) -> str:
         used = {L.get('label') for L in self.saved_loops if L.get('label')}
@@ -886,6 +1071,7 @@ class Main(QtWidgets.QMainWindow):
         self.wave.set_loop_visual(min(a,b), max(a,b))
         self._sync_saved_loops_to_view()
         self.statusBar().showMessage(f"Added loop {L['label']}: {min(a,b):.2f}s → {max(a,b):.2f}s")
+        self.save_session()
 
     def _update_loop_from_wave(self, lid: int, a: float, b: float):
         for L in self.saved_loops:
@@ -897,30 +1083,38 @@ class Main(QtWidgets.QMainWindow):
         if self.player:
             self.player.set_loop_seconds(min(a,b), max(a,b))
         self.wave.set_loop_visual(min(a,b), max(a,b))
+        if self._active_saved_loop_id is None or int(self._active_saved_loop_id) == int(lid):
+            self._active_saved_loop_id = int(lid)
+            self.wave.set_loop_visual(float(min(a,b)), float(max(a,b)))
+            if self.player:
+                self.player.set_loop_seconds(float(min(a,b)), float(max(a,b)))
         self._sync_saved_loops_to_view()
-        self.statusBar().showMessage(f"Updated loop to {min(a,b):.2f}s → {max(a,b):.2f}s")
+        self.save_session()
 
     def _select_loop_from_wave(self, lid: int):
-        L = next((x for x in self.saved_loops if x['id'] == lid), None)
+        L = next((x for x in self.saved_loops if int(x.get('id')) == int(lid)), None)
         if not L:
             return
-        a, b = float(min(L['a'], L['b'])), float(max(L['a'], L['b']))
-        self._active_saved_loop_id = lid
-        if self.player:
-            self.player.set_loop_seconds(a, b)
+        a = float(min(L['a'], L['b']))
+        b = float(max(L['a'], L['b']))
+        self._active_saved_loop_id = int(lid)
+        self.wave.selected_loop_id = int(lid)
         self.wave.set_loop_visual(a, b)
-        self.statusBar().showMessage(f"Selected loop {L.get('label','')}: {a:.2f}s → {b:.2f}s")
+        if self.player:
+            try:
+                self.player.set_loop_seconds(a, b)
+            except Exception:
+                pass
+        self._sync_saved_loops_to_view()
 
     def _delete_selected_loop(self):
-        lid = self._active_saved_loop_id
+        lid = getattr(self.wave, 'selected_loop_id', None)
         if lid is None:
+            lid = self._active_saved_loop_id
+        if lid is None:
+            self.statusBar().showMessage("No loop selected to delete")
             return
-        idx = next((i for i, L in enumerate(self.saved_loops) if L['id'] == lid), -1)
-        if idx >= 0:
-            rem = self.saved_loops.pop(idx)
-            self._active_saved_loop_id = None
-            self._sync_saved_loops_to_view()
-            self.statusBar().showMessage(f"Deleted loop {rem.get('label','')}")
+        self._delete_loop_id(int(lid))
 
     def _auto_loop_tick(self):
         if not self.player or not self.saved_loops:
@@ -1058,16 +1252,58 @@ class Main(QtWidgets.QMainWindow):
             L['label'] = str(text)
             self._sync_saved_loops_to_view()
             self.statusBar().showMessage(f"Renamed loop to '{L['label']}'")
+            self.save_session()
 
     def _delete_loop_id(self, lid: int):
-        idx = next((i for i, X in enumerate(self.saved_loops) if X['id'] == lid), -1)
-        if idx < 0:
-            return
-        rem = self.saved_loops.pop(idx)
-        if self._active_saved_loop_id == lid:
+        # Find the loop being deleted so we know its span before removal
+        Ldel = next((x for x in self.saved_loops if int(x.get('id')) == int(lid)), None)
+        before = len(self.saved_loops)
+
+        # Remove from model
+        self.saved_loops = [L for L in self.saved_loops if int(L.get('id')) != int(lid)]
+
+        # If we removed the active loop, clear overlay & player loop
+        cleared_overlay = False
+        if self._active_saved_loop_id is not None and int(self._active_saved_loop_id) == int(lid):
             self._active_saved_loop_id = None
-        self._sync_saved_loops_to_view()
-        self.statusBar().showMessage(f"Deleted loop {rem.get('label','') or lid}")
+            if hasattr(self.wave, 'clear_loop_visual'):
+                self.wave.clear_loop_visual()
+                cleared_overlay = True
+            if self.player:
+                try:
+                    dur = self.player.duration_seconds() if hasattr(self.player, 'duration_seconds') else (self.player.n / float(self.player.sr))
+                    self.player.set_loop_seconds(0.0, float(dur))
+                except Exception:
+                    pass
+
+        # If it WASN'T the active loop, but the overlay matches the deleted span, clear it too
+        if not cleared_overlay and Ldel is not None and self.wave is not None:
+            a = float(min(Ldel['a'], Ldel['b']))
+            b = float(max(Ldel['a'], Ldel['b']))
+            if self._feq(self.wave.loopA, a) and self._feq(self.wave.loopB, b):
+                if hasattr(self.wave, 'clear_loop_visual'):
+                    self.wave.clear_loop_visual()
+                if self.player:
+                    try:
+                        dur = self.player.duration_seconds() if hasattr(self.player, 'duration_seconds') else (self.player.n / float(self.player.sr))
+                        self.player.set_loop_seconds(0.0, float(dur))
+                    except Exception:
+                        pass
+
+        # Clear view selection if it pointed to the deleted loop
+        if hasattr(self.wave, 'selected_loop_id') and self.wave.selected_loop_id is not None:
+            try:
+                if int(self.wave.selected_loop_id) == int(lid):
+                    self.wave.selected_loop_id = None
+            except Exception:
+                self.wave.selected_loop_id = None
+
+        # Push updates to the view and repaint
+        self.wave.set_saved_loops(self.saved_loops)
+        self.wave.update()
+
+        self.statusBar().showMessage("Loop deleted" if len(self.saved_loops) < before else "No loop deleted")
+        self.save_session()
 
     # === Actions ===
     def _rate_changed(self, val: float):
@@ -1112,6 +1348,12 @@ class Main(QtWidgets.QMainWindow):
             self.player.set_position_seconds(lead, within_loop=False)
         except Exception:
             pass
+
+        try:
+            self.load_session()
+        except Exception:
+            pass
+
         # Default loop: musical span (from music start to detected tail)
         total_s = self.player.n / self.player.sr
         self.A = lead
@@ -1125,36 +1367,36 @@ class Main(QtWidgets.QMainWindow):
 
     def populate_chords_async(self, path: str):
         self.wave.set_chords([])
-        self.worker = ChordWorker(path)
-        self.worker.done.connect(self._chords_ready)
-        self.worker.start()
+        if self.chord_worker and self.chord_worker.isRunning():
+            self.chord_worker.requestInterruption(); self.chord_worker.quit(); self.chord_worker.wait(1000)
+        cw = ChordWorker(path)
+        cw.setParent(self)
+        cw.done.connect(self._chords_ready)
+        cw.finished.connect(lambda: setattr(self, "chord_worker", None))
+        self.chord_worker = cw
+        cw.start()
 
     def populate_key_async(self, path: str):
         self.key_header_label.setText("Key: …")
-        self.key_worker = KeyWorker(path)
-        self.key_worker.done.connect(self._key_ready)
-        self.key_worker.start()
-
-    def _key_ready(self, info: dict):
-        pretty = info.get("pretty", "unknown")
-        self.key_header_label.setText(f"Key: {pretty}")
+        if self.key_worker and self.key_worker.isRunning():
+            self.key_worker.requestInterruption(); self.key_worker.quit(); self.key_worker.wait(1000)
+        kw = KeyWorker(path)
+        kw.setParent(self)
+        kw.done.connect(self._key_ready)
+        kw.finished.connect(lambda: setattr(self, "key_worker", None))
+        self.key_worker = kw
+        kw.start()
 
     def _chords_ready(self, segs: list):
-        origin = getattr(self.wave, 'origin', 0.0)
-        adj = []
-        for s in segs or []:
-            try:
-                st = float(s.get('start', 0.0))
-                en = float(s.get('end', 0.0))
-                lab = s.get('label', '')
-            except Exception:
-                continue
-            if en <= origin:
-                continue  # entirely before music start
-            st = max(st, origin)  # clamp start to origin
-            adj.append({'start': st, 'end': en, 'label': lab})
-        self.wave.set_chords(adj)
-        self.statusBar().showMessage(f"Chords: {len(adj)} segments")
+        self.last_chords = list(segs or [])
+        self.wave.set_chords(self.last_chords)
+        self.statusBar().showMessage(f"Chords: {len(self.last_chords)} segments")
+        self.save_session()
+
+    def _key_ready(self, info: dict):
+        self.last_key = info or {}
+        self.key_header_label.setText(f"Key: {self.last_key.get('pretty','—')}")
+        self.save_session()
 
     def toggle_play(self):
         if not self.player:
@@ -1263,12 +1505,11 @@ class Main(QtWidgets.QMainWindow):
                 self.populate_beats_async(fn)
                 break
 
-    def closeEvent(self, e):
+    def closeEvent(self, event: QtGui.QCloseEvent):
         try:
-            if self.player:
-                self.player.stop(); self.player.close()
+            self._cleanup_on_quit()
         finally:
-            super().closeEvent(e)
+            super().closeEvent(event)
 
 
 if __name__ == "__main__":
