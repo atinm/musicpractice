@@ -438,8 +438,8 @@ class WaveformView(QtWidgets.QWidget):
         h = self.height()
         if w < 10 or h < 10:
             return
-        wf_h = int(h * 0.7)
-        ch_h = h - wf_h
+        ch_h = 32
+        wf_h = max(10, h - ch_h)
         t0, t1 = self._current_window()
         # Visual times relative to the music start (origin)
         rel_t0 = t0 - self.origin
@@ -1319,68 +1319,44 @@ class Main(QtWidgets.QMainWindow):
         name = Path(fn).name
         self.setWindowTitle(f"OpenPractice — {name}")
         self.title_label.setText(name)
+
         # (Re)create player
         if self.player:
             self.player.stop(); self.player.close()
         self.player = LoopPlayer(fn)
         self.wave.set_player(self.player)
 
-        # restore session if available
-        try:
-            self.load_session()
-        except Exception:
-            pass
-
-        # compute only what’s missing
-        if not self.last_beats:
-            self.populate_beats_async(self.current_path)
-        if not self.last_chords:
-            self.populate_chords_async(self.current_path)
-        if not (self.last_key and self.last_key.get("pretty")):
-            self.populate_key_async(self.current_path)        # Do not default to any loop on load
-
-        try:
-            self.player.clear_loop()
-        except Exception:
-            try:
-                # Degenerate range many players treat as 'no loop'
-                self.player.set_loop_seconds(0.0, 0.0)
-            except Exception:
-                pass
-        self.wave.clear_loop_visual()
-        # Reset saved loops for this file; we will add new ones as the user creates them
-        self.saved_loops.clear()
-        self._loop_id_seq = 1
-        self._active_saved_loop_id = None
-        self._sync_saved_loops_to_view()
-        # Align visual time 0 to first non-silent audio
+        # Align visual time 0 to first non-silent audio and position the transport
         lead = self._detect_leading_silence_seconds(self.player.y, self.player.sr)
         tail = self._detect_trailing_silence_seconds(self.player.y, self.player.sr)
         self.wave.set_music_span(lead, tail)
-        # Seek playback to music start for immediate context
         try:
             self.player.set_position_seconds(lead, within_loop=False)
         except Exception:
             pass
 
+        # Try to restore prior session (loops, beats, chords, key, snap, rate)
         try:
             self.load_session()
         except Exception:
             pass
 
-        # Default loop: musical span (from music start to detected tail)
+        # Compute only what is missing
+        if not self.last_beats:
+            self.populate_beats_async(self.current_path)
+        if not self.last_chords:
+            self.populate_chords_async(self.current_path)
+        if not (self.last_key and self.last_key.get("pretty")):
+            self.populate_key_async(self.current_path)
+
+        # Status
         total_s = self.player.n / self.player.sr
-        self.A = lead
-        self.B = max(lead + 0.1, min(total_s, tail))
-        mus_len = max(0.0, self.B - self.A)
+        mus_len = max(0.0, (tail - lead))
         self.statusBar().showMessage(f"Loaded: {Path(fn).name} [music {mus_len:.1f}s of {total_s:.1f}s]")
-        # Kick off chord worker
-        self.populate_chords_async(fn)
-        self.populate_key_async(fn)
-        self.populate_beats_async(fn)
+        # Focus waveform for immediate key control
+        self.wave.setFocus()
 
     def populate_chords_async(self, path: str):
-        self.wave.set_chords([])
         if self.chord_worker and self.chord_worker.isRunning():
             self.chord_worker.requestInterruption(); self.chord_worker.quit(); self.chord_worker.wait(1000)
         cw = ChordWorker(path)
@@ -1391,7 +1367,6 @@ class Main(QtWidgets.QMainWindow):
         cw.start()
 
     def populate_key_async(self, path: str):
-        self.key_header_label.setText("Key: …")
         if self.key_worker and self.key_worker.isRunning():
             self.key_worker.requestInterruption(); self.key_worker.quit(); self.key_worker.wait(1000)
         kw = KeyWorker(path)
