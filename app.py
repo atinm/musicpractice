@@ -786,6 +786,8 @@ class LogDock(QtWidgets.QDockWidget):
         self.view = QtWidgets.QPlainTextEdit(w)
         self.view.setReadOnly(True)
         self.view.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
+        # Buffer for partial lines; we only print complete lines
+        self._buffer = ""
         v.addWidget(self.view, 1)
         w.setLayout(v)
         self.setWidget(w)
@@ -794,7 +796,7 @@ class LogDock(QtWidgets.QDockWidget):
         self.view.clear()
 
     def write(self, msg: str):
-        # Accept str; coerce others safely
+        # Coerce to string
         if not isinstance(msg, str):
             try:
                 msg = str(msg)
@@ -802,16 +804,30 @@ class LogDock(QtWidgets.QDockWidget):
                 msg = ""
         if not msg:
             return
-        # Append from any thread
-        QtCore.QMetaObject.invokeMethod(
-            self.view,
-            "appendPlainText",
-            Qt.QueuedConnection,
-            QtCore.Q_ARG(str, msg.rstrip("\n"))
-        )
+        # Normalize carriage returns (tqdm progress) and buffer until full lines
+        msg = msg.replace("\r", "\n")
+        self._buffer += msg
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            if not line:
+                continue
+            QtCore.QMetaObject.invokeMethod(
+                self.view,
+                "appendPlainText",
+                Qt.QueuedConnection,
+                QtCore.Q_ARG(str, line)
+            )
 
     def flush(self):
-        pass
+        if getattr(self, "_buffer", ""):
+            line = self._buffer
+            self._buffer = ""
+            QtCore.QMetaObject.invokeMethod(
+                self.view,
+                "appendPlainText",
+                Qt.QueuedConnection,
+                QtCore.Q_ARG(str, line.rstrip("\n"))
+            )
 
 class Main(QtWidgets.QMainWindow):
     @staticmethod
@@ -880,8 +896,47 @@ class Main(QtWidgets.QMainWindow):
                 self.player.use_stems_only(True)
         if hasattr(self, '_clear_stem_rows'):
             self._clear_stem_rows()
-        for name in order_stem_names(list(arrays.keys())):
-            self._add_stem_row(name, arrays[name])
+        # Display stems in fixed preferred order (case-insensitive), then any extras
+        preferred_order = ["vocals", "drums", "bass", "guitar", "piano", "other"]
+
+        # Build a normalization map from canonical key -> original key in arrays
+        def _norm(s: str) -> str:
+            return s.strip().lower().replace(" ", "").replace("_", "-")
+
+        by_norm: dict[str, str] = {}
+        for original in arrays.keys():
+            n = _norm(original)
+            # keep first occurrence; subsequent duplicates won't override
+            by_norm.setdefault(n, original)
+
+        used = set()
+        for want in preferred_order:
+            # accept common aliases and plural/singular variants
+            aliases = [want]
+            if want == "vocals":
+                aliases += ["vocal", "voice", "voices"]
+            if want == "drums":
+                aliases += ["drum"]
+            if want == "bass":
+                aliases += ["bassguitar", "bass-guitar", "bass_guitar"]
+            if want == "guitar":
+                aliases += ["guitars"]
+            if want == "piano":
+                aliases += ["keys", "keyboard"]
+            if want == "other":
+                aliases += ["others", "misc", "accompaniment", "backing"]
+
+            for al in aliases:
+                match = by_norm.get(_norm(al))
+                if match and match not in used:
+                    self._add_stem_row(match, arrays[match])
+                    used.add(match)
+                    break
+
+        # Add any extras not covered above, in stable order from arrays
+        for k in arrays.keys():
+            if k not in used:
+                self._add_stem_row(k, arrays[k])
         if self.stems_dock:
             self.stems_dock.show()
 
@@ -929,10 +984,10 @@ class Main(QtWidgets.QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("OpenPractice — Minimal")
+        self.setWindowTitle("MusicPractice — Minimal")
         self.resize(960, 600)
         self.setAcceptDrops(True)
-        self.settings = QSettings("OpenPractice", "OpenPractice")
+        self.settings = QSettings("MusicPractice", "MusicPractice")
 
         self.player: LoopPlayer | None = None
         self.current_path: str | None = None
@@ -1093,9 +1148,9 @@ class Main(QtWidgets.QMainWindow):
 
     def _session_sidecar_path(self, audio_path: str) -> Path:
         p = Path(audio_path)
-        folder = p.parent / ".openpractice"
+        folder = p.parent / ".musicpractice"
         folder.mkdir(parents=True, exist_ok=True)
-        return folder / f"{p.stem}.openpractice.json"
+        return folder / f"{p.stem}.musicpractice.json"
 
     def load_session(self):
         # Use current file’s sidecar if a song is loaded; else prompt for JSON
@@ -1103,7 +1158,7 @@ class Main(QtWidgets.QMainWindow):
             sidecar = self._session_sidecar_path(self.current_path)
         else:
             dlg = QtWidgets.QFileDialog(self, "Open Session JSON")
-            dlg.setNameFilter("OpenPractice Session (*.openpractice.json);;JSON (*.json)")
+            dlg.setNameFilter("MusicPractice Session (*.musicpractice.json);;JSON (*.json)")
             if dlg.exec() != QtWidgets.QDialog.Accepted:
                 return
             sidecar = Path(dlg.selectedFiles()[0])
@@ -1204,7 +1259,7 @@ class Main(QtWidgets.QMainWindow):
         except Exception:
             meta = "0_0"
         safe = p.stem.replace(os.sep, "_")
-        root = p.parent / ".openpractice" / "stems" / f"{safe}__{meta}"
+        root = p.parent / ".musicpractice" / "stems" / f"{safe}__{meta}"
         root.mkdir(parents=True, exist_ok=True)
         return root
 
@@ -1238,6 +1293,19 @@ class Main(QtWidgets.QMainWindow):
         preexisting = sorted(outdir.rglob("*.wav"))
         if preexisting:
             stem_dir = outdir
+            # Use unified loader so ordering is guaranteed
+            try:
+                self._load_stems_from_dir(Path(stem_dir))
+                if self.stems_dock:
+                    self.stems_dock.show()
+            except Exception as e:
+                self.statusBar().showMessage(f"Load stems failed: {e}")
+                if getattr(self, "log_dock", None):
+                    self.log_dock.write(f"Load stems failed: {e}\n")
+                if hasattr(self, 'act_toggle_stems'):
+                    self.act_toggle_stems.setChecked(False)
+                return
+            return
         else:
             # Ensure a log dock exists and is visible
             if not hasattr(self, "log_dock") or self.log_dock is None:
@@ -1294,58 +1362,40 @@ class Main(QtWidgets.QMainWindow):
 
     def _add_stem_row(self, name: str, arr: np.ndarray):
         row = QtWidgets.QWidget(self.stems_panel)
-        hl = QtWidgets.QHBoxLayout(row)
+        outer = QtWidgets.QVBoxLayout(row)
+        outer.setContentsMargins(4, 6, 4, 6)
+        outer.setSpacing(6)
+
+        # Header: label (left) + mute (right)
+        header = QtWidgets.QWidget(row)
+        hl = QtWidgets.QHBoxLayout(header)
         hl.setContentsMargins(0, 0, 0, 0)
         hl.setSpacing(6)
 
-        lab = QtWidgets.QLabel(name.capitalize(), row)
-        lab.setMinimumWidth(70)
+        lab = QtWidgets.QLabel(name.capitalize(), header)
+        lab.setMinimumWidth(60)
+        lab.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
 
-        # Mini waveform
-        mini = QtWidgets.QWidget(row)
-        mini.setMinimumHeight(36)
-        mini.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
-
-        def _paint(ev, a=arr):
-            p = QtGui.QPainter(mini)
-            p.fillRect(mini.rect(), QtGui.QColor(18, 18, 18))
-            r = mini.rect()
-            if a is None or getattr(a, 'size', 0) == 0:
-                p.end(); return
-            data = a[:, 0] if (a.ndim == 2 and a.shape[1] >= 1) else (a if a.ndim == 1 else None)
-            if data is None:
-                p.end(); return
-            w = max(1, r.width())
-            step = max(1, int(len(data) / w))
-            samples = data[::step]
-            mid = r.center().y()
-            h2 = max(1, int(r.height() * 0.45))
-            path = QtGui.QPainterPath()
-            for i, s in enumerate(samples[:w]):
-                y = mid - int(h2 * float(s))
-                if i == 0:
-                    path.moveTo(r.left() + i, y)
-                else:
-                    path.lineTo(r.left() + i, y)
-            pen = QtGui.QPen(QtGui.QColor(120, 200, 255))
-            pen.setWidth(1)
-            p.setPen(pen)
-            p.drawPath(path)
-            p.end()
-
-        mini.paintEvent = _paint
-
-        vol = QtWidgets.QSlider(Qt.Vertical, row)
-        vol.setRange(0, 100)
-        vol.setValue(100)
-        vol.setFixedHeight(36)
-        vol.setToolTip("Volume")
-
-        mute = QtWidgets.QToolButton(row)
+        mute = QtWidgets.QToolButton(header)
         mute.setText("M")
         mute.setCheckable(True)
-        mute.setToolTip("Mute")
+        mute.setToolTip(f"Mute {name}")
 
+        hl.addWidget(lab, 1)
+        hl.addStretch(1)
+        hl.addWidget(mute)
+        header.setLayout(hl)
+
+        # Volume slider (horizontal) under the header
+        vol = QtWidgets.QSlider(Qt.Horizontal, row)
+        vol.setRange(0, 100)
+        vol.setValue(100)
+        vol.setSingleStep(1)
+        vol.setPageStep(5)
+        vol.setTracking(True)
+        vol.setToolTip(f"{name} level")
+
+        # Wire up callbacks
         def _vol_changed(v, nm=name):
             if self.player and hasattr(self.player, 'set_stem_gain'):
                 self.player.set_stem_gain(nm, float(v) / 100.0)
@@ -1358,11 +1408,9 @@ class Main(QtWidgets.QMainWindow):
         vol.valueChanged.connect(_vol_changed)
         mute.toggled.connect(_mute_toggled)
 
-        hl.addWidget(lab)
-        hl.addWidget(mini, 1)
-        hl.addWidget(vol)
-        hl.addWidget(mute)
-        row.setLayout(hl)
+        outer.addWidget(header)
+        outer.addWidget(vol)
+        row.setLayout(outer)
         self.stems_layout.addWidget(row)
 
     def _sync_saved_loops_to_view(self):
@@ -1692,7 +1740,7 @@ class Main(QtWidgets.QMainWindow):
         self.current_path = fn
         self.settings.setValue("last_dir", str(Path(fn).parent))
         name = Path(fn).name
-        self.setWindowTitle(f"OpenPractice — {name}")
+        self.setWindowTitle(f"MusicPractice — {name}")
         self.title_label.setText(name)
 
         # (Re)create player
@@ -1836,7 +1884,7 @@ class Main(QtWidgets.QMainWindow):
         self.current_path = path
         self.settings.setValue("last_dir", str(Path(path).parent))
         name = Path(path).name
-        self.setWindowTitle(f"OpenPractice — {name}")
+        self.setWindowTitle(f"MusicPractice — {name}")
         self.title_label.setText(name)
         self.player = LoopPlayer(path)
         self.wave.set_player(self.player)
