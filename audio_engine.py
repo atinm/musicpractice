@@ -86,6 +86,12 @@ class LoopPlayer:
     Loads entire file into RAM for responsive looping.
     """
     def __init__(self, path: str):
+        # === Stems mixing state ===
+        self._stems_base = {}     # name -> np.ndarray (N, C) original timeline
+        self._stems_play = {}     # name -> np.ndarray (N, C) stretched/output domain
+        self._stem_gains = {}     # name -> float in [0.0, 1.0]
+        self._stem_mute = {}      # name -> bool
+        self._use_stems_only = True  # if True and stems exist, ignore full mix and play stems sum
         self._load(path)
         # === Time‑stretch / playback state ===
         self._rate = 1.0                    # original speed by default
@@ -118,6 +124,10 @@ class LoopPlayer:
         self._y_base = self.y
         self._y_play = self.y
         self._frames_out = 0
+        self._stems_base = {}
+        self._stems_play = {}
+        self._stem_gains = {}
+        self._stem_mute = {}
 
     def reload(self, path: str):
         was_playing = self._playing
@@ -172,6 +182,73 @@ class LoopPlayer:
         self.lo, self.hi = 0, 0
         self._loop_seconds = None
         self._loop_frames_out = None
+
+    # ====== Stems API ======
+    def set_stems_arrays(self, stems: dict):
+        """Provide stems as name -> array (N,) or (N, C). sr must match self.sr.
+        Rebuilds stretched buffers for current rate and resets per‑stem gains to 1.0 (unmuted)."""
+        self._stems_base = {}
+        self._stems_play = {}
+        self._stem_gains = {}
+        self._stem_mute = {}
+        if not stems:
+            return
+        for name, arr in stems.items():
+            if arr is None:
+                continue
+            a = arr
+            if a.ndim == 1:
+                a = a.reshape(-1, 1)
+            a = a.astype(np.float32, copy=False)
+            self._stems_base[str(name)] = a
+            self._stem_gains[str(name)] = 1.0
+            self._stem_mute[str(name)] = False
+        self._rebuild_stems_for_rate()
+
+    def clear_stems(self):
+        self._stems_base.clear()
+        self._stems_play.clear()
+        self._stem_gains.clear()
+        self._stem_mute.clear()
+
+    def set_stem_gain(self, name: str, gain01: float):
+        self._stem_gains[str(name)] = float(max(0.0, min(1.0, gain01)))
+
+    def set_stem_mute(self, name: str, muted: bool):
+        self._stem_mute[str(name)] = bool(muted)
+
+    def use_stems_only(self, enabled: bool):
+        self._use_stems_only = bool(enabled)
+
+    def _rebuild_stems_for_rate(self):
+        """Stretch stems into output domain for current rate (uses librosa if available)."""
+        self._stems_play = {}
+        if not self._stems_base:
+            return
+        if abs(self._rate - 1.0) < 1e-6 or librosa is None:
+            # No stretch needed or no stretcher; use base
+            for k, a in self._stems_base.items():
+                self._stems_play[k] = a
+            return
+        for k, a in self._stems_base.items():
+            try:
+                if a.ndim == 1 or a.shape[1] == 1:
+                    mono = a[:, 0] if a.ndim == 2 else a
+                    st = librosa.effects.time_stretch(y=mono.astype(float, copy=False), rate=self._rate)
+                    st = st.astype(np.float32, copy=False)
+                    self._stems_play[k] = st.reshape(-1, 1)
+                else:
+                    chans = []
+                    for c in range(a.shape[1]):
+                        ch = librosa.effects.time_stretch(y=a[:, c].astype(float, copy=False), rate=self._rate)
+                        chans.append(ch)
+                    L = max(len(ch) for ch in chans)
+                    chans = [np.pad(ch, (0, L - len(ch))) for ch in chans]
+                    st = np.stack(chans, axis=1).astype(np.float32, copy=False)
+                    self._stems_play[k] = st
+            except Exception:
+                # On any failure, fall back to base for this stem
+                self._stems_play[k] = a
 
     def _rebuild_rate(self, rate: float) -> bool:
         """Rebuild the playback buffer for a new rate, preserving pitch.
@@ -229,6 +306,8 @@ class LoopPlayer:
         # Keep transport position stable in original time
         t_orig = self.position_seconds()
         self._frames_out = int(t_orig * self.sr / max(self._rate, 1e-6))
+        # Rebuild stems stretched buffers for new rate
+        self._rebuild_stems_for_rate()
         return True
 
     def set_rate(self, rate: float) -> bool:
@@ -239,49 +318,95 @@ class LoopPlayer:
         if status:
             pass
         outdata[:] = 0.0
-        y = self._y_play
-        if y is None:
-            return
-        n_total = int(y.shape[0])
-        ch_file = y.shape[1] if y.ndim == 2 else 1
-        ch_out = outdata.shape[1]
 
         # Output‑domain loop bounds if present, else fall back to original indices
         if self._loop_frames_out:
             loop_a, loop_b = int(self._loop_frames_out[0]), int(self._loop_frames_out[1])
         elif getattr(self, 'hi', 0) > getattr(self, 'lo', 0):
-            # legacy: map original sample indices approximately to output domain by rate
             loop_a = int(self.lo / max(self._rate, 1e-6))
             loop_b = int(self.hi / max(self._rate, 1e-6))
         else:
-            loop_a, loop_b = 0, n_total
+            loop_a, loop_b = 0, (self._y_play.shape[0] if self._y_play is not None else 0)
 
         pos = int(self._frames_out)
         wrote = 0
-        while wrote < frames:
-            if pos >= loop_b:
-                if loop_b > loop_a:
-                    pos = loop_a
-                else:
+        ch_out = outdata.shape[1]
+
+        # If stems are present and enabled, mix stems; else play the full mix buffer
+        if self._stems_play and self._use_stems_only:
+            # determine a safe loop_b from stems too
+            if not self._loop_frames_out:
+                lens = [v.shape[0] for v in self._stems_play.values()]
+                if lens:
+                    loop_b = min(loop_b, min(lens)) if loop_b else min(lens)
+            while wrote < frames:
+                if pos >= loop_b:
+                    if loop_b > loop_a:
+                        pos = loop_a
+                    else:
+                        break
+                take = min(frames - wrote, loop_b - pos)
+                if take <= 0:
                     break
-            take = min(frames - wrote, loop_b - pos)
-            if take <= 0:
-                break
-            if ch_file == 1:
-                src = y[pos:pos+take]
-                if src.ndim == 1:
-                    src = src.reshape(-1, 1)
-            else:
-                src = y[pos:pos+take, :ch_file]
-            if ch_file >= ch_out:
-                outdata[wrote:wrote+take, :] = src[:, :ch_out]
-            else:
-                outdata[wrote:wrote+take, :ch_file] = src
-                if ch_file == 1 and ch_out > 1:
-                    outdata[wrote:wrote+take, 1:] = src[:, :1]
-            wrote += take
-            pos += take
-        self._frames_out = pos
+                mix = None
+                for name, buf in self._stems_play.items():
+                    if self._stem_mute.get(name):
+                        continue
+                    g = float(self._stem_gains.get(name, 1.0))
+                    if g <= 0.0:
+                        continue
+                    sl = buf[pos:pos+take]
+                    if sl.ndim == 1:
+                        sl = sl.reshape(-1, 1)
+                    sl = sl * g
+                    mix = sl if mix is None else (mix + sl)
+                if mix is None:
+                    block = np.zeros((take, ch_out), dtype=np.float32)
+                else:
+                    if mix.shape[1] >= ch_out:
+                        block = mix[:, :ch_out]
+                    else:
+                        pad = np.zeros((mix.shape[0], ch_out - mix.shape[1]), dtype=mix.dtype)
+                        block = np.concatenate([mix, pad], axis=1)
+                outdata[wrote:wrote+take, :] = block
+                wrote += take
+                pos += take
+            self._frames_out = pos
+            return
+        else:
+            y = self._y_play
+            n_total = int(y.shape[0]) if y is not None else 0
+            while wrote < frames:
+                if pos >= loop_b:
+                    if loop_b > loop_a:
+                        pos = loop_a
+                    else:
+                        break
+                take = min(frames - wrote, loop_b - pos)
+                if take <= 0:
+                    break
+                if y is None or n_total == 0:
+                    block = np.zeros((take, ch_out), dtype=np.float32)
+                else:
+                    j = min(pos + take, n_total)
+                    chunk = y[pos:j]
+                    if chunk.ndim == 1:
+                        out = np.column_stack([chunk, chunk]).astype(np.float32, copy=False)
+                    else:
+                        if ch_out <= chunk.shape[1]:
+                            out = chunk[:, :ch_out].astype(np.float32, copy=False)
+                        else:
+                            pad = np.zeros((chunk.shape[0], ch_out - chunk.shape[1]), dtype=chunk.dtype)
+                            out = np.concatenate([chunk, pad], axis=1).astype(np.float32, copy=False)
+                    # pad if needed
+                    if out.shape[0] < take:
+                        pad = np.zeros((take - out.shape[0], out.shape[1]), dtype=out.dtype)
+                        out = np.vstack([out, pad])
+                    block = out
+                outdata[wrote:wrote+take, :] = block
+                wrote += take
+                pos += take
+            self._frames_out = pos
 
     def play(self):
         if self.stream is None:

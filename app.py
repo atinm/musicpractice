@@ -14,7 +14,10 @@ try:
 except Exception:
     HAS_STRETCH = False
 from utils import temp_wav_path
+from stems import separate_stems, load_stem_arrays, order_stem_names
 
+import os
+from pathlib import Path
 
 class WaveformView(QtWidgets.QWidget):
     """Scrolling waveform that moves right→left with a chord lane underneath."""
@@ -864,6 +867,19 @@ class Main(QtWidgets.QMainWindow):
         self.toolbar.addWidget(self.rate_spin)
         self.toolbar.addAction(self.act_render)
 
+        # === Stems UI (dock hidden by default) ===
+        self.stems_dock = QtWidgets.QDockWidget("Stems", self)
+        self.stems_dock.setObjectName("StemsDock")
+        self.stems_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+        self.stems_panel = QtWidgets.QWidget(self.stems_dock)
+        self.stems_layout = QtWidgets.QVBoxLayout(self.stems_panel)
+        self.stems_layout.setContentsMargins(6, 6, 6, 6)
+        self.stems_layout.setSpacing(8)
+        self.stems_panel.setLayout(self.stems_layout)
+        self.stems_dock.setWidget(self.stems_panel)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.stems_dock)
+        self.stems_dock.hide()
+
         # Snap toggle
         self.snap_checkbox = QtWidgets.QCheckBox("Snap")
         self.snap_checkbox.setChecked(True)
@@ -917,6 +933,13 @@ class Main(QtWidgets.QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction(save_act)
         file_menu.addAction(load_act)
+
+        # View menu
+        view_menu = self.menuBar().addMenu("View")
+        self.act_toggle_stems = QAction("Separate && Show Stems", self)
+        self.act_toggle_stems.setCheckable(True)
+        self.act_toggle_stems.toggled.connect(self._toggle_stems)
+        view_menu.addAction(self.act_toggle_stems)
 
         # Signals
         self.rate_spin.valueChanged.connect(self._rate_changed)
@@ -1037,6 +1060,156 @@ class Main(QtWidgets.QMainWindow):
             self.statusBar().showMessage(f"Session saved → {sidecar.name}")
         except Exception as e:
             self.statusBar().showMessage(f"Save failed: {e}")
+
+    def _song_cache_dir(self, audio_path: str) -> Path:
+        p = Path(audio_path)
+        try:
+            st = p.stat()
+            meta = f"{st.st_size}_{int(st.st_mtime)}"
+        except Exception:
+            meta = "0_0"
+        safe = p.stem.replace(os.sep, "_")
+        root = p.parent / ".openpractice" / "stems" / f"{safe}__{meta}"
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    def _toggle_stems(self, on: bool):
+        """Run stem separation (Demucs) and show a simple mixer UI with per-stem volume & mute."""
+        # Turning OFF: hide and clear
+        if not on:
+            self.stems_dock.hide()
+            # clear UI rows
+            while self.stems_layout.count():
+                item = self.stems_layout.takeAt(0)
+                w = item.widget()
+                if w:
+                    w.deleteLater()
+            # clear player stems
+            if self.player and hasattr(self.player, 'clear_stems'):
+                self.player.clear_stems()
+            return
+
+        # Turning ON requires an audio file
+        if not self.current_path:
+            self.statusBar().showMessage("Open a track first")
+            self.act_toggle_stems.setChecked(False)
+            return
+
+        # Run Demucs into a per-song cache folder
+        outdir = self._song_cache_dir(self.current_path)
+        preexisting = sorted(outdir.rglob("*.wav"))
+        if preexisting:
+            stem_dir = outdir
+        else:
+            stem_dir = separate_stems(self.current_path, str(outdir))
+        # descend to deepest dir that has .wav files (Demucs creates model/track)
+        leaf = stem_dir
+        candidates = [d for d in stem_dir.rglob("*") if d.is_dir() and list(d.glob("*.wav"))]
+        if candidates:
+            leaf = max(candidates, key=lambda p: p.stat().st_mtime)
+        stem_dir = leaf
+
+        # Load arrays
+        try:
+            arrays = load_stem_arrays(stem_dir)
+        except Exception as e:
+            self.statusBar().showMessage(f"Load stems failed: {e}")
+            self.act_toggle_stems.setChecked(False)
+            return
+        if not arrays:
+            self.statusBar().showMessage("No stems produced")
+            self.act_toggle_stems.setChecked(False)
+            return
+
+        # Feed to player
+        try:
+            if self.player and hasattr(self.player, 'set_stems_arrays'):
+                self.player.set_stems_arrays(arrays)
+                if hasattr(self.player, 'use_stems_only'):
+                    self.player.use_stems_only(True)
+        except Exception as e:
+            self.statusBar().showMessage(f"Player stems error: {e}")
+            self.act_toggle_stems.setChecked(False)
+            return
+
+        # Build UI rows
+        for name in order_stem_names(list(arrays.keys())):
+            self._add_stem_row(name, arrays[name])
+
+        self.stems_dock.show()
+
+    def _add_stem_row(self, name: str, arr: np.ndarray):
+        row = QtWidgets.QWidget(self.stems_panel)
+        hl = QtWidgets.QHBoxLayout(row)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.setSpacing(6)
+
+        lab = QtWidgets.QLabel(name.capitalize(), row)
+        lab.setMinimumWidth(70)
+
+        # Mini waveform
+        mini = QtWidgets.QWidget(row)
+        mini.setMinimumHeight(36)
+        mini.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+
+        def _paint(ev, a=arr):
+            p = QtGui.QPainter(mini)
+            p.fillRect(mini.rect(), QtGui.QColor(18, 18, 18))
+            r = mini.rect()
+            if a is None or getattr(a, 'size', 0) == 0:
+                p.end(); return
+            data = a[:, 0] if (a.ndim == 2 and a.shape[1] >= 1) else (a if a.ndim == 1 else None)
+            if data is None:
+                p.end(); return
+            w = max(1, r.width())
+            step = max(1, int(len(data) / w))
+            samples = data[::step]
+            mid = r.center().y()
+            h2 = max(1, int(r.height() * 0.45))
+            path = QtGui.QPainterPath()
+            for i, s in enumerate(samples[:w]):
+                y = mid - int(h2 * float(s))
+                if i == 0:
+                    path.moveTo(r.left() + i, y)
+                else:
+                    path.lineTo(r.left() + i, y)
+            pen = QtGui.QPen(QtGui.QColor(120, 200, 255))
+            pen.setWidth(1)
+            p.setPen(pen)
+            p.drawPath(path)
+            p.end()
+
+        mini.paintEvent = _paint
+
+        vol = QtWidgets.QSlider(Qt.Vertical, row)
+        vol.setRange(0, 100)
+        vol.setValue(100)
+        vol.setFixedHeight(36)
+        vol.setToolTip("Volume")
+
+        mute = QtWidgets.QToolButton(row)
+        mute.setText("M")
+        mute.setCheckable(True)
+        mute.setToolTip("Mute")
+
+        def _vol_changed(v, nm=name):
+            if self.player and hasattr(self.player, 'set_stem_gain'):
+                self.player.set_stem_gain(nm, float(v) / 100.0)
+
+        def _mute_toggled(m, nm=name, slider=vol):
+            if self.player and hasattr(self.player, 'set_stem_mute'):
+                self.player.set_stem_mute(nm, bool(m))
+            slider.setEnabled(not m)
+
+        vol.valueChanged.connect(_vol_changed)
+        mute.toggled.connect(_mute_toggled)
+
+        hl.addWidget(lab)
+        hl.addWidget(mini, 1)
+        hl.addWidget(vol)
+        hl.addWidget(mute)
+        row.setLayout(hl)
+        self.stems_layout.addWidget(row)
 
     def _sync_saved_loops_to_view(self):
         if hasattr(self, 'wave'):
@@ -1375,6 +1548,10 @@ class Main(QtWidgets.QMainWindow):
         self.wave.set_player(self.player)
         # Apply current UI rate to fresh player (keeps UI and audio consistent)
         self._rate_changed(self.rate_spin.value())
+
+        # If stems UI is active, clear it for the new track
+        if hasattr(self, 'act_toggle_stems') and self.act_toggle_stems.isChecked():
+            self.act_toggle_stems.setChecked(False)
 
         # Align visual time 0 to first non-silent audio and position the transport
         lead = self._detect_leading_silence_seconds(self.player.y, self.player.sr)
