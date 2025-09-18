@@ -1992,21 +1992,21 @@ class Main(QtWidgets.QMainWindow):
         print(f"[DBG] _edit_chord_at_time: updated idx={idx} → '{text}'")
 
     def _split_chord_at_time(self, t: float):
-        """Split the chord that contains time t at its midpoint, then snap that
-        midpoint to the nearest beat if Snap is enabled. Finally normalize the
-        chord sequence (snap→split-at-bars→fill-leading→dedupe), update UI, save."""
+        """Split the chord containing time t so the two parts have equal beat counts;
+        if the total beat count is odd, the first (left) part has one more beat.
+        The split is snapped to a beat strictly inside the chord span when possible.
+        """
         t = float(t)
         print(f"[DBG] _split_chord_at_time(request t={t:.3f})")
 
-        # Find the chord containing the click time
+        # Find chord index at click time
         idx = self._find_chord_index_at_time(t)
         if idx is None:
             print("[DBG] _split_chord_at_time: no chord at click time")
             return
         try:
             seg = dict(self.last_chords[idx])
-            a = float(seg.get('start'))
-            b = float(seg.get('end'))
+            a = float(seg.get('start')); b = float(seg.get('end'))
             lab = seg.get('label')
         except Exception:
             print("[DBG] _split_chord_at_time: bad segment data")
@@ -2015,58 +2015,53 @@ class Main(QtWidgets.QMainWindow):
             print("[DBG] _split_chord_at_time: zero/negative length segment; abort")
             return
 
-        # 1) Use the segment midpoint
-        mid = 0.5 * (a + b)
-
-        # 2) If Snap is enabled and we have beats, snap midpoint to the nearest
-        # beat STRICTLY INSIDE (a, b). This avoids snapping to bar edges.
-        # On ties (equidistant), bias to the earlier beat (end of beat 2 in 4/4).
-        mid_snapped = mid
+        # Collect beats strictly inside (a, b)
+        eps_in = 1e-6
+        inside = []
         try:
-            if bool(self.wave.snap_enabled) and self.last_beats:
+            if self.last_beats:
                 arr = np.asarray(self.last_beats, dtype=float)
-                eps_in = 1e-3
-                inside = arr[(arr > a + eps_in) & (arr < b - eps_in)]
-                if inside.size:
-                    diffs = np.abs(inside - mid)
-                    dmin = float(diffs.min())
-                    # candidates within numerical tie tolerance
-                    tol = 1e-9
-                    idxs = np.where(np.abs(diffs - dmin) <= tol)[0]
-                    # Prefer the earlier candidate if one is <= mid
-                    earlier = [k for k in idxs if inside[k] <= mid + tol]
-                    choice = earlier[-1] if earlier else int(idxs[0])
-                    mid_snapped = float(inside[choice])
+                inside = arr[(arr > a + eps_in) & (arr < b - eps_in)].tolist()
         except Exception:
-            pass
+            inside = []
 
-        # Keep split strictly inside the segment (avoid edges)
+        # Choose split point
+        if inside:
+            m = len(inside)  # number of interior beats
+            # Choose interior beat index so left intervals = ceil((m+1)/2)
+            k = int(np.ceil((m + 1) / 2.0))  # 1-based index
+            k = max(1, min(m, k))
+            split_t = float(inside[k - 1])
+            print(f"[DBG] _split_chord_at_time: interior beats m={m} → k={k} → split_t={split_t:.3f}")
+        else:
+            # Fallback: use the temporal midpoint
+            split_t = 0.5 * (a + b)
+            print(f"[DBG] _split_chord_at_time: no interior beats → midpoint split_t={split_t:.3f}")
+
+        # Keep strictly inside the span
         eps = 1e-3
-        if mid_snapped <= a + eps:
-            mid_snapped = min(a + eps, b - eps)
-        if mid_snapped >= b - eps:
-            mid_snapped = max(b - eps, a + eps)
+        if split_t <= a + eps:
+            split_t = min(a + eps, b - eps)
+        if split_t >= b - eps:
+            split_t = max(b - eps, a + eps)
 
-        print(f"[DBG] _split_chord_at_time: a={a:.3f} b={b:.3f} mid={mid:.3f} → snapped={mid_snapped:.3f}")
-
-        left = {'start': a, 'end': mid_snapped, 'label': lab}
-        right = {'start': mid_snapped, 'end': b, 'label': lab}
+        left = {'start': a, 'end': split_t, 'label': lab}
+        right = {'start': split_t, 'end': b, 'label': lab}
         self.last_chords = self.last_chords[:idx] + [left, right] + self.last_chords[idx+1:]
 
-        # Normalize for rendering/persistence: snap-to-bars → split-at-bars → fill-leading → dedupe
+        # Minimal normalization: enforce bar boundaries, keep user beat split
         try:
-            snapped = self.wave._snap_segments_to_bars(self.last_chords, self.last_bars or [])
-            split2 = self.wave._split_segments_at_bars(snapped, self.last_bars or [])
+            split2 = self.wave._split_segments_at_bars(self.last_chords, self.last_bars or [])
             filled = self.wave._ensure_leading_bar(split2, self.last_bars or [])
             self.last_chords = self.wave._unique_by_span(filled)
         except Exception:
             pass
 
-        # Reflect in UI and save
+        # Update UI and persist
         self.wave.set_chords(self.last_chords)
         self.save_session()
-        self.statusBar().showMessage(f"Chord split at {mid_snapped:.2f}s", 1200)
-        print(f"[DBG] _split_chord_at_time: split idx={idx} at {mid_snapped:.3f}s → two segments")
+        self.statusBar().showMessage(f"Chord split at {split_t:.2f}s", 1200)
+        print(f"[DBG] _split_chord_at_time: idx={idx} split at {split_t:.3f}s → two segments")
 
     def _join_chord_forward_at_time(self, t: float):
         """Join the chord at time t with the next chord if contiguous and within same bar."""
