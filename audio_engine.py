@@ -89,9 +89,11 @@ class LoopPlayer:
         self.hi = self.n
         self.pos = 0
         self._playing = False
+        self._pos_samples = 0
         self.stream = sd.OutputStream(
             samplerate=self.sr,
             channels=self.y.shape[1],
+            dtype='float32',
             callback=self._cb,
         )
 
@@ -113,47 +115,96 @@ class LoopPlayer:
             self.start()
 
     def set_loop_seconds(self, start_s: float, end_s: float):
-        with self.lock:
-            lo = int(max(0, min(self.n - 1, start_s * self.sr)))
-            hi = int(max(lo + 1, min(self.n, end_s * self.sr)))
-            self.lo, self.hi = lo, hi
-            self.pos = self.lo
-
-    def position_seconds(self) -> float:
-        with self.lock:
-            return self.pos / float(self.sr)
+        lo = int(max(0, min(self.n - 1, start_s * self.sr)))
+        hi = int(max(lo + 1, min(self.n, end_s * self.sr)))
+        self.lo, self.hi = lo, hi
 
     def duration_seconds(self) -> float:
         """Total duration of the loaded buffer in seconds."""
         return self.n / float(self.sr)
 
-    def set_position_seconds(self, t: float, within_loop: bool = True):
-        """Seek playback position to time `t` seconds.
-        If `within_loop` is True, clamp to the current loop [lo, hi), else clamp to full buffer.
-        """
-        if within_loop:
-            lo, hi = self.lo, self.hi
+    def position_seconds(self) -> float:
+        return float(self._pos_samples) / float(self.sr)
+
+    def set_position_seconds(self, t: float, within_loop: bool = False):
+        t = float(max(0.0, t))
+        total = self.y.shape[0] if self.y is not None else 0
+        pos = int(t * self.sr)
+        if within_loop and getattr(self, 'hi', 0) > getattr(self, 'lo', 0):
+            a = max(0, int(self.lo))
+            b = min(total, int(self.hi))
+            pos = max(a, min(max(a, b - 1), pos))
         else:
-            lo, hi = 0, self.n
-        with self.lock:
-            sample = int(round(max(lo, min(hi - 1, t * self.sr))))
-            self.pos = sample
+            pos = max(0, min(max(0, total - 1), pos))
+        self._pos_samples = pos
+
+    def clear_loop(self):
+        self.lo, self.hi = 0, 0
 
     def _cb(self, outdata, frames, time, status):
         if status:
+            # print(status)  # optional
             pass
-        with self.lock:
-            end = min(self.pos + frames, self.hi)
-            chunk = self.y[self.pos:end]
-            if end - self.pos < frames:  # wrap
-                missing = frames - (end - self.pos)
-                chunk = np.vstack([chunk, self.y[self.lo:self.lo + missing]])
-                self.pos = self.lo + missing
+        # Zero fill by default
+        outdata[:] = 0.0
+        if self.y is None:
+            return
+
+        n_total = self.y.shape[0]
+        ch_file = self.y.shape[1] if self.y.ndim == 2 else 1
+        ch_out = outdata.shape[1]
+
+        # Loop bounds in samples (use lo/hi exclusively)
+        if getattr(self, 'hi', 0) > getattr(self, 'lo', 0):
+            loop_a, loop_b = int(self.lo), int(self.hi)
+        else:
+            loop_a, loop_b = 0, n_total
+
+        pos = int(self._pos_samples)
+        wrote = 0
+        while wrote < frames:
+            if pos >= loop_b:
+                # wrap if a loop exists; otherwise leave remaining silence
+                if loop_b > loop_a:
+                    pos = loop_a
+                else:
+                    break
+            take = min(frames - wrote, loop_b - pos)
+            if take <= 0:
+                break
+            if ch_file == 1:
+                src = self.y[pos:pos+take]
+                if src.ndim == 1:
+                    src = src.reshape(-1, 1)
             else:
-                self.pos = end
-        outdata[:len(chunk)] = chunk
-        if len(chunk) < frames:
-            outdata[len(chunk):] = 0
+                src = self.y[pos:pos+take, :ch_file]
+            # Fit channels to device
+            if ch_file >= ch_out:
+                outdata[wrote:wrote+take, :] = src[:, :ch_out]
+            else:
+                outdata[wrote:wrote+take, :ch_file] = src
+                if ch_file == 1 and ch_out > 1:
+                    outdata[wrote:wrote+take, 1:] = src[:, :1]
+            wrote += take
+            pos += take
+        self._pos_samples = pos
+
+    def play(self):
+        if self.stream is None:
+            import sounddevice as sd
+            self.stream = sd.OutputStream(
+                samplerate=self.sr,
+                channels=(self.y.shape[1] if self.y.ndim == 2 else 1),
+                dtype='float32',
+                callback=self._cb,
+                blocksize=0,
+            )
+        if not self.stream.active:
+            self.stream.start()
+
+    def pause(self):
+        if self.stream is not None and self.stream.active:
+            self.stream.stop()
 
     def start(self):
         if not self._playing:

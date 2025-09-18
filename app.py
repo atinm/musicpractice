@@ -20,6 +20,17 @@ class WaveformView(QtWidgets.QWidget):
 
     requestSetLoop = QtCore.Signal(float, float)  # (A, B) in seconds (absolute timeline)
     requestSeek = QtCore.Signal(float)  # absolute seconds to seek playhead
+    requestAddLoop = QtCore.Signal(float, float)          # create a new saved loop [a,b]
+    requestUpdateLoop = QtCore.Signal(int, float, float)  # update saved loop id → [a,b]
+    requestSelectLoop = QtCore.Signal(int)                # select a saved loop by id
+    requestDeleteSelected = QtCore.Signal()               # delete currently selected saved loop
+    requestRenameLoop = QtCore.Signal(int)     # loop id to rename
+    requestDeleteLoopId = QtCore.Signal(int)   # loop id to delete
+
+    def set_saved_loops(self, loops: list[dict] | None):
+        self.saved_loops = list(loops or [])
+        self.update()
+
     def __init__(self, parent=None, window_s: float = 15.0):
         super().__init__(parent)
         self.setFocusPolicy(Qt.StrongFocus)
@@ -46,12 +57,20 @@ class WaveformView(QtWidgets.QWidget):
         self.HANDLE_PX = 6
         self.FLAG_W = 10
         self.FLAG_H = 10
+        self.FLAG_STRIP = 16  # pixels reserved at the top of waveform for flags & loop names
         self.saved_loops = []            # optional: list of dicts {id,a,b,label}
         self.selected_loop_id = None
         # drag state
-        self._press_kind = None          # 'new' | 'flag' | 'edgeA' | 'edgeB' | None
+        self._press_kind = None          # 'new' | 'edgeA' | 'edgeB' | None
         self._press_loop_id = None
         self._press_dx = 0.0             # offset used when moving a loop via flag
+        # click vs drag tracking
+        self._press_x = None             # x at mouse press (px)
+        self._drag_started = False       # becomes True once threshold passed
+        self._click_thresh_px = 4        # pixels before treating as drag
+        self._freeze_window = False
+        self._manual_t0 = None
+        self._manual_t1 = None
 
     def set_beats(self, beats: list | None, bars: list | None):
         self.beats = beats or []
@@ -80,6 +99,11 @@ class WaveformView(QtWidgets.QWidget):
         self.loopB = float(B)
         self.update()
 
+    def clear_loop_visual(self):
+        self.loopA = None
+        self.loopB = None
+        self.update()
+
     def set_snap_enabled(self, enabled: bool):
         self.snap_enabled = bool(enabled)
         self.update()
@@ -92,18 +116,19 @@ class WaveformView(QtWidgets.QWidget):
         """Return (kind, loop_id) if hit on a flag or edge."""
         x = pos.x()
         y = pos.y()
-        flag_top = -2 - self.FLAG_H
+        flag_top = 0
+        flag_bottom = min(wf_h, self.FLAG_STRIP)
         if hasattr(self, 'saved_loops'):
             for L in self.saved_loops:
                 a = float(L['a'])
                 b = float(L['b'])
                 fx = self._x_from_time(a, t0, t1, w)
-                # START flag hit-test
-                if abs(x - fx) <= self.FLAG_W and y <= wf_h and y >= flag_top:
-                    return ("flag", int(L['id']))
+                # START flag hit-test → resize A
+                if abs(x - fx) <= self.FLAG_W and (0 <= y <= wf_h) and (flag_top <= y <= flag_bottom):
+                    return ("edgeA", int(L['id']))
                 # END flag hit-test (acts like grabbing edgeB for resize)
                 fxb = self._x_from_time(b, t0, t1, w)
-                if abs(x - fxb) <= self.FLAG_W and y <= wf_h and y >= flag_top:
+                if abs(x - fxb) <= self.FLAG_W and (0 <= y <= wf_h) and (flag_top <= y <= flag_bottom):
                     return ("edgeB", int(L['id']))
                 # edge hit zones (within waveform)
                 if 0 <= y <= wf_h:
@@ -113,23 +138,58 @@ class WaveformView(QtWidgets.QWidget):
                         return ("edgeA", int(L['id']))
                     if abs(x - xb) <= self.HANDLE_PX:
                         return ("edgeB", int(L['id']))
+        # Fallback: active loop handles/flags when no saved loop was hit
+        if self.loopA is not None and self.loopB is not None:
+            a = float(min(self.loopA, self.loopB)); b = float(max(self.loopA, self.loopB))
+            fx = self._x_from_time(a, t0, t1, w)
+            # START flag → resize A on active loop
+            if abs(x - fx) <= self.FLAG_W and (0 <= y <= wf_h) and (flag_top <= y <= flag_bottom):
+                return ("edgeA", -1)
+            # END flag (treat like edgeB resize)
+            fxb = self._x_from_time(b, t0, t1, w)
+            if abs(x - fxb) <= self.FLAG_W and (0 <= y <= wf_h) and (flag_top <= y <= flag_bottom):
+                return ("edgeB", -1)
+            # edges within waveform
+            if 0 <= y <= wf_h:
+                xa = self._x_from_time(a, t0, t1, w)
+                xb = self._x_from_time(b, t0, t1, w)
+                if abs(x - xa) <= self.HANDLE_PX:
+                    return ("edgeA", -1)
+                if abs(x - xb) <= self.HANDLE_PX:
+                    return ("edgeB", -1)
         return (None, None)
 
     def _time_at_x(self, x: int, t0: float, t1: float, w: int) -> float:
         x = max(0, min(w - 1, x))
         return t0 + (t1 - t0) * (x / max(1, w - 1))
 
+    def _window_from_center(self, c: float):
+        half = self.window_s * 0.5
+        return c - half, c + half
+
+    def freeze_window_now(self):
+        """Capture the current visual window and hold it until unfreeze."""
+        t0, t1 = self._current_window()
+        self._manual_t0, self._manual_t1 = float(t0), float(t1)
+        self._freeze_window = True
+        self.update()
+
+    def unfreeze_and_center(self):
+        """Release the hold so the view recenters on the playhead."""
+        self._freeze_window = False
+        self._manual_t0 = None
+        self._manual_t1 = None
+        self.update()
+
     def _current_window(self):
+        # If frozen (after a click seek), hold the captured window
+        if self._freeze_window and self._manual_t0 is not None and self._manual_t1 is not None:
+            return float(self._manual_t0), float(self._manual_t1)
         if not self.player:
-            # center playhead at 0 with lookahead/behind
             half = self.window_s * 0.5
             return -half, half
         t = self.player.position_seconds()
-        half = self.window_s * 0.5
-        # Do NOT clamp to 0 here; negative start will render as empty padding
-        start = t - half
-        end = t + half
-        return start, end
+        return self._window_from_center(t)
 
     def _mono_slice_minmax(self, start_s: float, end_s: float, width: int):
         if not self.player or width <= 2:
@@ -171,6 +231,29 @@ class WaveformView(QtWidgets.QWidget):
         maxs[x0:x0+L] = maxs_seg[:L]
         return mins, maxs
 
+    def contextMenuEvent(self, e: QtGui.QContextMenuEvent):
+        # Right-click → offer a small menu if we're over a loop flag/edge
+        if not hasattr(self, 'saved_loops') or not self.saved_loops:
+            return
+        t0, t1 = self._current_window()
+        w = self.width(); h = self.height(); wf_h = int(h * 0.7)
+        pos = e.pos()
+        kind, lid = self._hit_test(pos, t0, t1, w, wf_h)
+        if lid is None or lid == -1:
+            return  # only support saved loops via menu
+        # Select it for visual feedback
+        self.selected_loop_id = int(lid)
+        self.requestSelectLoop.emit(int(lid))
+        # Build menu
+        menu = QtWidgets.QMenu(self)
+        actRename = menu.addAction("Rename loop…")
+        actDelete = menu.addAction("Delete loop")
+        chosen = menu.exec(e.globalPos())
+        if chosen == actRename:
+            self.requestRenameLoop.emit(int(lid))
+        elif chosen == actDelete:
+            self.requestDeleteLoopId.emit(int(lid))
+
     def mousePressEvent(self, e: QtGui.QMouseEvent):
         if not self.player:
             return
@@ -179,23 +262,29 @@ class WaveformView(QtWidgets.QWidget):
         kind, lid = self._hit_test(e.position().toPoint(), t0, t1, w, wf_h)
         t = self._time_at_x(int(e.position().x()), t0, t1, w)
         self._press_t = t
+        self._press_x = int(e.position().x())
+        self._drag_started = False
         if kind is None:
-            # start a new loop by drag in empty space
-            self._press_kind = 'new'
+            # empty space: may become seek (click) or new loop (drag)
+            self._press_kind = 'empty'
             self._press_loop_id = None
-            self.set_loop_visual(t, t)
         else:
-            # grabbed an existing loop handle/flag
+            # grabbed an existing loop edge; prepare to resize
             self._press_kind = kind
             self._press_loop_id = lid
-            # Preview edit by setting visual loop to the grabbed loop's extents
+            # preview extents for feedback
             L = next((x for x in self.saved_loops if x.get('id') == lid), None)
-            if L is not None:
+            if L is None and lid == -1 and self.loopA is not None and self.loopB is not None:
+                a = float(min(self.loopA, self.loopB)); b = float(max(self.loopA, self.loopB))
+            elif L is not None:
                 a = float(min(L['a'], L['b'])); b = float(max(L['a'], L['b']))
-                self.set_loop_visual(a, b)
-                if kind == 'flag':
-                    # moving whole loop: store offset from mouse to loop start
-                    self._press_dx = t - a
+            else:
+                a = b = t
+            self.set_loop_visual(a, b)
+            if lid is not None:
+                self.selected_loop_id = lid if lid != -1 else None
+                if lid != -1:
+                    self.requestSelectLoop.emit(int(lid))
         e.accept()
 
     def mouseMoveEvent(self, e: QtGui.QMouseEvent):
@@ -203,30 +292,47 @@ class WaveformView(QtWidgets.QWidget):
             return
         t0, t1 = self._current_window(); w = self.width(); h = self.height()
         t = self._time_at_x(int(e.position().x()), t0, t1, w)
-        if self._press_kind == 'new':
-            a = min(self._press_t, t); b = max(self._press_t, t)
-            if b - a < 0.01: b = a + 0.01
-            self.set_loop_visual(a, b)
-        elif self._press_kind in ('edgeA', 'edgeB', 'flag') and self._press_loop_id is not None:
+        if self._press_kind == 'empty':
+            dx = abs(int(e.position().x()) - int(self._press_x))
+            if not self._drag_started and dx >= self._click_thresh_px:
+                # begin creating a new loop
+                self._drag_started = True
+                a = min(self._press_t, t); b = max(self._press_t, t)
+                if b - a < 0.01: b = a + 0.01
+                self.set_loop_visual(a, b)
+            elif self._drag_started:
+                a = min(self._press_t, t); b = max(self._press_t, t)
+                if b - a < 0.01: b = a + 0.01
+                self.set_loop_visual(a, b)
+        elif self._press_kind in ('edgeA', 'edgeB') and self._press_loop_id is not None:
             L = next((x for x in self.saved_loops if x.get('id') == self._press_loop_id), None)
             if L is None:
-                return
-            a = float(min(L['a'], L['b'])); b = float(max(L['a'], L['b']))
+                if self.loopA is None or self.loopB is None:
+                    return
+                a = float(min(self.loopA, self.loopB)); b = float(max(self.loopA, self.loopB))
+            else:
+                a = float(min(L['a'], L['b'])); b = float(max(L['a'], L['b']))
             if self._press_kind == 'edgeA':
                 a = min(t, b - 0.01)
             elif self._press_kind == 'edgeB':
                 b = max(t, a + 0.01)
-            elif self._press_kind == 'flag':
-                width = b - a
-                a = max(0.0, t - self._press_dx)
-                b = a + width
+            self._drag_started = True
             self.set_loop_visual(a, b)
         e.accept()
 
     def mouseReleaseEvent(self, e: QtGui.QMouseEvent):
+        # Click (no drag) in empty space → seek to that time
+        if self._press_kind == 'empty' and not self._drag_started and self._press_t is not None:
+            self.freeze_window_now()
+            self.requestSeek.emit(float(self._press_t))
+            # reset
+            self._press_kind = None; self._press_loop_id = None; self._press_t = None; self._press_x = None; self._drag_started = False
+            e.accept();
+            return
+
         if self._press_t is None or self.loopA is None or self.loopB is None:
             # reset
-            self._press_kind = None; self._press_loop_id = None; self._press_t = None
+            self._press_kind = None; self._press_loop_id = None; self._press_t = None; self._press_x = None; self._drag_started = False
             return
         a = float(min(self.loopA, self.loopB)); b = float(max(self.loopA, self.loopB))
         # Optional snap to beats
@@ -239,10 +345,15 @@ class WaveformView(QtWidgets.QWidget):
             if b_s < a_s: a_s, b_s = b_s, a_s
             if abs(b_s - a_s) < 1e-3: b_s = a_s + 1e-2
             a, b = a_s, b_s
-        # Commit by telling Main to set the active loop (works for new or edited)
-        self.requestSetLoop.emit(a, b)
+        # Commit
+        if (self._press_kind in ('empty', 'new')) and self._drag_started:
+            self.requestAddLoop.emit(a, b)
+        elif self._press_kind in ('edgeA', 'edgeB') and self._press_loop_id is not None:
+            self.requestUpdateLoop.emit(int(self._press_loop_id), a, b)
+        else:
+            self.requestSetLoop.emit(a, b)
         # reset
-        self._press_kind = None; self._press_loop_id = None; self._press_t = None
+        self._press_kind = None; self._press_loop_id = None; self._press_t = None; self._press_x = None; self._drag_started = False
         e.accept()
 
     def wheelEvent(self, e: QtGui.QWheelEvent):
@@ -288,13 +399,20 @@ class WaveformView(QtWidgets.QWidget):
         new_window = max(min_window, min(max_window, new_window))
         if abs(new_window - self.window_s) > 1e-6:
             self.window_s = new_window
-            self.update()
+            if self._freeze_window and self._manual_t0 is not None and self._manual_t1 is not None:
+                mid = 0.5 * (self._manual_t0 + self._manual_t1)
+                self._manual_t0, self._manual_t1 = self._window_from_center(mid)
+                self.update()
         e.accept()
 
     def keyPressEvent(self, e: QtGui.QKeyEvent):
         if not self.player:
             return
         key = e.key()
+        if key in (Qt.Key_Delete, Qt.Key_Backspace):
+            self.requestDeleteSelected.emit()
+            e.accept()
+            return
         if key not in (Qt.Key_Left, Qt.Key_Right):
             return super().keyPressEvent(e)
         step = self.window_s * 0.2  # pan by 20% of window
@@ -317,37 +435,127 @@ class WaveformView(QtWidgets.QWidget):
         wf_h = int(h * 0.7)
         ch_h = h - wf_h
         t0, t1 = self._current_window()
+        # Visual times relative to the music start (origin)
+        rel_t0 = t0 - self.origin
+        rel_t1 = t1 - self.origin
 
         p.fillRect(0, 0, w, wf_h, QtGui.QColor(20, 20, 20))
         p.fillRect(0, wf_h, w, ch_h, QtGui.QColor(28, 28, 28))
+        # Constrain subsequent waveform drawings (grid, beats, flags, loop fills, waveform, playhead)
+        p.save()
+        p.setClipRect(0, 0, w, wf_h)
 
-        # time grid in *visual* seconds where 0 = music start (origin)
-        p.setPen(QtGui.QPen(QtGui.QColor(60, 60, 60)))
-        rel_t0 = t0 - self.origin
-        rel_t1 = t1 - self.origin
-        first_s = int(np.floor(rel_t0))
-        last_s = int(np.ceil(rel_t1))
-        for s in range(first_s, last_s + 1):
-            x = int((s - rel_t0) / (rel_t1 - rel_t0) * w)
-            p.drawLine(x, 0, x, wf_h)
-            if s >= 0:
-                p.drawText(x + 2, 12, f"{s}s")
-
-        # beat grid over waveform
-        if self.beats:
-            p.setPen(QtGui.QPen(QtGui.QColor(70, 90, 110)))
-            for bt in self.beats:
+        # --- TOP RULER: Prefer BEAT ruler; back-fill beats prior to first downbeat. Fallback → time ruler.
+        have_beats = bool(self.beats)
+        have_bars = bool(self.bars)
+        long_len = min(12, wf_h)
+        short_len = min(6, wf_h)
+        if have_beats:
+            beat_times = np.asarray(self.beats, dtype=float)
+            # Estimate average beat period for back-fill if needed
+            if beat_times.size >= 2:
+                diffs = np.diff(beat_times)
+                good = diffs[(diffs > 0.1) & (diffs < 2.0)]
+                period = float(np.median(good)) if good.size else float(np.median(diffs))
+            else:
+                period = 0.5
+            # Map bars (downbeats) to nearest beat index (±30 ms) to infer phase / beats-per-bar
+            down_idx = set()
+            phase_i0 = None
+            beats_per_bar = None
+            bar_index_by_beat = {}
+            if have_bars and beat_times.size:
+                idxs = []
+                for bar_i, bar_t in enumerate(self.bars, start=1):
+                    i = int(np.argmin(np.abs(beat_times - bar_t)))
+                    if abs(beat_times[i] - bar_t) <= 0.03:
+                        idxs.append(i)
+                        bar_index_by_beat[i] = bar_i  # 1-based numbering
+                if idxs:
+                    idxs = sorted(set(int(i) for i in idxs))
+                    phase_i0 = idxs[0]
+                    if len(idxs) >= 2:
+                        gaps = np.diff(idxs)
+                        if gaps.size:
+                            beats_per_bar = int(np.round(np.median(gaps)))
+                    for i in idxs:
+                        down_idx.add(i)
+            # Build beats covering window: prepend synthetic beats before first to show pickup
+            beats_full = []
+            base_first_idx = 0
+            if beat_times.size:
+                first_bt = float(beat_times[0])
+                k = 1
+                # back-fill slightly beyond window to ensure coverage at left edge
+                while period > 0 and (first_bt - k * period) > (t0 - 2 * period):
+                    beats_full.append(first_bt - k * period)
+                    k += 1
+                beats_full = list(reversed(beats_full)) + beat_times.tolist()
+                base_first_idx = k - 1
+            # Pens
+            pen_long = QtGui.QPen(QtGui.QColor(150, 170, 200)); pen_long.setWidth(1)
+            pen_short = QtGui.QPen(QtGui.QColor(90, 90, 90))
+            text_pen = QtGui.QPen(QtGui.QColor(200, 210, 220))
+            # Draw ticks (+ bar numbers on downbeats, including a backfilled bar 0)
+            for j, bt in enumerate(beats_full):
                 if bt < t0 or bt > t1:
                     continue
                 x = int((bt - t0) / (t1 - t0) * w)
-                p.drawLine(x, 0, x, wf_h)
-        if self.bars:
-            p.setPen(QtGui.QPen(QtGui.QColor(120, 170, 220), 2))
-            for bar_t in self.bars:
-                if bar_t < t0 or bar_t > t1:
-                    continue
-                x = int((bar_t - t0) / (t1 - t0) * w)
-                p.drawLine(x, 0, x, wf_h)
+
+                # Decide downbeat and compute a global beat index to look up/derive bar number
+                i_global = j - base_first_idx
+                is_down = False
+                if beats_per_bar and phase_i0 is not None:
+                    is_down = ((i_global - phase_i0) % max(1, beats_per_bar) == 0)
+                elif have_bars and down_idx:
+                    is_down = (i_global in down_idx)
+                else:
+                    is_down = (j == 0)
+
+                if is_down:
+                    p.setPen(pen_long)
+                    p.drawLine(x, 0, x, long_len)
+
+                    # Determine bar number to draw, if any.
+                    bar_no = None
+                    # Prefer explicit mapping from detected downbeats (1-based numbers)
+                    if i_global in bar_index_by_beat:
+                        bar_no = int(bar_index_by_beat[i_global])
+                    # Otherwise, if meter is known, infer the bar index relative to the first downbeat
+                    elif beats_per_bar and phase_i0 is not None:
+                        # Bar 1 occurs at phase_i0. Previous downbeat is bar 0, etc.
+                        bar_no = 1 + (i_global - phase_i0) // max(1, beats_per_bar)
+                    # If we still don't know, leave unlabeled.
+
+                    # Draw label only for non-negative bars (0, 1, 2, ...); skip negatives
+                    if bar_no is not None and bar_no >= 0:
+                        p.setPen(text_pen)
+                        text_y = int(min(long_len + 10, wf_h - 2))
+                        p.drawText(x + 2, text_y, str(bar_no))
+                else:
+                    p.setPen(pen_short)
+                    p.drawLine(x, 0, x, short_len)
+        else:
+            # Fallback: time ruler with long ticks at seconds + labels, short at half-seconds
+            first_s = int(np.floor(rel_t0))
+            last_s = int(np.ceil(rel_t1))
+            p.setPen(QtGui.QPen(QtGui.QColor(90, 90, 90)))
+            for s in range(first_s, last_s + 1):
+                x = int((s - rel_t0) / (rel_t1 - rel_t0) * w)
+                p.drawLine(x, 0, x, long_len)
+                if s >= 0:
+                    p.setPen(QtGui.QPen(QtGui.QColor(180, 180, 180)))
+                    text_y = int(min(long_len + 10, wf_h - 2))
+                    p.drawText(x + 2, text_y, f"{s}s")
+                    p.setPen(QtGui.QPen(QtGui.QColor(90, 90, 90)))
+            p.setPen(QtGui.QPen(QtGui.QColor(70, 70, 70)))
+            half_start = np.ceil(rel_t0 * 2.0) / 2.0
+            hmark = half_start
+            while hmark <= rel_t1 + 1e-9:
+                if abs(hmark - round(hmark)) > 1e-6:
+                    xh = int((hmark - rel_t0) / (rel_t1 - rel_t0) * w)
+                    p.drawLine(xh, 0, xh, short_len)
+                hmark += 0.5
 
         # loop overlay (if available)
         if self.loopA is not None and self.loopB is not None:
@@ -357,26 +565,97 @@ class WaveformView(QtWidgets.QWidget):
                 a, b = b, a
             x0 = int((a - t0) / (t1 - t0) * w)
             x1 = int((b - t0) / (t1 - t0) * w)
-            p.fillRect(QtCore.QRect(x0, 0, max(1, x1 - x0), wf_h), QtGui.QColor(255, 255, 255, 28))
-            p.setPen(QtGui.QPen(QtGui.QColor(220, 220, 220)))
+            # Overlay: greenish-blue fill, clipped to waveform area, more opacity
+            p.fillRect(QtCore.QRect(x0, 0, max(1, x1 - x0), wf_h), QtGui.QColor(0, 200, 180, 48))
+            p.setPen(QtGui.QPen(QtGui.QColor(210, 210, 210)))
             p.drawLine(x0, 0, x0, wf_h)
             p.drawLine(x1, 0, x1, wf_h)
+            # flags at top strip for the active loop
+            tip_y = 2
+            base_y = min(self.FLAG_STRIP - 2, tip_y + self.FLAG_H)
+            flag_poly_a = QtGui.QPolygon([
+                QtCore.QPoint(x0, tip_y),
+                QtCore.QPoint(x0 - self.FLAG_W//2, base_y),
+                QtCore.QPoint(x0 + self.FLAG_W//2, base_y),
+            ])
+            flag_poly_b = QtGui.QPolygon([
+                QtCore.QPoint(x1, tip_y),
+                QtCore.QPoint(x1 - self.FLAG_W//2, base_y),
+                QtCore.QPoint(x1 + self.FLAG_W//2, base_y),
+            ])
+            # Yellow flags for active loop
+            p.setPen(QtGui.QPen(QtGui.QColor(255, 215, 0)))
+            p.setBrush(QtGui.QColor(255, 215, 0))  # yellow
+            p.drawPolygon(flag_poly_a)
+            p.drawPolygon(flag_poly_b)
 
+        # Draw saved loops' flags & labels in the top strip
+        if hasattr(self, 'saved_loops') and self.saved_loops:
+            tip_y = 2
+            base_y = min(self.FLAG_STRIP - 2, tip_y + self.FLAG_H)
+            # Yellow flags for saved loops
+            p.setPen(QtGui.QPen(QtGui.QColor(255, 215, 0)))
+            p.setBrush(QtGui.QColor(255, 215, 0))  # yellow
+            for L in self.saved_loops:
+                a = float(L['a']); b = float(L['b'])
+                x0 = self._x_from_time(a, t0, t1, w)
+                x1 = self._x_from_time(b, t0, t1, w)
+                # start flag
+                flag_poly = QtGui.QPolygon([
+                    QtCore.QPoint(x0, tip_y),
+                    QtCore.QPoint(x0 - self.FLAG_W//2, base_y),
+                    QtCore.QPoint(x0 + self.FLAG_W//2, base_y),
+                ])
+                p.drawPolygon(flag_poly)
+                # end flag
+                flag_poly_b = QtGui.QPolygon([
+                    QtCore.QPoint(x1, tip_y),
+                    QtCore.QPoint(x1 - self.FLAG_W//2, base_y),
+                    QtCore.QPoint(x1 + self.FLAG_W//2, base_y),
+                ])
+                p.drawPolygon(flag_poly_b)
+                # label (if any): near start flag; if start flag is offscreen but the loop overlaps, pin to left margin
+                label = str(L.get('label', '') or '')
+                if label:
+                    x_label = x0 + self.FLAG_W + 4
+                    # If start flag is left of view but the loop overlaps the window, pin to left margin
+                    if x0 < 0 and x1 > 0:
+                        x_label = 4
+                    # Only draw label if any part of the loop is visible
+                    if x0 <= w and x1 >= 0:
+                        p.setPen(QtGui.QPen(QtGui.QColor(210, 220, 230)))
+                        p.drawText(int(max(0, min(w - 40, x_label))), int(base_y - 2), label)
+                        p.setPen(QtGui.QPen(QtGui.QColor(220, 220, 220)))
+
+        # Draw waveform min/max and playhead below the top strip
         mins, maxs = self._mono_slice_minmax(t0, t1, w)
         if mins is not None:
-            mid = wf_h // 2
+            body_top = min(wf_h, self.FLAG_STRIP)
+            body_h = max(1, wf_h - body_top)
+            mid = body_top + body_h // 2
             p.setPen(QtGui.QPen(QtGui.QColor(0, 180, 255)))
             for x, (mn, mx) in enumerate(zip(mins, maxs)):
-                y1 = mid - int(mx * (wf_h * 0.45))
-                y2 = mid - int(mn * (wf_h * 0.45))
+                y1 = mid - int(mx * (body_h * 0.45))
+                y2 = mid - int(mn * (body_h * 0.45))
                 if y1 > y2:
                     y1, y2 = y2, y1
                 p.drawLine(x, y1, x, y2)
 
-        # center playhead for heads‑up on upcoming changes
+        # playhead: center when following, absolute position when frozen
         p.setPen(QtGui.QPen(QtGui.QColor(255, 200, 0)))
-        cx = w // 2
-        p.drawLine(cx, 0, cx, wf_h)
+        if self._freeze_window and self.player is not None:
+            try:
+                tpos = float(self.player.position_seconds())
+            except Exception:
+                tpos = (t0 + t1) * 0.5
+            px = int(max(0, min(w - 1, (tpos - t0) / (t1 - t0) * w)))
+        else:
+            px = w // 2
+        p.drawLine(px, min(wf_h, self.FLAG_STRIP), px, wf_h)
+        # End waveform layer; ensure no brush/pen bleed into chord lane
+        p.restore()
+        p.setBrush(QtCore.Qt.NoBrush)
+        p.setPen(QtGui.QPen(QtGui.QColor(220, 220, 220)))
 
         # chord lane
         if self.chords:
@@ -399,31 +678,6 @@ class WaveformView(QtWidgets.QWidget):
                 p.drawRect(rect)
                 p.setPen(QtGui.QPen(QtGui.QColor(230, 230, 230)))
                 p.drawText(rect.adjusted(4, 0, -4, 0), Qt.AlignVCenter | Qt.AlignLeft, seg['label'])
-
-        # Draw saved loops and flags (start and end)
-        if hasattr(self, 'saved_loops'):
-            flag_top = -2 - self.FLAG_H
-            for L in self.saved_loops:
-                a = float(L['a'])
-                b = float(L['b'])
-                x0 = self._x_from_time(a, t0, t1, w)
-                x1 = self._x_from_time(b, t0, t1, w)
-                # flag at start
-                flag_poly = QtGui.QPolygon([
-                    QtCore.QPoint(x0, -2),
-                    QtCore.QPoint(x0 - self.FLAG_W//2, -2 - self.FLAG_H),
-                    QtCore.QPoint(x0 + self.FLAG_W//2, -2 - self.FLAG_H),
-                ])
-                p.setBrush(QtGui.QColor(120, 170, 220))
-                p.drawPolygon(flag_poly)
-                # flag at end
-                flag_poly_b = QtGui.QPolygon([
-                    QtCore.QPoint(x1, -2),
-                    QtCore.QPoint(x1 - self.FLAG_W//2, -2 - self.FLAG_H),
-                    QtCore.QPoint(x1 + self.FLAG_W//2, -2 - self.FLAG_H),
-                ])
-                p.setBrush(QtGui.QColor(120, 170, 220))
-                p.drawPolygon(flag_poly_b)
 
 
 class ChordWorker(QThread):
@@ -491,6 +745,10 @@ class Main(QtWidgets.QMainWindow):
         self.current_path: str | None = None
         self.A = 0.0
         self.B = 10.0
+        # Saved loops model
+        self.saved_loops: list[dict] = []   # {id:int, a:float, b:float, label:str}
+        self._loop_id_seq = 1
+        self._active_saved_loop_id: int | None = None
 
         # === UI ===
         self.rate_spin = QtWidgets.QDoubleSpinBox()
@@ -550,6 +808,12 @@ class Main(QtWidgets.QMainWindow):
         self.wave = WaveformView()
         self.wave.requestSetLoop.connect(self._apply_loop_from_wave)
         self.wave.requestSeek.connect(self._seek_from_wave)
+        self.wave.requestAddLoop.connect(self._add_loop_from_wave)
+        self.wave.requestUpdateLoop.connect(self._update_loop_from_wave)
+        self.wave.requestSelectLoop.connect(self._select_loop_from_wave)
+        self.wave.requestDeleteSelected.connect(self._delete_selected_loop)
+        self.wave.requestRenameLoop.connect(self._rename_loop_id)
+        self.wave.requestDeleteLoopId.connect(self._delete_loop_id)
 
         central = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(central)
@@ -587,6 +851,110 @@ class Main(QtWidgets.QMainWindow):
 
         # Status
         self.statusBar().showMessage("Ready")
+        self.loop_poll = QtCore.QTimer(self)
+        self.loop_poll.setInterval(80)  # ~12.5 Hz is plenty
+        self.loop_poll.timeout.connect(self._auto_loop_tick)
+        self.loop_poll.start()
+    def _sync_saved_loops_to_view(self):
+        self.wave.set_saved_loops(self.saved_loops)
+
+    def _next_loop_label(self) -> str:
+        used = {L.get('label') for L in self.saved_loops if L.get('label')}
+        # First try single letters A..Z
+        for i in range(26):
+            lab = chr(ord('A') + i)
+            if lab not in used:
+                return lab
+        # Then A1..Z1, A2..Z2, etc.
+        suffix = 1
+        while True:
+            for i in range(26):
+                lab = f"{chr(ord('A') + i)}{suffix}"
+                if lab not in used:
+                    return lab
+            suffix += 1
+
+    def _add_loop_from_wave(self, a: float, b: float):
+        L = {"id": self._loop_id_seq, "a": float(a), "b": float(b), "label": self._next_loop_label()}
+        self._loop_id_seq += 1
+        self.saved_loops.append(L)
+        self.saved_loops.sort(key=lambda x: min(x['a'], x['b']))
+        self._active_saved_loop_id = L['id']
+        # Set playback to this loop immediately
+        if self.player:
+            self.player.set_loop_seconds(min(a,b), max(a,b))
+        self.wave.set_loop_visual(min(a,b), max(a,b))
+        self._sync_saved_loops_to_view()
+        self.statusBar().showMessage(f"Added loop {L['label']}: {min(a,b):.2f}s → {max(a,b):.2f}s")
+
+    def _update_loop_from_wave(self, lid: int, a: float, b: float):
+        for L in self.saved_loops:
+            if L['id'] == lid:
+                L['a'], L['b'] = float(min(a,b)), float(max(a,b))
+                break
+        self.saved_loops.sort(key=lambda x: min(x['a'], x['b']))
+        self._active_saved_loop_id = lid
+        if self.player:
+            self.player.set_loop_seconds(min(a,b), max(a,b))
+        self.wave.set_loop_visual(min(a,b), max(a,b))
+        self._sync_saved_loops_to_view()
+        self.statusBar().showMessage(f"Updated loop to {min(a,b):.2f}s → {max(a,b):.2f}s")
+
+    def _select_loop_from_wave(self, lid: int):
+        L = next((x for x in self.saved_loops if x['id'] == lid), None)
+        if not L:
+            return
+        a, b = float(min(L['a'], L['b'])), float(max(L['a'], L['b']))
+        self._active_saved_loop_id = lid
+        if self.player:
+            self.player.set_loop_seconds(a, b)
+        self.wave.set_loop_visual(a, b)
+        self.statusBar().showMessage(f"Selected loop {L.get('label','')}: {a:.2f}s → {b:.2f}s")
+
+    def _delete_selected_loop(self):
+        lid = self._active_saved_loop_id
+        if lid is None:
+            return
+        idx = next((i for i, L in enumerate(self.saved_loops) if L['id'] == lid), -1)
+        if idx >= 0:
+            rem = self.saved_loops.pop(idx)
+            self._active_saved_loop_id = None
+            self._sync_saved_loops_to_view()
+            self.statusBar().showMessage(f"Deleted loop {rem.get('label','')}")
+
+    def _auto_loop_tick(self):
+        if not self.player or not self.saved_loops:
+            return
+        try:
+            t = float(self.player.position_seconds())
+        except Exception:
+            return
+        # Find loop that contains t (inclusive of start, exclusive of end)
+        cur = next((L for L in self.saved_loops if min(L['a'], L['b']) <= t < max(L['a'], L['b'])), None)
+        if cur:
+            lid = int(cur['id'])
+            if self._active_saved_loop_id != lid:
+                # Entered a loop → set player loop to it
+                a = float(min(cur['a'], cur['b'])); b = float(max(cur['a'], cur['b']))
+                self._active_saved_loop_id = lid
+                try:
+                    self.player.set_loop_seconds(a, b)
+                except Exception:
+                    pass
+                self.wave.set_loop_visual(a, b)
+        else:
+            # Outside all loops → disable looping so playback runs to the natural end
+            if self._active_saved_loop_id is not None:
+                self._active_saved_loop_id = None
+                try:
+                    # Preferred: a clear method if LoopPlayer provides it
+                    self.player.clear_loop()
+                except Exception:
+                    # Fallback: set a degenerate loop (interpreted as no-loop by most players)
+                    try:
+                        self.player.set_loop_seconds(0.0, 0.0)
+                    except Exception:
+                        pass
 
     def _seek_from_wave(self, t: float):
         if not self.player:
@@ -681,6 +1049,26 @@ class Main(QtWidgets.QMainWindow):
         # small post‑roll for natural tail
         return min(n / float(sr), end_secs + 0.05)
 
+    def _rename_loop_id(self, lid: int):
+        L = next((x for x in self.saved_loops if x['id'] == lid), None)
+        if not L:
+            return
+        text, ok = QtWidgets.QInputDialog.getText(self, "Rename Loop", "Name:", text=L.get('label',''))
+        if ok:
+            L['label'] = str(text)
+            self._sync_saved_loops_to_view()
+            self.statusBar().showMessage(f"Renamed loop to '{L['label']}'")
+
+    def _delete_loop_id(self, lid: int):
+        idx = next((i for i, X in enumerate(self.saved_loops) if X['id'] == lid), -1)
+        if idx < 0:
+            return
+        rem = self.saved_loops.pop(idx)
+        if self._active_saved_loop_id == lid:
+            self._active_saved_loop_id = None
+        self._sync_saved_loops_to_view()
+        self.statusBar().showMessage(f"Deleted loop {rem.get('label','') or lid}")
+
     # === Actions ===
     def _rate_changed(self, val: float):
         self.rate_label.setText(f"Rate: {val:.2f}x")
@@ -700,6 +1088,21 @@ class Main(QtWidgets.QMainWindow):
             self.player.stop(); self.player.close()
         self.player = LoopPlayer(fn)
         self.wave.set_player(self.player)
+        # Do not default to any loop on load
+        try:
+            self.player.clear_loop()
+        except Exception:
+            try:
+                # Degenerate range many players treat as 'no loop'
+                self.player.set_loop_seconds(0.0, 0.0)
+            except Exception:
+                pass
+        self.wave.clear_loop_visual()
+        # Reset saved loops for this file; we will add new ones as the user creates them
+        self.saved_loops.clear()
+        self._loop_id_seq = 1
+        self._active_saved_loop_id = None
+        self._sync_saved_loops_to_view()
         # Align visual time 0 to first non-silent audio
         lead = self._detect_leading_silence_seconds(self.player.y, self.player.sr)
         tail = self._detect_trailing_silence_seconds(self.player.y, self.player.sr)
@@ -713,9 +1116,6 @@ class Main(QtWidgets.QMainWindow):
         total_s = self.player.n / self.player.sr
         self.A = lead
         self.B = max(lead + 0.1, min(total_s, tail))
-        self.player.set_loop_seconds(self.A, self.B)
-        self.wave.set_loop_visual(self.A, self.B)
-        self.wave.setFocus()
         mus_len = max(0.0, self.B - self.A)
         self.statusBar().showMessage(f"Loaded: {Path(fn).name} [music {mus_len:.1f}s of {total_s:.1f}s]")
         # Kick off chord worker
@@ -766,12 +1166,21 @@ class Main(QtWidgets.QMainWindow):
             pass
 
     def play(self):
-        if self.player:
-            self.player.start()
+        if not self.player:
+            return
+        # When starting playback, re-center on the playhead
+        try:
+            self.wave.unfreeze_and_center()
+        except Exception:
+            pass
+        try:
+            self.player.play()
+        except Exception:
+            pass
 
     def pause(self):
         if self.player:
-            self.player.stop()
+            self.player.pause()
 
     def set_A(self):
         if self.player:
@@ -827,6 +1236,11 @@ class Main(QtWidgets.QMainWindow):
                     self.player.stop(); self.player.close()
                 self.player = LoopPlayer(fn)
                 self.wave.set_player(self.player)
+                # Reset saved loops for this file; we will add new ones as the user creates them
+                self.saved_loops.clear()
+                self._loop_id_seq = 1
+                self._active_saved_loop_id = None
+                self._sync_saved_loops_to_view()
                 lead = self._detect_leading_silence_seconds(self.player.y, self.player.sr)
                 tail = self._detect_trailing_silence_seconds(self.player.y, self.player.sr)
                 self.wave.set_music_span(lead, tail)
