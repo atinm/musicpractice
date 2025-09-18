@@ -1,13 +1,15 @@
 import sys
 import json
+import shutil
 from pathlib import Path
 from PySide6 import QtWidgets, QtCore, QtGui
 from PySide6.QtCore import Qt, QThread, Signal, QSettings
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
 import numpy as np
-
+import traceback
+import logging
 from audio_engine import LoopPlayer
-from chords import estimate_chords, estimate_key, estimate_beats
+from chords import estimate_chords as _estimate_chords_base, estimate_key, estimate_beats
 try:
     from timestretch import render_time_stretch
     HAS_STRETCH = True
@@ -18,6 +20,7 @@ from stems import separate_stems, load_stem_arrays, order_stem_names
 
 import os
 from pathlib import Path
+import tempfile
 
 class WaveformView(QtWidgets.QWidget):
     """Scrolling waveform that moves right→left with a chord lane underneath."""
@@ -691,18 +694,205 @@ class WaveformView(QtWidgets.QWidget):
 
 class ChordWorker(QThread):
     done = Signal(list)
+    status = Signal(str)
+    demucs_line = Signal(str)  # forward Demucs logs to LogDock (like _toggle_stems)
     def __init__(self, path: str):
         super().__init__()
         self.path = path
+
+    def _log(self, msg: str):
+        s = str(msg)
+        try:
+            self.demucs_line.emit(s.rstrip("\n") + "\n")
+        except Exception:
+            pass
+        try:
+            self.status.emit(s)
+        except Exception:
+            pass
+
+    def _log_exc(self, where: str, exc: Exception):
+        tb = traceback.format_exc()
+        try:
+            self.demucs_line.emit(f"[ERROR] {where}: {exc}\n{tb}\n")
+        except Exception:
+            pass
+        try:
+            self.status.emit(f"Error in {where}: {exc}")
+        except Exception:
+            pass
+        try:
+            logging.exception("%s", where)
+        except Exception:
+            pass
+
+    def _song_cache_dir(self, audio_path: str) -> Path:
+        """Match Main._song_cache_dir layout so Demucs cache location is identical."""
+        p = Path(audio_path)
+        try:
+            st = p.stat()
+            meta = f"{st.st_size}_{int(st.st_mtime)}"
+        except Exception:
+            meta = "0_0"
+        safe = p.stem.replace(os.sep, "_")
+        root = p.parent / ".musicpractice" / "stems" / f"{safe}__{meta}"
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    def _stem_leaf_dir(self, audio_path: str, out_dir: Path, model: str) -> Path:
+        src = Path(audio_path)
+        return out_dir / model / src.stem
+
+    def _wait_for_stems(self, audio_path: str, out_dir: Path, model: str = "htdemucs_6s", timeout_s: int = 900):
+        """
+        Block until htdemucs_6s outputs exist and are size-stable under
+        out_dir/<model>/<track>/ for the given audio file.
+        Returns dict from load_stem_arrays(leaf_dir) or {} on timeout.
+        """
+        from PySide6 import QtCore
+        # htdemucs_6s fixed set
+        expected = {"bass", "drums", "guitar", "piano", "other", "vocals"}
+        stem_leaf = self._stem_leaf_dir(audio_path, out_dir, model)
+        self._log(f"Waiting for stems in: {stem_leaf}")
+        start_ms = QtCore.QTime.currentTime().msecsSinceStartOfDay()
+        last_sizes = {}
+
+        def all_present_and_stable():
+            files = {}
+            for name in expected:
+                candidates = list(stem_leaf.glob(f"{name}.wav"))
+                if not candidates:
+                    return False, {}
+                f = max(candidates, key=lambda p: p.stat().st_mtime_ns)
+                files[name] = f
+            sizes_now = {k: files[k].stat().st_size for k in files}
+            stable = (sizes_now == last_sizes) and all(sz > 0 for sz in sizes_now.values())
+            return stable, files
+
+        # init last_sizes
+        for name in expected:
+            candidates = list(stem_leaf.glob(f"{name}.wav"))
+            last_sizes[name] = max((p.stat().st_size for p in candidates), default=0)
+
+        elapsed_ms = 0
+        while elapsed_ms < timeout_s * 1000:
+            if self.isInterruptionRequested():
+                return {}
+            QtCore.QThread.msleep(500)
+            try:
+                stable, _ = all_present_and_stable()
+            except Exception:
+                stable = False
+            if stable:
+                try: self.status.emit("Stems ready. Loading…")
+                except Exception: pass
+                try:
+                    self._log("Stems appear stable; loading arrays…")
+                    loaded = load_stem_arrays(stem_leaf)
+                except Exception:
+                    loaded = None
+                return loaded or {}
+            # refresh sizes
+            for k in list(last_sizes.keys()):
+                candidates = list(stem_leaf.glob(f"{k}.wav"))
+                if candidates:
+                    last_sizes[k] = max(p.stat().st_size for p in candidates)
+            now_ms = QtCore.QTime.currentTime().msecsSinceStartOfDay()
+            elapsed_ms = now_ms - start_ms
+            if (elapsed_ms // 1000) % 5 == 0:
+                try: self.status.emit("Waiting for stems to finish writing…")
+                except Exception: pass
+        self._log("Timed out waiting for stems; proceeding without stems.")
+        return {}
+
+    def estimate_chords(self, audio_path: str, sr=22050, hop=2048, **kwargs):
+        """
+        Wrapper: always run beat detection first, and attach stems if available,
+        then call chords.estimate_chords with these as inputs.
+        """
+        # If caller didn't provide beat info, compute it now.
+        if not kwargs.get("beats"):
+            bd = estimate_beats(audio_path, sr=sr, hop=512)
+            kwargs["beats"] = bd.get("beats", [])
+            kwargs["downbeats"] = bd.get("downbeats", [])
+            kwargs["beat_strengths"] = bd.get("beat_strengths", [])
+
+        # Always-on stem extraction (force run) using the same cache layout as _toggle_stems
+        model = "htdemucs_6s"
+        out_dir = self._song_cache_dir(audio_path)
+        leaf = self._stem_leaf_dir(audio_path, out_dir, model)
+        maybe_pre = None
+        # Force a fresh Demucs render so we don't skip due to cached files
+        try:
+            if leaf.exists():
+                self._log(f"Removing existing stems leaf to force render: {leaf}")
+                shutil.rmtree(leaf)
+        except Exception as e:
+            self._log_exc("Pre-clean leaf dir", e)
+        self._log(f"[ENTRY] estimate_chords: forcing Demucs for {audio_path}")
+        # Start Demucs and stream logs; always wait afterwards
+        self._log(f"Demucs starting: {model} → {out_dir}")
+        try:
+            worker = DemucsWorker(audio_path, str(out_dir), model)
+            # Forward every line to the main LogDock through ChordWorker.demucs_line
+            worker.line.connect(lambda s: self.demucs_line.emit(s))
+            # Block this worker thread until Demucs finishes
+            loop = QtCore.QEventLoop()
+            worker.done.connect(lambda _p: loop.quit())
+            worker.failed.connect(lambda _e: loop.quit())
+            worker.start()
+            loop.exec()
+        except Exception as e:
+            self._log_exc("Demucs run", e)
+
+        self._log("Demucs finished rendering. Verifying files…")
+        try:
+            maybe_pre = self._wait_for_stems(audio_path, out_dir, model=model, timeout_s=900)
+        except Exception as e:
+            self._log_exc("Wait for stems", e)
+            maybe_pre = None
+
+        if not maybe_pre:
+            # Last resort: attempt direct load and log outcome
+            try:
+                maybe_pre = load_stem_arrays(leaf)
+                if maybe_pre:
+                    self._log("Loaded stems via direct scan of leaf directory.")
+                else:
+                    self._log("Direct leaf load returned empty dict.")
+            except Exception as e:
+                self._log_exc("Direct leaf load", e)
+                maybe_pre = None
+
+        if not kwargs.get("stems") and isinstance(maybe_pre, dict) and maybe_pre:
+            kwargs["stems"] = maybe_pre
+        if not kwargs.get("stems"):
+            try:
+                self.status.emit("Proceeding without stems (timeout or missing files).")
+            except Exception:
+                pass
+        return _estimate_chords_base(audio_path, sr=sr, hop=hop, **kwargs)
+
     def run(self):
         try:
             if self.isInterruptionRequested():
                 return
-            segs = estimate_chords(self.path)
-        except Exception:
+            try:
+                self.status.emit("Analyzing: beats + stems + chords…")
+            except Exception:
+                pass
+            self.demucs_line.emit("[ENTRY] ChordWorker.run → estimate_chords\n")
+            segs = self.estimate_chords(self.path)
+        except Exception as e:
+            self._log_exc("ChordWorker.run", e)
             segs = []
         if not self.isInterruptionRequested():
+            try:
+                self.status.emit("Analysis complete.")
+            except Exception:
+                pass
             self.done.emit(segs)
+
 
 class KeyWorker(QThread):
     done = Signal(dict)
@@ -718,7 +908,6 @@ class KeyWorker(QThread):
             info = {"pretty": "unknown"}
         if not self.isInterruptionRequested():
             self.done.emit(info)
-
 
 # --- BeatWorker for beat/bar estimation ---
 class BeatWorker(QThread):
@@ -978,7 +1167,7 @@ class Main(QtWidgets.QMainWindow):
                 if w and w.isRunning():
                     w.requestInterruption()
                     w.quit()
-                    w.wait(1500)
+                    w.wait(-1)
             except Exception:
                 pass
 
@@ -1044,6 +1233,31 @@ class Main(QtWidgets.QMainWindow):
             self.act_render.setToolTip("timestretch.render_time_stretch not available")
         self.act_render.triggered.connect(self.render_rate)
 
+        self.actRecompute = QAction("Recompute analysis", self)
+        self.actRecompute.setShortcut(QKeySequence("Ctrl+Shift+R"))
+        self.actRecompute.triggered.connect(self._recompute_current)
+
+        self.actAlwaysRecompute = QAction("Always recompute on open", self)
+        self.actAlwaysRecompute.setCheckable(True)
+        # Restore persisted value
+        try:
+            s = QSettings("musicpractice", "musicpractice")
+            always = bool(s.value("analysis/always_recompute_on_open", False, type=bool))
+            self.actAlwaysRecompute.setChecked(always)
+        except Exception:
+            pass
+        self.actAlwaysRecompute.toggled.connect(self._toggle_always_recompute)
+
+        # Menu
+        try:
+            mb = self.menuBar()
+            analysisMenu = mb.addMenu("Analysis")
+            analysisMenu.addAction(self.actRecompute)
+            analysisMenu.addSeparator()
+            analysisMenu.addAction(self.actAlwaysRecompute)
+        except Exception:
+            pass
+
         # Populate toolbar
         self.toolbar.addAction(self.act_open)
         self.toolbar.addSeparator()
@@ -1056,6 +1270,12 @@ class Main(QtWidgets.QMainWindow):
         self.toolbar.addWidget(self.rate_label)
         self.toolbar.addWidget(self.rate_spin)
         self.toolbar.addAction(self.act_render)
+        self.toolbar.addSeparator()
+        try:
+            self.actRecompute.setToolTip("Delete cached analysis and re-run stems + chords (Ctrl+Shift+R)")
+        except Exception:
+            pass
+        self.toolbar.addAction(self.actRecompute)
 
         # === Stems UI (dock hidden by default) ===
         self.stems_dock = QtWidgets.QDockWidget("Stems", self)
@@ -1145,6 +1365,23 @@ class Main(QtWidgets.QMainWindow):
         self.loop_poll.setInterval(80)  # ~12.5 Hz is plenty
         self.loop_poll.timeout.connect(self._auto_loop_tick)
         self.loop_poll.start()
+
+    def _toggle_always_recompute(self, checked: bool):
+        try:
+            s = QSettings("musicpractice", "musicpractice")
+            s.setValue("analysis/always_recompute_on_open", bool(checked))
+        except Exception:
+            pass
+
+    def _recompute_current(self):
+        try:
+            path = getattr(self, "current_path", None)
+            if not path:
+                return
+            self._clear_cached_analysis(path, remove_stems=True)
+            self.start_chord_analysis(path)  # runs Demucs + waits + chords
+        except Exception:
+            pass
 
     def _session_sidecar_path(self, audio_path: str) -> Path:
         p = Path(audio_path)
@@ -1680,6 +1917,41 @@ class Main(QtWidgets.QMainWindow):
         self.statusBar().showMessage("Loop deleted" if len(self.saved_loops) < before else "No loop deleted")
         self.save_session()
 
+    def _sidecar_path(self, audio_path: str) -> Path:
+        p = Path(audio_path)
+        return p.parent / ".musicpractice" / f"{p.stem}.musicpractice.json"
+
+    def _stem_leaf_dir(self, audio_path: str, model: str = "htdemucs_6s") -> Path:
+        out_dir = self._song_cache_dir(audio_path)  # you already have this in Main
+        return out_dir / model / Path(audio_path).stem
+
+    def _clear_cached_analysis(self, audio_path: str, remove_stems: bool = True):
+        # Delete sidecar JSON
+        try:
+            sidecar = self._sidecar_path(audio_path)
+            if sidecar.exists():
+                sidecar.unlink()
+        except Exception:
+            pass
+        # Optionally delete stems leaf
+        if remove_stems:
+            try:
+                leaf = self._stem_leaf_dir(audio_path, "htdemucs_6s")
+                if leaf.exists():
+                    shutil.rmtree(leaf)
+            except Exception:
+                pass
+        # Clear in-memory chords and the view
+        try:
+            self.last_chords = []
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "wave"):
+                self.wave.set_chords([])
+        except Exception:
+            pass
+
     # === Actions ===
     def _rate_changed(self, val: float):
         """Update playback rate on the player and keep the UI/transport coherent."""
@@ -1697,11 +1969,6 @@ class Main(QtWidgets.QMainWindow):
             ok = self.player.set_rate(r)
             if ok is False:
                 msg = getattr(self.player, 'last_rate_error', None) or "Time-stretch unavailable — using normal speed."
-                # Print to console for visibility while debugging
-                try:
-                    print(f"[rate] set_rate({r}) failed: {msg}")
-                except Exception:
-                    pass
                 self.statusBar().showMessage(msg, 6000)
                 # Nudge transport so UI ↔ audio mapping stays stable
             try:
@@ -1769,7 +2036,11 @@ class Main(QtWidgets.QMainWindow):
             self.load_session()
         except Exception:
             pass
-
+        try:
+            if hasattr(self, "actAlwaysRecompute") and self.actAlwaysRecompute.isChecked():
+                self._clear_cached_analysis(self.current_path, remove_stems=True)
+        except Exception:
+            pass
         # Compute only what is missing
         if not self.last_beats:
             self.populate_beats_async(self.current_path)
@@ -1786,14 +2057,9 @@ class Main(QtWidgets.QMainWindow):
         self.wave.setFocus()
 
     def populate_chords_async(self, path: str):
-        if self.chord_worker and self.chord_worker.isRunning():
-            self.chord_worker.requestInterruption(); self.chord_worker.quit(); self.chord_worker.wait(1000)
-        cw = ChordWorker(path)
-        cw.setParent(self)
-        cw.done.connect(self._chords_ready)
-        cw.finished.connect(lambda: setattr(self, "chord_worker", None))
-        self.chord_worker = cw
-        cw.start()
+        # Delegate to the unified chord analysis entrypoint which runs Demucs
+        # with live logs and waits for stems before estimating chords.
+        return self.start_chord_analysis(path)
 
     def populate_key_async(self, path: str):
         if self.key_worker and self.key_worker.isRunning():
@@ -1805,11 +2071,37 @@ class Main(QtWidgets.QMainWindow):
         self.key_worker = kw
         kw.start()
 
-    def _chords_ready(self, segs: list):
-        self.last_chords = list(segs or [])
+    def start_chord_analysis(self, path: str):
+        # Stop any existing chord worker
+        if hasattr(self, "chord_worker") and self.chord_worker and self.chord_worker.isRunning():
+            self.chord_worker.requestInterruption()
+            self.chord_worker.quit()
+            self.chord_worker.wait(-1)
+        cw = ChordWorker(path)
+        cw.setParent(self)
+        # Ensure a LogDock exists and is visible (same UX as _toggle_stems)
+        if not hasattr(self, "log_dock") or self.log_dock is None:
+            self.log_dock = LogDock(parent=self)
+            self.addDockWidget(Qt.BottomDockWidgetArea, self.log_dock)
+        self.log_dock.setWindowTitle("Demucs Log")
+        self.log_dock.show(); self.log_dock.raise_(); self.log_dock.clear()
+        cw.demucs_line.connect(self._demucs_log)
+        cw.status.connect(lambda s: self.statusBar().showMessage(str(s)))
+        cw.done.connect(self._chords_ready)
+        cw.finished.connect(lambda: setattr(self, "chord_worker", None))
+        self.chord_worker = cw
+        # Show a minimal waiting message immediately
+        self.statusBar().showMessage("Analyzing: beats + stems + chords…")
+        cw.start()
+
+    def _chords_ready(self, segments: list):
+        self.last_chords = list(segments or [])
+        # Update waveform lane and persist
         self.wave.set_chords(self.last_chords)
-        self.statusBar().showMessage(f"Chords: {len(self.last_chords)} segments")
         self.save_session()
+        # Clear the waiting message after a short delay
+        self.statusBar().showMessage(f"Chords: {len(self.last_chords)} segments")
+        QtCore.QTimer.singleShot(1500, lambda: self.statusBar().clearMessage())
 
     def _key_ready(self, info: dict):
         self.last_key = info or {}
@@ -1901,6 +2193,11 @@ class Main(QtWidgets.QMainWindow):
         # Restore session and compute only missing analyses
         try:
             self.load_session()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "actAlwaysRecompute") and self.actAlwaysRecompute.isChecked():
+                self._clear_cached_analysis(self.current_path, remove_stems=True)
         except Exception:
             pass
         if not self.last_beats:

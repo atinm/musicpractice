@@ -112,6 +112,7 @@ def estimate_beats(audio_path: str, sr=22050, hop=512, units_per_bar: int = 4, t
         "tempo": float,              # BPM
         "beats": List[float],        # seconds
         "downbeats": List[float],    # seconds, inferred bar starts (phase-aligned)
+        "beat_strengths": List[float], # normalized [0,1] onset strengths at beat times
         "sr": int,
         "hop": int,
       }
@@ -137,7 +138,7 @@ def estimate_beats(audio_path: str, sr=22050, hop=512, units_per_bar: int = 4, t
 
     # If no beats, bail gracefully
     if beat_times.size == 0:
-        return {"tempo": float(tempo), "beats": [], "downbeats": [], "sr": int(sr), "hop": int(hop)}
+        return {"tempo": float(tempo), "beats": [], "downbeats": [], "beat_strengths": [], "sr": int(sr), "hop": int(hop)}
 
     # Heuristic downbeat phase: choose offset k in [0..N-1] maximizing average onset
     N = max(1, int(units_per_bar))
@@ -147,6 +148,17 @@ def estimate_beats(audio_path: str, sr=22050, hop=512, units_per_bar: int = 4, t
         idx = int(min(len(oenv) - 1, max(0, f)))
         oenv_at_beats.append(float(oenv[idx]))
     oenv_at_beats = np.asarray(oenv_at_beats, dtype=float)
+
+    # Normalize beat strengths to [0,1] for later use
+    if oenv_at_beats.size:
+        bs_min = float(oenv_at_beats.min())
+        bs_max = float(oenv_at_beats.max())
+        if bs_max > bs_min:
+            beat_strengths = ((oenv_at_beats - bs_min) / (bs_max - bs_min)).tolist()
+        else:
+            beat_strengths = [1.0 for _ in oenv_at_beats]
+    else:
+        beat_strengths = []
 
     best_k = 0
     best_score = -1.0
@@ -162,9 +174,113 @@ def estimate_beats(audio_path: str, sr=22050, hop=512, units_per_bar: int = 4, t
         "tempo": float(tempo),
         "beats": [float(t) for t in beat_times],
         "downbeats": [float(t) for t in downbeat_times],
+        "beat_strengths": beat_strengths,
         "sr": int(sr),
         "hop": int(hop),
     }
+def viterbi_timevarying(log_probs, stay_probs):
+    """
+    Time-varying self-biased Viterbi.
+
+    Args:
+        log_probs: (N, T) log-likelihoods.
+        stay_probs: (T,) or (N,T) self-transition probability in [0,1] per time step (applies between t-1 -> t).
+                    Off-diagonal mass is distributed uniformly.
+
+    Returns:
+        path: (T,) best state indices.
+    """
+    N, T = log_probs.shape
+    if stay_probs.ndim == 1:
+        stay_probs = np.broadcast_to(stay_probs[None, :], (N, T))
+    dp = np.zeros_like(log_probs)
+    back = np.zeros((N, T), dtype=np.int16)
+    dp[:, 0] = log_probs[:, 0]
+    for t in range(1, T):
+        stay_t = np.clip(stay_probs[:, t], 1e-6, 1.0 - 1e-6)
+        switch_t = (1.0 - stay_t) / max(1, N - 1)
+        # Build (N,N) log transition for time t
+        prev = np.full((N, N), -np.inf, dtype=np.float64)
+        # Off-diagonal
+        prev[:] = dp[:, t - 1][:, None] + np.log(switch_t)[:, None]
+        # Diagonal (stay)
+        diag = dp[:, t - 1] + np.log(stay_t)
+        np.fill_diagonal(prev, diag)
+        back[:, t] = np.argmax(prev, axis=0)
+        dp[:, t] = log_probs[:, t] + np.max(prev, axis=0)
+    path = np.zeros(T, dtype=np.int16)
+    path[-1] = np.argmax(dp[:, -1])
+    for t in range(T - 2, -1, -1):
+        path[t] = back[path[t + 1], t + 1]
+    return path
+# --- Minor triad vs minor 7th refinement ------------------------------------
+
+
+# --- Harmonic mix and beat-sync chroma helpers ------------------------------
+
+def _mix_from_stems(stems: dict | None, sr_expected: int | None = None):
+    """
+    Combine available stems into a 'harmonic' mono mix for chord features.
+    Excludes percussion. Accepts keys like: 'vocals','other','guitar','piano','bass','drums','accompaniment','harmonic'.
+    Returns (y_harm, sr_or_None). If stems is None or empty, returns (None, None).
+    """
+    if not stems:
+        return None, None
+    # Priority 1: explicit harmonic/accompaniment provided
+    for k in ('harmonic', 'accompaniment'):
+        if k in stems and stems[k] is not None:
+            y = stems[k]
+            if y.ndim == 2:
+                y = y.mean(axis=1)
+            return y.astype(np.float32), sr_expected
+    # Otherwise sum non-percussive sources
+    prefer = ['vocals', 'guitar', 'piano', 'other', 'bass']
+    acc = None
+    for k in prefer:
+        if k in stems and stems[k] is not None:
+            yk = stems[k]
+            if yk.ndim == 2:
+                yk = yk.mean(axis=1)
+            acc = yk.astype(np.float32) if acc is None else (acc + yk.astype(np.float32))
+    if acc is None:
+        return None, None
+    # Gentle limiter to avoid clipping when summing
+    m = np.max(np.abs(acc)) + 1e-9
+    acc = acc / m
+    return acc, sr_expected
+
+
+def _beat_sync_chroma(chroma: np.ndarray, frame_times: np.ndarray, beats_sec: list[float], reduce='median'):
+    """
+    Aggregate framewise chroma (12,F) to beat-synchronous (12,B) using median/mean.
+    Returns (C_beat, beat_idxs) where beat_idxs holds the frame indices used per beat start.
+    """
+    if chroma.size == 0 or not beats_sec:
+        return chroma, np.arange(chroma.shape[1])
+    beats = np.asarray(beats_sec, dtype=float)
+    idxs = np.searchsorted(frame_times, beats, side='left')
+    idxs = np.clip(idxs, 0, chroma.shape[1]-1)
+    segs = []
+    used = []
+    for i in range(len(idxs)):
+        a = idxs[i]
+        b = idxs[i+1] if i+1 < len(idxs) else chroma.shape[1]
+        if b <= a:
+            b = min(a+1, chroma.shape[1])
+        X = chroma[:, a:b]
+        if X.size == 0:
+            X = chroma[:, a:a+1]
+        if reduce == 'mean':
+            v = X.mean(axis=1)
+        else:
+            v = np.median(X, axis=1)
+        # log + l2 normalize
+        v = np.log1p(v)
+        v = v / (np.linalg.norm(v) + 1e-12)
+        segs.append(v)
+        used.append(a)
+    Cb = np.stack(segs, axis=1) if segs else chroma
+    return Cb, np.asarray(used, dtype=int)
 
 
 def snap_time_to_beats(t: float, beats: list[float]) -> float:
@@ -414,22 +530,79 @@ def _root_sanity_pass(segments: list, audio_path: str, use_flats: bool | None = 
             out.append(s)
     return out
 
-
-def estimate_chords(audio_path: str, sr=22050, hop=2048):
+def estimate_chords(
+    audio_path: str,
+    sr=22050,
+    hop=2048,
+    beats: list[float] | None = None,
+    downbeats: list[float] | None = None,
+    beat_strengths: list[float] | None = None,
+    stems: dict | None = None,
+    use_hpss: bool = True,
+):
     from audio_engine import _load_audio_any
     y_stereo, sr_loaded = _load_audio_any(audio_path)
     if sr is None:
         sr = sr_loaded
-    y = y_stereo.mean(axis=1)  # mono mixdown
-    chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop)
-    # Likelihoods and log
+
+    # Build harmonic mix: prefer stems, else HPSS on the mono mix
+    y_mono = y_stereo.mean(axis=1).astype(np.float32)
+
+    y_harm = None
+    if stems:
+        y_harm, _ = _mix_from_stems(stems, sr)
+    if y_harm is None:
+        if use_hpss:
+            try:
+                y_h, _ = librosa.effects.hpss(y_mono)
+                y_harm = y_h
+            except Exception:
+                y_harm = y_mono
+        else:
+            y_harm = y_mono
+
+    # Framewise chroma for fallback/feature use
+    chroma_frames = librosa.feature.chroma_cqt(y=y_harm, sr=sr, hop_length=hop)
+    frame_times = librosa.frames_to_time(np.arange(chroma_frames.shape[1]), sr=sr, hop_length=hop)
+
+    # If beats are provided (or can be estimated), aggregate beat-synchronously
+    if beats is None:
+        bd = estimate_beats(audio_path, sr=sr, hop=512)
+        beats = bd.get("beats", [])
+        downbeats = bd.get("downbeats", []) if downbeats is None else downbeats
+        beat_strengths = bd.get("beat_strengths", []) if beat_strengths is None else beat_strengths
+
+    if beats:
+        chroma, beat_frame_idxs = _beat_sync_chroma(chroma_frames, frame_times, beats, reduce='median')
+        times = np.asarray(beats, dtype=float)
+    else:
+        chroma = chroma_frames
+        times = frame_times
+
+    # Normalize chroma columns
+    chroma = chroma / (np.linalg.norm(chroma, axis=0, keepdims=True) + 1e-12)
+
     scores = chord_likelihoods(chroma) + 1e-6
-    # Add a prior that slightly favors triads over 7th chords to reduce false m7
-    # State layout: 0..11 maj, 12..23 min, 24..35 dom7, 36..47 maj7, 48..59 min7
     log_probs = np.log(scores)
-    states = viterbi(log_probs, trans=0.997)
-    # Map to labels & times
-    times = librosa.frames_to_time(np.arange(chroma.shape[1]), sr=sr, hop_length=hop)
+
+    # Build stay probability per time using beat context:
+    T = log_probs.shape[1]
+    stay = np.full(T, 0.997, dtype=np.float64)
+    if beats:
+        # Encourage changes on downbeats and strong beats
+        down_set = set(np.round(np.asarray(downbeats or []) * 1000).astype(int).tolist())
+        beat_ms = np.round(np.asarray(beats) * 1000).astype(int).tolist()
+        strengths = beat_strengths or [1.0]*len(beat_ms)
+        for i, (bm, s) in enumerate(zip(beat_ms, strengths)):
+            # If this beat is a downbeat, allow more switching
+            is_down = bm in down_set
+            base = 0.994 if is_down else 0.997
+            # Stronger beat -> lower stay (more likely to change)
+            stay_i = np.clip(base - 0.08 * float(s), 0.94, 0.999)
+            # Map to time index i (beat-synchronous)
+            if i < T:
+                stay[i] = stay_i
+    states = viterbi_timevarying(log_probs, stay)
 
     # Choose enharmonics based on estimated key
     tonic_idx, mode = _estimate_key_from_chroma(chroma)
@@ -469,4 +642,8 @@ def estimate_chords(audio_path: str, sr=22050, hop=2048):
     segments = _refine_minor_sevenths(segments, audio_path)
     # Root sanity check (keep family, re-pick root if clearly better)
     segments = _root_sanity_pass(segments, audio_path, use_flats=use_flats)
+
+    beat_sync_used = bool(beats)
+    if beat_sync_used:
+        segments = [dict(s, beat_sync=True) for s in segments]
     return segments
