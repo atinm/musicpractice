@@ -1096,30 +1096,116 @@ class WaveformView(QtWidgets.QWidget):
                 x1 = int((b_rel - rel_t0) / (rel_t1 - rel_t0) * w)
                 rect = QtCore.QRect(x0, wf_h, max(1, x1 - x0), ch_h)
                 p.fillRect(rect, QtGui.QColor(50, 80, 110))
-                p.setPen(QtGui.QPen(QtGui.QColor(120, 170, 220)))
+                # Brighter outline for the chord box, with increased width
+                bright_pen = QtGui.QPen(QtGui.QColor(0, 0, 0))
+                bright_pen.setWidth(2)
+                p.setPen(bright_pen)
                 p.drawRect(rect)
+                # Chord label
                 p.setPen(QtGui.QPen(QtGui.QColor(230, 230, 230)))
                 p.drawText(rect.adjusted(4, 0, -4, 0), Qt.AlignVCenter | Qt.AlignLeft, seg['label'])
 
-            # Draw vertical separators at boundaries between adjacent visible chord boxes
+            # Draw subtle beat boundaries inside each chord box (only if chord spans >1 beat)
+            # Use beats with backfill so bar 0 (origin→first downbeat) gets interior ticks.
             try:
-                if segs_visible and len(segs_visible) >= 2:
-                    # Sort by start time and iterate adjacent pairs
-                    ordered = sorted(segs_visible, key=lambda s: float(s.get('start', 0.0)))
-                    pen_sep = QtGui.QPen(QtGui.QColor(230, 240, 255))
-                    pen_sep.setWidth(1)
-                    p.setPen(pen_sep)
-                    for a, bseg in zip(ordered[:-1], ordered[1:]):
+                beat_arr = None
+                if self.beats:
+                    bt = np.asarray(self.beats, dtype=float)
+                    bt.sort()
+                    if bt.size >= 2:
+                        diffs = np.diff(bt)
+                        good = diffs[(diffs > 0.1) & (diffs < 2.0)]
+                        period = float(np.median(good)) if good.size else float(np.median(diffs))
+                    else:
+                        period = 0.5
+                    # Backfill a few beats before the first to cover the first bar window
+                    beats_full = []
+                    if bt.size:
+                        first_bt = float(bt[0])
+                        k = 1
+                        # back-fill slightly beyond window to ensure left-edge coverage
+                        while period > 0 and (first_bt - k * period) > (t0 - 2 * period):
+                            beats_full.append(first_bt - k * period)
+                            k += 1
+                        beats_full = list(reversed(beats_full)) + bt.tolist()
+                    else:
+                        beats_full = bt.tolist()
+                    beat_arr = np.asarray(beats_full, dtype=float)
+                else:
+                    beat_arr = None
+            except Exception:
+                beat_arr = None
+
+            try:
+                if beat_arr is not None:
+                    pen_beat = QtGui.QPen(QtGui.QColor(200, 210, 230, 110))
+                    pen_beat.setWidth(1)
+                    pen_beat.setStyle(QtCore.Qt.DotLine)
+                    for seg in segs_to_draw:
                         try:
-                            boundary = float(a.get('end'))  # should equal next.start after snapping/splitting
+                            sa = float(seg['start']); sb = float(seg['end'])
                         except Exception:
                             continue
-                        if boundary <= t0 or boundary >= t1:
+                        # Beats strictly inside the chord interval
+                        if beat_arr is None:
                             continue
-                        x = int((boundary - t0) / (t1 - t0) * w)
-                        p.drawLine(x, wf_h, x, wf_h + ch_h - 1)
+                        inside = beat_arr[(beat_arr > sa + 1e-9) & (beat_arr < sb - 1e-9)] if beat_arr.size else beat_arr
+                        if inside is None or (hasattr(inside, 'size') and inside.size == 0):
+                            continue
+                        # Clip to the chord rect so beat lines don't bleed outside
+                        a_clamped = max(t0, sa); b_clamped = min(t1, sb)
+                        if b_clamped <= a_clamped:
+                            continue
+                        x0_clip = int((a_clamped - t0) / (t1 - t0) * w)
+                        x1_clip = int((b_clamped - t0) / (t1 - t0) * w)
+                        rect_clip = QtCore.QRect(x0_clip, wf_h, max(1, x1_clip - x0_clip), ch_h)
+                        p.save()
+                        p.setClipRect(rect_clip)
+                        p.setPen(pen_beat)
+                        for bt in inside:
+                            if bt <= t0 or bt >= t1:
+                                continue
+                            x = int((float(bt) - t0) / (t1 - t0) * w)
+                            p.drawLine(x, wf_h, x, wf_h + ch_h - 1)
+                        p.restore()
             except Exception:
                 pass
+
+            # Draw rounded bar boundaries as translucent boxes across the chord lane
+            try:
+                if have_bars and self.bars:
+                    bars_sorted = [float(b) for b in self.bars]
+                    bars_sorted = sorted(bars_sorted)
+                    # Build (start, end) pairs for bars that intersect the visible window
+                    prev = float(self.origin or 0.0)
+                    intervals = []
+                    for b in bars_sorted:
+                        intervals.append((prev, float(b)))
+                        prev = float(b)
+                    # Add a trailing interval to cover view past the last known bar (optional)
+                    intervals.append((prev, float('inf')))
+
+                    # Use the same brighter/thicker line as chord boxes so the bar outline
+                    # acts as the visual separator between waveform and chord lane.
+                    pen_round = QtGui.QPen(QtGui.QColor(0, 0, 0))
+                    pen_round.setWidth(2)
+                    p.setPen(pen_round)
+                    p.setBrush(QtCore.Qt.NoBrush)
+                    radius = 6
+                    for (bs, be) in intervals:
+                        # Clip to the visible window
+                        a = max(t0, bs)
+                        b = min(t1, be)
+                        if not (b > a):
+                            continue
+                        x0 = int((a - t0) / (t1 - t0) * w)
+                        x1 = int((b - t0) / (t1 - t0) * w)
+                        rect_bar = QtCore.QRect(x0, wf_h, max(1, x1 - x0), ch_h)
+                        # Rounded outline to hint the bar container
+                        p.drawRoundedRect(rect_bar, radius, radius)
+            except Exception:
+                pass
+
 
 
 class ChordWorker(QThread):
