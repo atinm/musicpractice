@@ -1212,6 +1212,7 @@ class ChordWorker(QThread):
     done = Signal(list)
     status = Signal(str)
     demucs_line = Signal(str)  # forward Demucs logs to LogDock (like _toggle_stems)
+    stems_ready = Signal(str)  # emits the stem **leaf** directory path
     def __init__(self, path: str):
         super().__init__()
         self.path = path
@@ -1338,15 +1339,18 @@ class ChordWorker(QThread):
         out_dir = self._song_cache_dir(audio_path)
         leaf = self._stem_leaf_dir(audio_path, out_dir, model)
         maybe_pre = None
-        # Force a fresh Demucs render so we don't skip due to cached files
+        # Only force a fresh Demucs render if Main requested recompute
         try:
-            if leaf.exists():
+            force = bool(getattr(self.parent(), "_force_stems_recompute", False))
+        except Exception:
+            force = False
+        try:
+            if leaf.exists() and force:
                 self._log(f"Removing existing stems leaf to force render: {leaf}")
                 shutil.rmtree(leaf)
         except Exception as e:
             self._log_exc("Pre-clean leaf dir", e)
-        self._log(f"[ENTRY] estimate_chords: forcing Demucs for {audio_path}")
-        # Start Demucs and stream logs; always wait afterwards
+        self._log(f"[ENTRY] estimate_chords: Demucs run (force={force}) for {audio_path}")        # Start Demucs and stream logs; always wait afterwards
         self._log(f"Demucs starting: {model} → {out_dir}")
         try:
             worker = DemucsWorker(audio_path, str(out_dir), model)
@@ -1364,6 +1368,9 @@ class ChordWorker(QThread):
         self._log("Demucs finished rendering. Verifying files…")
         try:
             maybe_pre = self._wait_for_stems(audio_path, out_dir, model=model, timeout_s=900)
+            if isinstance(maybe_pre, dict) and maybe_pre:
+                leaf_dir = self._stem_leaf_dir(audio_path, out_dir, model)
+                self.stems_ready.emit(str(leaf_dir))
         except Exception as e:
             self._log_exc("Wait for stems", e)
             maybe_pre = None
@@ -1374,6 +1381,7 @@ class ChordWorker(QThread):
                 maybe_pre = load_stem_arrays(leaf)
                 if maybe_pre:
                     self._log("Loaded stems via direct scan of leaf directory.")
+                    self.stems_ready.emit(str(leaf))
                 else:
                     self._log("Direct leaf load returned empty dict.")
             except Exception as e:
@@ -1574,6 +1582,48 @@ class Main(QtWidgets.QMainWindow):
         if hasattr(self, 'log_dock') and self.log_dock is not None:
             self.log_dock.write(text)
 
+    def _on_stems_ready(self, stem_dir_str: str):
+        """Always wire stems into the player and show the mixer dock when stems are ready."""
+        try:
+            self._load_stems_from_dir(Path(stem_dir_str))
+            self.statusBar().showMessage("Stems loaded into mixer.", 1500)
+            if self.stems_dock:
+                self.stems_dock.show()
+        except Exception as e:
+            self.statusBar().showMessage(f"Failed to load stems: {e}")
+            if hasattr(self, 'log_dock') and self.log_dock is not None:
+                self.log_dock.write(f"Failed to load stems: {e}\n")
+
+    def _find_existing_stem_leaf(self, audio_path: str, model: str = "htdemucs_6s") -> Path | None:
+        """Return a Demucs leaf directory containing wavs if present, else None."""
+        root = self._song_cache_dir(audio_path)
+        leaf = self._stem_leaf_dir(audio_path, root, model)
+        try:
+            if leaf.is_dir() and list(leaf.glob("*.wav")):
+                return leaf
+            # fall back: scan subdirs for the most recent leaf with wavs
+            candidates = [d for d in root.rglob("*") if d.is_dir() and list(d.glob("*.wav"))]
+            if candidates:
+                return max(candidates, key=lambda p: p.stat().st_mtime)
+        except Exception:
+            pass
+        return None
+
+    def _maybe_load_cached_stems(self, audio_path: str):
+        """If stems already exist on disk, load them into the mixer and show the dock."""
+        leaf = self._find_existing_stem_leaf(audio_path)
+        if leaf is None:
+            return
+        try:
+            self._load_stems_from_dir(leaf)
+            self.statusBar().showMessage("Loaded existing stems from cache.", 1500)
+            if self.stems_dock:
+                self.stems_dock.show()
+        except Exception as e:
+            self.statusBar().showMessage(f"Cached stems present but failed to load: {e}")
+            if hasattr(self, 'log_dock') and self.log_dock is not None:
+                self.log_dock.write(f"Cached stems load error: {e}\n")
+
     def _clear_stem_rows(self):
         while self.stems_layout.count():
             item = self.stems_layout.takeAt(0)
@@ -1654,8 +1704,6 @@ class Main(QtWidgets.QMainWindow):
             self.statusBar().showMessage(f"Load stems failed: {e}")
             if self.log_dock:
                 self.log_dock.write(f"Load stems failed: {e}\n")
-            if hasattr(self, 'act_toggle_stems'):
-                self.act_toggle_stems.setChecked(False)
         finally:
             setattr(self, 'demucs_worker', None)
 
@@ -1663,8 +1711,6 @@ class Main(QtWidgets.QMainWindow):
         if hasattr(self, 'log_dock') and self.log_dock is not None:
             self.log_dock.write(f"\nERROR: {err}\n")
         self.statusBar().showMessage(f"Stems failed: {err}")
-        if hasattr(self, 'act_toggle_stems'):
-            self.act_toggle_stems.setChecked(False)
         setattr(self, 'demucs_worker', None)
 
     def _cleanup_on_quit(self):
@@ -1712,6 +1758,7 @@ class Main(QtWidgets.QMainWindow):
         self.chord_worker = None
         self.key_worker = None
         self.log_dock = None  # created on demand when separating stems
+        self._force_stems_recompute = False
 
         # === UI ===
         self.rate_spin = QtWidgets.QDoubleSpinBox()
@@ -1893,11 +1940,13 @@ class Main(QtWidgets.QMainWindow):
             pass
 
     def _recompute_current(self):
+        self._force_stems_recompute = True
         try:
             path = getattr(self, "current_path", None)
             if not path:
                 return
             self._clear_cached_analysis(path, remove_stems=True)
+            self._clear_stem_rows()
             self.start_chord_analysis(path)  # runs Demucs + waits + chords
         except Exception:
             pass
@@ -2616,9 +2665,32 @@ class Main(QtWidgets.QMainWindow):
         p = Path(audio_path)
         return p.parent / ".musicpractice" / f"{p.stem}.musicpractice.json"
 
-    def _stem_leaf_dir(self, audio_path: str, model: str = "htdemucs_6s") -> Path:
-        out_dir = self._song_cache_dir(audio_path)  # you already have this in Main
-        return out_dir / model / Path(audio_path).stem
+    def _stem_leaf_dir(self, audio_path: str, out_dir_or_model=None, model: str = "htdemucs_6s") -> Path:
+        """
+        Backward-compatible helper that accepts either:
+        - (audio_path) → uses cache dir + default model
+        - (audio_path, model_str) → uses cache dir + given model
+        - (audio_path, out_dir: PathLike, model_str) → explicit out_dir and model
+        - Keyword args out_dir=..., model=...
+        """
+        p = Path(audio_path)
+        # Resolve out_dir based on the 2nd arg's type/shape
+        if out_dir_or_model is None:
+            out_dir = self._song_cache_dir(audio_path)
+        elif isinstance(out_dir_or_model, (Path, os.PathLike)):
+            out_dir = Path(out_dir_or_model)
+        elif isinstance(out_dir_or_model, str):
+            # If it's clearly a path-like string (has separator or exists), treat as out_dir; else it's a model
+            looks_path = (os.sep in out_dir_or_model) or out_dir_or_model.startswith(".") \
+                        or out_dir_or_model.startswith("/") or Path(out_dir_or_model).exists()
+            if looks_path:
+                out_dir = Path(out_dir_or_model)
+            else:
+                out_dir = self._song_cache_dir(audio_path)
+                model = out_dir_or_model
+        else:
+            out_dir = self._song_cache_dir(audio_path)
+        return Path(out_dir) / model / p.stem
 
     def _clear_cached_analysis(self, audio_path: str, remove_stems: bool = True):
         # Delete sidecar JSON
@@ -2713,9 +2785,7 @@ class Main(QtWidgets.QMainWindow):
         # Apply current UI rate to fresh player (keeps UI and audio consistent)
         self._rate_changed(self.rate_spin.value())
 
-        # If stems UI is active, clear it for the new track
-        if hasattr(self, 'act_toggle_stems') and self.act_toggle_stems.isChecked():
-            self.act_toggle_stems.setChecked(False)
+        self._maybe_load_cached_stems(self.current_path)
 
         # Align visual time 0 to first non-silent audio and position the transport
         lead = self._detect_leading_silence_seconds(self.player.y, self.player.sr)
@@ -2774,18 +2844,20 @@ class Main(QtWidgets.QMainWindow):
             self.chord_worker.wait(-1)
         cw = ChordWorker(path)
         cw.setParent(self)
-        # Ensure a LogDock exists and is visible (same UX as _toggle_stems)
+        # Ensure Demucs logs are visible and wire stem loading
         if not hasattr(self, "log_dock") or self.log_dock is None:
             self.log_dock = LogDock(parent=self)
             self.addDockWidget(Qt.BottomDockWidgetArea, self.log_dock)
         self.log_dock.setWindowTitle("Demucs Log")
         self.log_dock.show(); self.log_dock.raise_(); self.log_dock.clear()
+
         cw.demucs_line.connect(self._demucs_log)
+        cw.stems_ready.connect(self._on_stems_ready)
+
         cw.status.connect(lambda s: self.statusBar().showMessage(str(s)))
         cw.done.connect(self._chords_ready)
-        cw.finished.connect(lambda: setattr(self, "chord_worker", None))
+        cw.finished.connect(lambda: (setattr(self, "chord_worker", None), setattr(self, "_force_stems_recompute", False)))
         self.chord_worker = cw
-        # Show a minimal waiting message immediately
         self.statusBar().showMessage("Analyzing: beats + stems + chords…")
         cw.start()
 
