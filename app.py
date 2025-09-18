@@ -1324,7 +1324,21 @@ class Main(QtWidgets.QMainWindow):
             self.player.stop(); self.player.close()
         self.player = LoopPlayer(fn)
         self.wave.set_player(self.player)
-        # Do not default to any loop on load
+
+        # restore session if available
+        try:
+            self.load_session()
+        except Exception:
+            pass
+
+        # compute only what’s missing
+        if not self.last_beats:
+            self.populate_beats_async(self.current_path)
+        if not self.last_chords:
+            self.populate_chords_async(self.current_path)
+        if not (self.last_key and self.last_key.get("pretty")):
+            self.populate_key_async(self.current_path)        # Do not default to any loop on load
+
         try:
             self.player.clear_loop()
         except Exception:
