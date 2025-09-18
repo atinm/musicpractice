@@ -736,6 +736,82 @@ class BeatWorker(QThread):
         if not self.isInterruptionRequested():
             self.done.emit(info)
 
+class DemucsWorker(QtCore.QThread):
+    line = QtCore.Signal(str)
+    done = QtCore.Signal(str)   # emits the stem root directory as string
+    failed = QtCore.Signal(str)
+
+    def __init__(self, audio_path: str, outdir: str, model: str):
+        super().__init__()
+        self.audio_path = audio_path
+        self.outdir = outdir
+        self.model = model
+
+    # Make the worker behave like a text stream for stdout/stderr redirection
+    def write(self, msg: str):
+        try:
+            s = str(msg)
+        except Exception:
+            s = ""
+        if s:
+            self.line.emit(s)
+
+    def flush(self):
+        pass
+
+    def run(self):
+        import sys
+        old_out, old_err = sys.stdout, sys.stderr
+        sys.stdout = sys.stderr = self
+        try:
+            self.line.emit(f"Separating with model: {self.model}\n")
+            self.line.emit(f"Output: {self.outdir}\n")
+            stem_dir = separate_stems(self.audio_path, self.outdir, model=self.model)
+            self.done.emit(str(stem_dir))
+        except Exception as e:
+            self.failed.emit(str(e))
+        finally:
+            sys.stdout, sys.stderr = old_out, old_err
+
+class LogDock(QtWidgets.QDockWidget):
+    """A dock that behaves like a file-like stream (write/flush) to show Demucs logs."""
+    def __init__(self, title="Demucs Log", parent=None):
+        super().__init__(title, parent)
+        self.setObjectName("DemucsLogDock")
+        self.setAllowedAreas(Qt.BottomDockWidgetArea | Qt.TopDockWidgetArea)
+        w = QtWidgets.QWidget(self)
+        v = QtWidgets.QVBoxLayout(w)
+        v.setContentsMargins(6, 6, 6, 6)
+        v.setSpacing(4)
+        self.view = QtWidgets.QPlainTextEdit(w)
+        self.view.setReadOnly(True)
+        self.view.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
+        v.addWidget(self.view, 1)
+        w.setLayout(v)
+        self.setWidget(w)
+
+    def clear(self):
+        self.view.clear()
+
+    def write(self, msg: str):
+        # Accept str; coerce others safely
+        if not isinstance(msg, str):
+            try:
+                msg = str(msg)
+            except Exception:
+                msg = ""
+        if not msg:
+            return
+        # Append from any thread
+        QtCore.QMetaObject.invokeMethod(
+            self.view,
+            "appendPlainText",
+            Qt.QueuedConnection,
+            QtCore.Q_ARG(str, msg.rstrip("\n"))
+        )
+
+    def flush(self):
+        pass
 
 class Main(QtWidgets.QMainWindow):
     @staticmethod
@@ -772,6 +848,64 @@ class Main(QtWidgets.QMainWindow):
         self.last_beats = list(beats)
         self.last_bars = list(bars)
         self.save_session()
+
+    def _demucs_log(self, text: str):
+        if hasattr(self, 'log_dock') and self.log_dock is not None:
+            self.log_dock.write(text)
+
+    def _clear_stem_rows(self):
+        while self.stems_layout.count():
+            item = self.stems_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+
+    def _load_stems_from_dir(self, stem_dir: Path):
+        # Demucs usually writes outdir/<model>/<track_name>/*.wav → descend to leaf containing wavs
+        if stem_dir.is_dir():
+            leaf = stem_dir
+            try:
+                candidates = [d for d in stem_dir.rglob("*") if d.is_dir() and list(d.glob("*.wav"))]
+                if candidates:
+                    leaf = max(candidates, key=lambda p: p.stat().st_mtime)
+            except Exception:
+                pass
+            stem_dir = leaf
+        arrays = load_stem_arrays(stem_dir)
+        if not arrays:
+            raise RuntimeError("No stem WAVs found")
+        if self.player and hasattr(self.player, 'set_stems_arrays'):
+            self.player.set_stems_arrays(arrays)
+            if hasattr(self.player, 'use_stems_only'):
+                self.player.use_stems_only(True)
+        if hasattr(self, '_clear_stem_rows'):
+            self._clear_stem_rows()
+        for name in order_stem_names(list(arrays.keys())):
+            self._add_stem_row(name, arrays[name])
+        if self.stems_dock:
+            self.stems_dock.show()
+
+    def _demucs_done(self, stem_dir_str: str):
+        if hasattr(self, 'log_dock') and self.log_dock is not None:
+            self.log_dock.write("\nSeparation complete.\n")
+        try:
+            self._load_stems_from_dir(Path(stem_dir_str))
+        except Exception as e:
+            self.statusBar().showMessage(f"Load stems failed: {e}")
+            if self.log_dock:
+                self.log_dock.write(f"Load stems failed: {e}\n")
+            if hasattr(self, 'act_toggle_stems'):
+                self.act_toggle_stems.setChecked(False)
+        finally:
+            setattr(self, 'demucs_worker', None)
+
+    def _demucs_failed(self, err: str):
+        if hasattr(self, 'log_dock') and self.log_dock is not None:
+            self.log_dock.write(f"\nERROR: {err}\n")
+        self.statusBar().showMessage(f"Stems failed: {err}")
+        if hasattr(self, 'act_toggle_stems'):
+            self.act_toggle_stems.setChecked(False)
+        setattr(self, 'demucs_worker', None)
 
     def _cleanup_on_quit(self):
         # Stop audio stream if present
@@ -817,6 +951,7 @@ class Main(QtWidgets.QMainWindow):
         self.beat_worker = None
         self.chord_worker = None
         self.key_worker = None
+        self.log_dock = None  # created on demand when separating stems
 
         # === UI ===
         self.rate_spin = QtWidgets.QDoubleSpinBox()
@@ -1078,7 +1213,7 @@ class Main(QtWidgets.QMainWindow):
         # Turning OFF: hide and clear
         if not on:
             self.stems_dock.hide()
-            # clear UI rows
+            # delete UI rows
             while self.stems_layout.count():
                 item = self.stems_layout.takeAt(0)
                 w = item.widget()
@@ -1087,6 +1222,9 @@ class Main(QtWidgets.QMainWindow):
             # clear player stems
             if self.player and hasattr(self.player, 'clear_stems'):
                 self.player.clear_stems()
+            # also hide the log dock if present
+            if hasattr(self, "log_dock") and self.log_dock is not None:
+                self.log_dock.hide()
             return
 
         # Turning ON requires an audio file
@@ -1101,8 +1239,24 @@ class Main(QtWidgets.QMainWindow):
         if preexisting:
             stem_dir = outdir
         else:
-            stem_dir = separate_stems(self.current_path, str(outdir))
-        # descend to deepest dir that has .wav files (Demucs creates model/track)
+            # Ensure a log dock exists and is visible
+            if not hasattr(self, "log_dock") or self.log_dock is None:
+                self.log_dock = LogDock(parent=self)
+                self.addDockWidget(Qt.BottomDockWidgetArea, self.log_dock)
+            self.log_dock.setWindowTitle("Demucs Log")
+            self.log_dock.show()
+            self.log_dock.raise_()
+            self.log_dock.clear()
+
+            # Launch Demucs in background and stream logs
+            model = 'htdemucs_6s'
+            self.demucs_worker = DemucsWorker(self.current_path, str(outdir), model)
+            self.demucs_worker.line.connect(self._demucs_log)
+            self.demucs_worker.done.connect(self._demucs_done)
+            self.demucs_worker.failed.connect(self._demucs_failed)
+            self.demucs_worker.start()
+            return
+
         leaf = stem_dir
         candidates = [d for d in stem_dir.rglob("*") if d.is_dir() and list(d.glob("*.wav"))]
         if candidates:
