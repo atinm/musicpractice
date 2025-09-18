@@ -437,6 +437,62 @@ class WaveformView(QtWidgets.QWidget):
         self.requestSeek.emit(float(t_new))
         e.accept()
 
+    def _snap_segments_to_bars(self, segments: list[dict], bars: list[float]) -> list[dict]:
+        """Snap chord segment boundaries to bar boundaries.
+        Start snaps to the nearest bar at or before the start; end snaps to the nearest bar at or after the end.
+        Bar list is in absolute seconds.
+        """
+        if not segments or not bars:
+            return segments or []
+        bars_sorted = sorted(float(b) for b in bars)
+        out: list[dict] = []
+        for seg in segments:
+            try:
+                s = float(seg.get('start'))
+                e = float(seg.get('end'))
+                lab = seg.get('label')
+            except Exception:
+                continue
+            if e <= s:
+                continue
+            # find bar at/before start
+            bs = max((b for b in bars_sorted if b <= s), default=s)
+            # find bar at/after end
+            be = min((b for b in bars_sorted if b >= e), default=e)
+            # ensure strictly increasing
+            if be <= bs:
+                # if collapsed due to missing bars, keep original
+                bs, be = s, e
+            out.append({'start': bs, 'end': be, 'label': lab})
+        return out
+
+    def _split_segments_at_bars(self, segments: list[dict], bars: list[float]) -> list[dict]:
+        """Return segments split so none spans across a bar boundary.
+        Each output segment keeps the original 'label'.
+        """
+        if not segments or not bars:
+            return segments or []
+        bars_sorted = sorted(set(float(b) for b in bars))
+        out: list[dict] = []
+        for seg in segments:
+            try:
+                start = float(seg.get('start'))
+                end = float(seg.get('end'))
+                label = seg.get('label')
+            except Exception:
+                continue
+            if end <= start:
+                continue
+            t0 = start
+            # collect internal bar cuts strictly inside (start, end)
+            cuts = [b for b in bars_sorted if start < b < end]
+            prev = t0
+            for cut in cuts:
+                out.append({'start': prev, 'end': cut, 'label': label})
+                prev = cut
+            out.append({'start': prev, 'end': end, 'label': label})
+        return out
+
     def paintEvent(self, e: QtGui.QPaintEvent):
         p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.Antialiasing, False)
@@ -569,6 +625,19 @@ class WaveformView(QtWidgets.QWidget):
                     p.drawLine(xh, 0, xh, short_len)
                 hmark += 0.5
 
+        # Draw dashed bar grid lines across the waveform area
+        if have_bars and self.bars:
+            pen_bar = QtGui.QPen(QtGui.QColor(120, 130, 150, 110))  # light, subtle
+            pen_bar.setWidth(1)
+            pen_bar.setStyle(QtCore.Qt.DashLine)
+            p.setPen(pen_bar)
+            for bar_t in self.bars:
+                bt = float(bar_t)
+                if bt < t0 or bt > t1:
+                    continue
+                x = int((bt - t0) / (t1 - t0) * w)
+                p.drawLine(x, 0, x, wf_h)  # full height of waveform area
+
         # loop overlay (if available)
         if self.loopA is not None and self.loopB is not None:
             a = max(t0, min(t1, float(self.loopA)))
@@ -671,12 +740,20 @@ class WaveformView(QtWidgets.QWidget):
 
         # chord lane
         if self.chords:
+            # Step 1: snap chord boundaries to bar boundaries
+            snapped = self._snap_segments_to_bars(self.chords, self.bars)
+            # Step 2: split any segments that still span across bars
+            segs_to_draw = self._split_segments_at_bars(snapped, self.bars)
+
             font = p.font()
             font.setPointSizeF(max(9.0, self.font().pointSizeF()))
             p.setFont(font)
-            for seg in self.chords:
-                a = max(t0, float(seg['start']))
-                b = min(t1, float(seg['end']))
+            for seg in segs_to_draw:
+                try:
+                    a = max(t0, float(seg['start']))
+                    b = min(t1, float(seg['end']))
+                except Exception:
+                    continue
                 if b <= a:
                     continue
                 # relative (visual) times, though x mapping uses absolute t0/t1
