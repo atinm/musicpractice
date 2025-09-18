@@ -33,6 +33,9 @@ class WaveformView(QtWidgets.QWidget):
     requestDeleteSelected = QtCore.Signal()               # delete currently selected saved loop
     requestRenameLoop = QtCore.Signal(int)     # loop id to rename
     requestDeleteLoopId = QtCore.Signal(int)   # loop id to delete
+    requestEditChord = QtCore.Signal(float)         # time (sec) under cursor to edit chord label
+    requestSplitChordAt = QtCore.Signal(float)      # time (sec) to split chord at that point
+    requestJoinChordForward = QtCore.Signal(float)  # time (sec) to join this chord with the next (same bar)
 
     def set_saved_loops(self, loops: list[dict] | None):
         self.saved_loops = list(loops or [])
@@ -47,6 +50,7 @@ class WaveformView(QtWidgets.QWidget):
         super().__init__(parent)
         self.setFocusPolicy(Qt.StrongFocus)
         self.setMinimumHeight(160)
+        self.setContextMenuPolicy(Qt.DefaultContextMenu)
         self.window_s = window_s
         self.player = None  # type: LoopPlayer | None
         self.chords = []    # list of {start, end, label}
@@ -123,6 +127,36 @@ class WaveformView(QtWidgets.QWidget):
     def _x_from_time(self, t: float, t0: float, t1: float, w: int) -> int:
         """Convert time to pixel column, clamped to [0, w-1]."""
         return int(max(0, min(w - 1, (t - t0) / (t1 - t0) * w)))
+
+    def _time_in_chord_lane(self, pos: QtCore.QPoint, t0: float, t1: float, w: int, wf_h: int):
+        """Return absolute time if pos is in the chord lane; else None."""
+        x = int(pos.x()); y = int(pos.y())
+        lane_top = wf_h
+        lane_bottom = wf_h + 32
+        # Expand hit-box by 4px to make right-clicking easier
+        if y < (lane_top - 4) or y >= (lane_bottom + 4):
+            return None
+        return self._time_at_x(x, t0, t1, w)
+
+    def _open_chord_context_at(self, pos: QtCore.QPoint, global_pos: QtCore.QPoint):
+        """Try to open the chord context menu for a widget-relative pos; return True if handled."""
+        t0, t1 = self._current_window()
+        w = self.width(); h = self.height(); wf_h = int(h * 0.7)
+        t_ch = self._time_in_chord_lane(pos, t0, t1, w, wf_h)
+        if t_ch is None:
+            return False
+        menu = QtWidgets.QMenu(self)
+        actEdit = menu.addAction("Change chord…")
+        actSplit = menu.addAction("Split chord here")
+        actJoin = menu.addAction("Join with next (same bar)")
+        chosen = menu.exec(global_pos)
+        if chosen == actEdit:
+            self.requestEditChord.emit(float(t_ch))
+        elif chosen == actSplit:
+            self.requestSplitChordAt.emit(float(t_ch))
+        elif chosen == actJoin:
+            self.requestJoinChordForward.emit(float(t_ch))
+        return True
 
     def _hit_test(self, pos: QtCore.QPoint, t0: float, t1: float, w: int, wf_h: int):
         """Return (kind, loop_id) if hit on a flag or edge."""
@@ -244,8 +278,18 @@ class WaveformView(QtWidgets.QWidget):
         return mins, maxs
 
     def contextMenuEvent(self, e: QtGui.QContextMenuEvent):
+        # Chord box context menu when right-clicking in the chord lane
+        pos_local = e.pos()
+        try:
+            pos_global = e.globalPos()
+        except Exception:
+            pos_global = QtGui.QCursor.pos()
+        if self._open_chord_context_at(pos_local, pos_global):
+            e.accept()
+            return
         # Right-click → offer a small menu if we're over a loop flag/edge
         if not hasattr(self, 'saved_loops') or not self.saved_loops:
+            e.ignore()
             return
         t0, t1 = self._current_window()
         w = self.width(); h = self.height(); wf_h = int(h * 0.7)
@@ -267,7 +311,24 @@ class WaveformView(QtWidgets.QWidget):
             self.requestDeleteLoopId.emit(int(lid))
 
     def mousePressEvent(self, e: QtGui.QMouseEvent):
+        # Right-click: open chord context menu if inside chord lane, else let parent handle
+        if e.button() == Qt.RightButton:
+            # Use widget-relative pos and global position compatible with Qt6
+            pos_local = e.position().toPoint() if hasattr(e, 'position') else e.pos()
+            pos_global = e.globalPosition().toPoint() if hasattr(e, 'globalPosition') else e.globalPos()
+            handled = self._open_chord_context_at(pos_local, pos_global)
+            if handled:
+                e.accept()
+                return
+            e.ignore()
+            return
+        # For left/middle clicks, we require a player to interact
         if not self.player:
+            e.ignore()
+            return
+        # Only handle left-button presses here
+        if e.button() != Qt.LeftButton:
+            e.ignore()
             return
         t0, t1 = self._current_window()
         w = self.width(); h = self.height(); wf_h = int(h * 0.7)
@@ -333,6 +394,10 @@ class WaveformView(QtWidgets.QWidget):
         e.accept()
 
     def mouseReleaseEvent(self, e: QtGui.QMouseEvent):
+        # Only handle left-button releases for seeking/loop commits
+        if e.button() != Qt.LeftButton:
+            e.ignore()
+            return
         # Click (no drag) in empty space → seek to that time
         if self._press_kind == 'empty' and not self._drag_started and self._press_t is not None:
             self.freeze_window_now()
@@ -386,6 +451,9 @@ class WaveformView(QtWidgets.QWidget):
             cur = self.player.position_seconds()
             dur = self.player.duration_seconds() if hasattr(self.player, 'duration_seconds') else (self.player.n / float(self.player.sr))
             t_new = max(0.0, min(dur, cur + step))
+            # Ensure the view is not frozen so it will re-center on the new playhead
+            if self._freeze_window:
+                self.unfreeze_and_center()
             # Seek (Main will keep playhead centered in view)
             self.requestSeek.emit(float(t_new))
             e.accept()
@@ -442,9 +510,17 @@ class WaveformView(QtWidgets.QWidget):
         Start snaps to the nearest bar at or before the start; end snaps to the nearest bar at or after the end.
         Bar list is in absolute seconds.
         """
-        if not segments or not bars:
-            return segments or []
-        bars_sorted = sorted(float(b) for b in bars)
+        if not segments:
+            return []
+        # Always treat the visual origin as a bar boundary (bar 0)
+        bars_aug = list(bars or [])
+        try:
+            bars_aug.append(float(self.origin or 0.0))
+        except Exception:
+            bars_aug.append(0.0)
+        bars_sorted = sorted(float(b) for b in bars_aug)
+        if not bars_sorted:
+            return list(segments)
         out: list[dict] = []
         for seg in segments:
             try:
@@ -470,9 +546,16 @@ class WaveformView(QtWidgets.QWidget):
         """Return segments split so none spans across a bar boundary.
         Each output segment keeps the original 'label'.
         """
-        if not segments or not bars:
-            return segments or []
-        bars_sorted = sorted(set(float(b) for b in bars))
+        if not segments:
+            return []
+        bars_aug = set(float(b) for b in (bars or []))
+        try:
+            bars_aug.add(float(self.origin or 0.0))
+        except Exception:
+            bars_aug.add(0.0)
+        bars_sorted = sorted(bars_aug)
+        if not bars_sorted:
+            return list(segments)
         out: list[dict] = []
         for seg in segments:
             try:
@@ -493,6 +576,38 @@ class WaveformView(QtWidgets.QWidget):
             out.append({'start': prev, 'end': end, 'label': label})
         return out
 
+    def _ensure_leading_bar(self, segments: list[dict], bars: list[float]) -> list[dict]:
+        """If the first visible bar (origin→first bar) has no chord segment,
+        create one using the first chord's label. Does not modify input list in-place."""
+        segs = list(segments or [])
+        if not segs:
+            return segs
+        try:
+            origin = float(self.origin or 0.0)
+        except Exception:
+            origin = 0.0
+        # Determine the first bar boundary at or after origin
+        first_bar = None
+        if bars:
+            try:
+                first_bar = min(b for b in bars if float(b) >= origin)
+            except ValueError:
+                first_bar = None
+        segs_sorted = sorted(segs, key=lambda s: float(s.get('start', 0.0)))
+        first_seg = segs_sorted[0]
+        try:
+            s0 = float(first_seg.get('start'))
+            lab0 = first_seg.get('label')
+        except Exception:
+            return segs
+        # If the first segment already starts at or before origin (within epsilon), nothing to do
+        if s0 <= origin + 1e-6:
+            return segs
+        # Insert a leading segment covering up to the first bar (if present) or to s0
+        stop = min(first_bar, s0) if first_bar is not None else s0
+        lead = {'start': origin, 'end': float(stop), 'label': lab0}
+        return [lead] + segs_sorted
+
     def paintEvent(self, e: QtGui.QPaintEvent):
         p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.Antialiasing, False)
@@ -500,7 +615,8 @@ class WaveformView(QtWidgets.QWidget):
         h = self.height()
         if w < 10 or h < 10:
             return
-        ch_h = 32
+        CHORD_LANE_H = 32
+        ch_h = CHORD_LANE_H
         wf_h = max(10, h - ch_h)
         t0, t1 = self._current_window()
         # Visual times relative to the music start (origin)
@@ -637,6 +753,13 @@ class WaveformView(QtWidgets.QWidget):
                     continue
                 x = int((bt - t0) / (t1 - t0) * w)
                 p.drawLine(x, 0, x, wf_h)  # full height of waveform area
+            # Also draw a dashed line at the origin as bar 0
+            try:
+                x0 = int(((float(self.origin or 0.0)) - t0) / (t1 - t0) * w)
+                if 0 <= x0 <= w - 1:
+                    p.drawLine(x0, 0, x0, wf_h)
+            except Exception:
+                pass
 
         # loop overlay (if available)
         if self.loopA is not None and self.loopB is not None:
@@ -743,7 +866,9 @@ class WaveformView(QtWidgets.QWidget):
             # Step 1: snap chord boundaries to bar boundaries
             snapped = self._snap_segments_to_bars(self.chords, self.bars)
             # Step 2: split any segments that still span across bars
-            segs_to_draw = self._split_segments_at_bars(snapped, self.bars)
+            split = self._split_segments_at_bars(snapped, self.bars)
+            # Step 3: ensure the first bar (origin→first bar) has a chord box
+            segs_to_draw = self._ensure_leading_bar(split, self.bars)
 
             font = p.font()
             font.setPointSizeF(max(9.0, self.font().pointSizeF()))
@@ -1382,6 +1507,9 @@ class Main(QtWidgets.QMainWindow):
         self.wave.requestDeleteSelected.connect(self._delete_selected_loop)
         self.wave.requestRenameLoop.connect(self._rename_loop_id)
         self.wave.requestDeleteLoopId.connect(self._delete_loop_id)
+        self.wave.requestEditChord.connect(self._edit_chord_at_time)
+        self.wave.requestSplitChordAt.connect(self._split_chord_at_time)
+        self.wave.requestJoinChordForward.connect(self._join_chord_forward_at_time)
 
         central = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(central)
@@ -1526,11 +1654,17 @@ class Main(QtWidgets.QMainWindow):
         if self.last_key:
             self.key_header_label.setText(f"Key: {self.last_key.get('pretty','—')}")
 
-        # Chords
+        # Chords (normalize to bar-aligned & split form on load)
         self.last_chords = list(data.get("chords", []))
         if self.last_chords:
+            try:
+                snapped = self.wave._snap_segments_to_bars(self.last_chords, self.last_bars or [])
+                split = self.wave._split_segments_at_bars(snapped, self.last_bars or [])
+                filled = self.wave._ensure_leading_bar(split, self.last_bars or [])
+                self.last_chords = filled
+            except Exception:
+                pass
             self.wave.set_chords(self.last_chords)
-
         # Rate
         if "rate" in data:
             try:
@@ -1576,6 +1710,17 @@ class Main(QtWidgets.QMainWindow):
         root = p.parent / ".musicpractice" / "stems" / f"{safe}__{meta}"
         root.mkdir(parents=True, exist_ok=True)
         return root
+
+    def _bar_index_at_time(self, t: float) -> int | None:
+        if not self.last_bars:
+            return None
+        bars = sorted(float(b) for b in self.last_bars)
+        if not bars:
+            return None
+        for i, b in enumerate(bars):
+            if t < b:
+                return max(0, i - 1)
+        return len(bars) - 1
 
     def _toggle_stems(self, on: bool):
         """Run stem separation (Demucs) and show a simple mixer UI with per-stem volume & mute."""
@@ -1804,6 +1949,71 @@ class Main(QtWidgets.QMainWindow):
             self.statusBar().showMessage("No loop selected to delete")
             return
         self._delete_loop_id(int(lid))
+
+    def _find_chord_index_at_time(self, t: float) -> int | None:
+        if not self.last_chords:
+            return None
+        for i, seg in enumerate(self.last_chords):
+            try:
+                a = float(seg.get('start')); b = float(seg.get('end'))
+            except Exception:
+                continue
+            if a <= t < b or (i == len(self.last_chords) - 1 and abs(t - b) < 1e-6):
+                return i
+        return None
+
+    def _edit_chord_at_time(self, t: float):
+        idx = self._find_chord_index_at_time(float(t))
+        if idx is None:
+            return
+        cur = dict(self.last_chords[idx])
+        text, ok = QtWidgets.QInputDialog.getText(self, "Change chord", "Chord label:", text=str(cur.get('label', '')))
+        if not ok:
+            return
+        cur['label'] = str(text)
+        self.last_chords[idx] = cur
+        self.wave.set_chords(self.last_chords)
+        self.save_session()
+
+    def _split_chord_at_time(self, t: float):
+        t = float(t)
+        idx = self._find_chord_index_at_time(t)
+        if idx is None:
+            return
+        seg = self.last_chords[idx]
+        a = float(seg.get('start')); b = float(seg.get('end'))
+        if t <= a + 1e-6 or t >= b - 1e-6:
+            return  # ignore splits at edges
+        lab = seg.get('label')
+        left = {'start': a, 'end': t, 'label': lab}
+        right = {'start': t, 'end': b, 'label': lab}
+        self.last_chords = self.last_chords[:idx] + [left, right] + self.last_chords[idx+1:]
+        self.wave.set_chords(self.last_chords)
+        self.save_session()
+
+    def _join_chord_forward_at_time(self, t: float):
+        t = float(t)
+        idx = self._find_chord_index_at_time(t)
+        if idx is None:
+            return
+        if idx + 1 >= len(self.last_chords):
+            return
+        cur = self.last_chords[idx]
+        nxt = self.last_chords[idx + 1]
+        # Ensure both within the same bar and contiguous (tiny epsilon allowed)
+        cmid = (float(cur['start']) + float(cur['end'])) * 0.5
+        nmid = (float(nxt['start']) + float(nxt['end'])) * 0.5
+        bar_cur = self._bar_index_at_time(cmid)
+        bar_nxt = self._bar_index_at_time(nmid)
+        if bar_cur is None or bar_nxt is None or bar_cur != bar_nxt:
+            return
+        if abs(float(cur['end']) - float(nxt['start'])) > 1e-3:
+            return
+        merged = {'start': float(cur['start']), 'end': float(nxt['end']),
+                'label': cur.get('label') or nxt.get('label')}
+        self.last_chords = self.last_chords[:idx] + [merged] + self.last_chords[idx+2:]
+        self.wave.set_chords(self.last_chords)
+        self.save_session()
 
     def _auto_loop_tick(self):
         if not self.player or not self.saved_loops:
@@ -2171,9 +2381,16 @@ class Main(QtWidgets.QMainWindow):
         self.statusBar().showMessage("Analyzing: beats + stems + chords…")
         cw.start()
 
-    def _chords_ready(self, segments: list):
+    def _chords_ready(self, segments: list[dict]):
+        # Normalize chords to bar-aligned & split form before persisting
+        try:
+            snapped = self.wave._snap_segments_to_bars(segments or [], self.last_bars or [])
+            split = self.wave._split_segments_at_bars(snapped, self.last_bars or [])
+            filled = self.wave._ensure_leading_bar(split, self.last_bars or [])
+            segments = filled
+        except Exception:
+            pass
         self.last_chords = list(segments or [])
-        # Update waveform lane and persist
         self.wave.set_chords(self.last_chords)
         self.save_session()
         # Clear the waiting message after a short delay
