@@ -1207,11 +1207,10 @@ class WaveformView(QtWidgets.QWidget):
                 pass
 
 
-
 class ChordWorker(QThread):
     done = Signal(list)
     status = Signal(str)
-    demucs_line = Signal(str)  # forward Demucs logs to LogDock (like _toggle_stems)
+    demucs_line = Signal(str)  # forward Demucs logs to LogDock
     stems_ready = Signal(str)  # emits the stem **leaf** directory path
     def __init__(self, path: str):
         super().__init__()
@@ -1334,7 +1333,7 @@ class ChordWorker(QThread):
             kwargs["downbeats"] = bd.get("downbeats", [])
             kwargs["beat_strengths"] = bd.get("beat_strengths", [])
 
-        # Always-on stem extraction (force run) using the same cache layout as _toggle_stems
+        # Always-on stem extraction (force run)
         model = "htdemucs_6s"
         out_dir = self._song_cache_dir(audio_path)
         leaf = self._stem_leaf_dir(audio_path, out_dir, model)
@@ -1814,6 +1813,13 @@ class Main(QtWidgets.QMainWindow):
         # Menu
         try:
             mb = self.menuBar()
+            # Create File menu first, if not already present
+            fileMenu = mb.addMenu("File")
+            fileMenu.addAction(self.act_open)
+            fileMenu.addSeparator()
+            fileMenu.addAction(QAction("Save Session", self, shortcut=QKeySequence.StandardKey.Save, triggered=self.save_session))
+            fileMenu.addAction(QAction("Load Session", self, shortcut=QKeySequence("Ctrl+Shift+O"), triggered=self.load_session))
+            # Insert Analysis menu after File
             analysisMenu = mb.addMenu("Analysis")
             analysisMenu.addAction(self.actRecompute)
             analysisMenu.addSeparator()
@@ -1891,31 +1897,6 @@ class Main(QtWidgets.QMainWindow):
 
         layout.addWidget(self.wave, 1)
         self.setCentralWidget(central)
-
-        # Menu (File→Open)
-        open_act = QAction("Open…", self)
-        open_act.setShortcut(QKeySequence.StandardKey.Open)
-        open_act.triggered.connect(self.load_audio)
-        file_menu = self.menuBar().addMenu("File")
-        file_menu.addAction(open_act)
-        save_act = QAction("Save Session", self)
-        save_act.setShortcut(QKeySequence.StandardKey.Save)
-        save_act.triggered.connect(self.save_session)
-
-        load_act = QAction("Load Session", self)
-        load_act.setShortcut(QKeySequence("Ctrl+Shift+O"))
-        load_act.triggered.connect(self.load_session)
-
-        file_menu.addSeparator()
-        file_menu.addAction(save_act)
-        file_menu.addAction(load_act)
-
-        # View menu
-        view_menu = self.menuBar().addMenu("View")
-        self.act_toggle_stems = QAction("Separate && Show Stems", self)
-        self.act_toggle_stems.setCheckable(True)
-        self.act_toggle_stems.toggled.connect(self._toggle_stems)
-        view_menu.addAction(self.act_toggle_stems)
 
         # Signals
         self.rate_spin.valueChanged.connect(self._rate_changed)
@@ -2231,103 +2212,6 @@ class Main(QtWidgets.QMainWindow):
         self.wave.set_chords(self.last_chords)
         self.save_session()
         print(f"[DBG] _join_chord_forward_at_time: merged idx={idx} & idx={idx+1}")
-
-    def _toggle_stems(self, on: bool):
-        """Run stem separation (Demucs) and show a simple mixer UI with per-stem volume & mute."""
-        # Turning OFF: hide and clear
-        if not on:
-            self.stems_dock.hide()
-            # delete UI rows
-            while self.stems_layout.count():
-                item = self.stems_layout.takeAt(0)
-                w = item.widget()
-                if w:
-                    w.deleteLater()
-            # clear player stems
-            if self.player and hasattr(self.player, 'clear_stems'):
-                self.player.clear_stems()
-            # also hide the log dock if present
-            if hasattr(self, "log_dock") and self.log_dock is not None:
-                self.log_dock.hide()
-            return
-
-        # Turning ON requires an audio file
-        if not self.current_path:
-            self.statusBar().showMessage("Open a track first")
-            self.act_toggle_stems.setChecked(False)
-            return
-
-        # Run Demucs into a per-song cache folder
-        outdir = self._song_cache_dir(self.current_path)
-        preexisting = sorted(outdir.rglob("*.wav"))
-        if preexisting:
-            stem_dir = outdir
-            # Use unified loader so ordering is guaranteed
-            try:
-                self._load_stems_from_dir(Path(stem_dir))
-                if self.stems_dock:
-                    self.stems_dock.show()
-            except Exception as e:
-                self.statusBar().showMessage(f"Load stems failed: {e}")
-                if getattr(self, "log_dock", None):
-                    self.log_dock.write(f"Load stems failed: {e}\n")
-                if hasattr(self, 'act_toggle_stems'):
-                    self.act_toggle_stems.setChecked(False)
-                return
-            return
-        else:
-            # Ensure a log dock exists and is visible
-            if not hasattr(self, "log_dock") or self.log_dock is None:
-                self.log_dock = LogDock(parent=self)
-                self.addDockWidget(Qt.BottomDockWidgetArea, self.log_dock)
-            self.log_dock.setWindowTitle("Demucs Log")
-            self.log_dock.show()
-            self.log_dock.raise_()
-            self.log_dock.clear()
-
-            # Launch Demucs in background and stream logs
-            model = 'htdemucs_6s'
-            self.demucs_worker = DemucsWorker(self.current_path, str(outdir), model)
-            self.demucs_worker.line.connect(self._demucs_log)
-            self.demucs_worker.done.connect(self._demucs_done)
-            self.demucs_worker.failed.connect(self._demucs_failed)
-            self.demucs_worker.start()
-            return
-
-        leaf = stem_dir
-        candidates = [d for d in stem_dir.rglob("*") if d.is_dir() and list(d.glob("*.wav"))]
-        if candidates:
-            leaf = max(candidates, key=lambda p: p.stat().st_mtime)
-        stem_dir = leaf
-
-        # Load arrays
-        try:
-            arrays = load_stem_arrays(stem_dir)
-        except Exception as e:
-            self.statusBar().showMessage(f"Load stems failed: {e}")
-            self.act_toggle_stems.setChecked(False)
-            return
-        if not arrays:
-            self.statusBar().showMessage("No stems produced")
-            self.act_toggle_stems.setChecked(False)
-            return
-
-        # Feed to player
-        try:
-            if self.player and hasattr(self.player, 'set_stems_arrays'):
-                self.player.set_stems_arrays(arrays)
-                if hasattr(self.player, 'use_stems_only'):
-                    self.player.use_stems_only(True)
-        except Exception as e:
-            self.statusBar().showMessage(f"Player stems error: {e}")
-            self.act_toggle_stems.setChecked(False)
-            return
-
-        # Build UI rows
-        for name in order_stem_names(list(arrays.keys())):
-            self._add_stem_row(name, arrays[name])
-
-        self.stems_dock.show()
 
     def _add_stem_row(self, name: str, arr: np.ndarray):
         row = QtWidgets.QWidget(self.stems_panel)
