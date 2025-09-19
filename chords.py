@@ -50,21 +50,59 @@ _MAJOR_PROFILE = np.array([6.35,2.23,3.48,2.33,4.38,4.09,2.52,5.19,2.39,3.66,2.2
 _MINOR_PROFILE = np.array([6.33,2.68,3.52,5.38,2.60,3.53,2.54,4.75,3.98,2.69,3.34,3.17])
 
 def _estimate_key_from_chroma(chroma):
-    """Return (tonic_idx, mode) with mode in {"maj","min"} using profile correlation."""
+    """Return (tonic_idx, mode) with mode in {"maj","min"}.
+    Base: Krumhansl–Schmuckler profile correlation on time-averaged chroma.
+    Enhancement: add a small bias toward MAJOR keys whose I/IV/V pitch-class energy is strong
+    (computed from per-class maxima across time). This helps disambiguate A major vs C# minor, etc.
+    """
+    if chroma.ndim != 2 or chroma.shape[0] != 12:
+        # Fallback to a safe default
+        return 0, "maj"
     chroma_mean = chroma.mean(axis=1)
     if np.allclose(chroma_mean.sum(), 0):
         return 0, "maj"  # default C major if silence
     chroma_vec = chroma_mean / (np.linalg.norm(chroma_mean) + 1e-9)
-    best_score = -1e9
-    best = (0, "maj")
-    for mode, prof in (("maj", _MAJOR_PROFILE), ("min", _MINOR_PROFILE)):
-        prof_n = prof / np.linalg.norm(prof)
+
+    # Base profile correlation for all 24 keys
+    maj_scores = np.zeros(12, dtype=float)
+    min_scores = np.zeros(12, dtype=float)
+    profM = _MAJOR_PROFILE / np.linalg.norm(_MAJOR_PROFILE)
+    profm = _MINOR_PROFILE / np.linalg.norm(_MINOR_PROFILE)
+    for k in range(12):
+        maj_scores[k] = float(np.dot(chroma_vec, np.roll(profM, k)))
+        min_scores[k] = float(np.dot(chroma_vec, np.roll(profm, k)))
+
+    # Cadence bias based on per-pitch-class maxima (robust to sparse textures)
+    pc_max = chroma.max(axis=1)
+    if pc_max.sum() > 1e-12:
+        pc_max = pc_max / (np.linalg.norm(pc_max) + 1e-12)
+        cadence = np.zeros(12, dtype=float)
         for k in range(12):
-            score = np.dot(chroma_vec, np.roll(prof_n, k))
-            if score > best_score:
-                best_score = score
-                best = (k, mode)
-    return best
+            I = k % 12; IV = (k + 5) % 12; V = (k + 7) % 12
+            cadence[k] = pc_max[I] + pc_max[IV] + pc_max[V]
+        # Normalize cadence to [0,1]
+        cmin, cmax = float(cadence.min()), float(cadence.max())
+        if cmax > cmin:
+            cadence = (cadence - cmin) / (cmax - cmin)
+        # Small weight keeps profile correlation dominant but nudges toward clear I/IV/V
+        gamma = 0.15
+        maj_scores = maj_scores + gamma * cadence
+
+    # Choose best over 24 keys
+    k_maj = int(np.argmax(maj_scores))
+    k_min = int(np.argmax(min_scores))
+    best_maj = float(maj_scores[k_maj])
+    best_min = float(min_scores[k_min])
+
+    if best_maj >= best_min:
+        return k_maj, "maj"
+    else:
+        # If minor wins but its relative MAJOR has a much stronger cadence, flip to MAJOR
+        rel_maj = (k_min + 3) % 12
+        rel_maj_score = float(maj_scores[rel_maj])
+        if rel_maj_score >= best_min + 0.05:
+            return rel_maj, "maj"
+        return k_min, "min"
 
 # Major flat keys: F, Bb, Eb, Ab, Db, Gb, Cb  -> indices {5,10,3,8,1,6,11}
 _FLAT_MAJOR_TONICS = {5, 10, 3, 8, 1, 6, 11}
@@ -282,6 +320,53 @@ def _beat_sync_chroma(chroma: np.ndarray, frame_times: np.ndarray, beats_sec: li
     Cb = np.stack(segs, axis=1) if segs else chroma
     return Cb, np.asarray(used, dtype=int)
 
+# --- Small resample helper ---
+def _resample_mono(y: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+    """Return mono signal at target_sr. Accepts mono or stereo arrays."""
+    if target_sr == orig_sr:
+        if y.ndim == 1:
+            return y.astype(np.float32)
+        return y.mean(axis=1).astype(np.float32)
+    # ensure mono before resample for speed
+    y_mono = y.mean(axis=1) if y.ndim == 2 else y
+    return librosa.resample(y_mono.astype(np.float32), orig_sr=orig_sr, target_sr=target_sr)
+
+# --- Tuning-aware chroma helper ---------------------------------------------
+
+def _chroma_cqt_tuned(y: np.ndarray, sr: int, hop: int, tuning_bins: float | None = None) -> np.ndarray:
+    """Compute chroma CQT with an optional global tuning correction (in bins)."""
+    if tuning_bins is None:
+        try:
+            tuning_bins = float(librosa.estimate_tuning(y=y, sr=sr))
+        except Exception:
+            tuning_bins = 0.0
+    return librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop, tuning=tuning_bins)
+
+# --- Bass root hint from bass stem -------------------------------------------------
+
+def _bass_root_logits(bass_y: np.ndarray | None, sr: int, hop: int = 2048,
+                      frame_times: np.ndarray | None = None,
+                      beats_sec: list[float] | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """Return (logits_pc, times) where logits_pc is (12,Tb) over pitch classes.
+    If `beats_sec` provided, aggregates to beats; otherwise framewise.
+    """
+    if bass_y is None or bass_y.size == 0:
+        return np.zeros((12, 0), dtype=np.float32), np.asarray(beats_sec or [], dtype=float)
+    # Focus on low range for bass root evidence
+    C = librosa.feature.chroma_cqt(y=bass_y.astype(np.float32), sr=sr, hop_length=hop, tuning=None)
+    times = librosa.frames_to_time(np.arange(C.shape[1]), sr=sr, hop_length=hop)
+    if beats_sec:
+        Cb, _ = _beat_sync_chroma(C, times, beats_sec, reduce='median')
+    else:
+        Cb = C
+    # Softmax-ish logits per time over PCs
+    Cb = Cb + 1e-6
+    Cb = Cb / (np.linalg.norm(Cb, axis=0, keepdims=True) + 1e-12)
+    Cb = Cb ** 1.5          # sharpen
+    Cb = Cb / (np.sum(Cb, axis=0, keepdims=True) + 1e-12)
+    logits = np.log(Cb + 1e-9)
+    tvec = np.asarray(beats_sec, dtype=float) if beats_sec else times
+    return logits.astype(np.float32), tvec
 
 def snap_time_to_beats(t: float, beats: list[float]) -> float:
     """Return the beat time closest to t (in seconds)."""
@@ -312,9 +397,14 @@ def estimate_key(audio_path: str, sr=22050, hop=2048):
     y_stereo, sr_loaded = _load_audio_any(audio_path)
     if sr is None:
         sr = sr_loaded
-    # mono mixdown for chroma
-    y = y_stereo.mean(axis=1)
-    chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop)
+    # resample mono to requested sr
+    y = _resample_mono(y_stereo, sr_loaded, sr)
+    # tuning-aware chroma
+    try:
+        tuning_bins = float(librosa.estimate_tuning(y=y, sr=sr))
+    except Exception:
+        tuning_bins = 0.0
+    chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop, tuning=tuning_bins)
     tonic_idx, mode = _estimate_key_from_chroma(chroma)
     use_flats = _use_flats_for_key(tonic_idx, mode)
     tonic_name = _pc_name(tonic_idx, use_flats)
@@ -364,7 +454,12 @@ def _refine_minor_sevenths(
     y_stereo, sr_loaded = _load_audio_any(audio_path)
     if sr is None:
         sr = sr_loaded
-    y = y_stereo.mean(axis=1)
+    y = _resample_mono(y_stereo, sr_loaded, sr)
+    # pre-compute tuning once for this track
+    try:
+        tuning_bins_all = float(librosa.estimate_tuning(y=y, sr=sr))
+    except Exception:
+        tuning_bins_all = 0.0
 
     def seg_chroma_frames(a: float, b: float):
         a_s = max(0, int(a * sr)); b_s = max(a_s + 1, int(b * sr))
@@ -372,7 +467,7 @@ def _refine_minor_sevenths(
         if y_seg.size < hop:
             pad = np.zeros(min(hop, max(0, hop - y_seg.size)), dtype=y.dtype)
             y_seg = np.concatenate([y_seg, pad])
-        C = librosa.feature.chroma_cqt(y=y_seg, sr=sr, hop_length=hop)  # (12, F)
+        C = librosa.feature.chroma_cqt(y=y_seg, sr=sr, hop_length=hop, tuning=tuning_bins_all)  # (12, F)
         if C.shape[1] == 0:
             return C
         # normalize each frame to its max so per-frame peak = 1
@@ -484,12 +579,16 @@ def _root_sanity_pass(segments: list, audio_path: str, use_flats: bool | None = 
     y_stereo, sr_loaded = _load_audio_any(audio_path)
     if sr is None:
         sr = sr_loaded
-    y = y_stereo.mean(axis=1)
+    y = _resample_mono(y_stereo, sr_loaded, sr)
 
-    # Key-based naming unless provided
+    # Key-based naming unless provided (tuning-aware)
     if use_flats is None:
         try:
-            chroma_all = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop)
+            try:
+                tuning_bins = float(librosa.estimate_tuning(y=y, sr=sr))
+            except Exception:
+                tuning_bins = 0.0
+            chroma_all = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop, tuning=tuning_bins)
             tonic_idx, mode = _estimate_key_from_chroma(chroma_all)
             use_flats = _use_flats_for_key(tonic_idx, mode)
         except Exception:
@@ -511,7 +610,12 @@ def _root_sanity_pass(segments: list, audio_path: str, use_flats: bool | None = 
         if y_seg.size < hop:
             pad = np.zeros(min(hop, max(0, hop - y_seg.size)), dtype=y.dtype)
             y_seg = np.concatenate([y_seg, pad])
-        C = librosa.feature.chroma_cqt(y=y_seg, sr=sr, hop_length=hop)
+        # tuning-aware chroma for segment
+        try:
+            tuning_bins = float(librosa.estimate_tuning(y=y_seg, sr=sr))
+        except Exception:
+            tuning_bins = 0.0
+        C = librosa.feature.chroma_cqt(y=y_seg, sr=sr, hop_length=hop, tuning=tuning_bins)
         v = C.mean(axis=1)
         nrm = np.linalg.norm(v) + 1e-12
         v = v / nrm
@@ -530,6 +634,310 @@ def _root_sanity_pass(segments: list, audio_path: str, use_flats: bool | None = 
             out.append(s)
     return out
 
+def estimate_chords_stem_aware(
+    audio_path: str,
+    sr=22050,
+    hop=2048,
+    beats: list[float] | None = None,
+    downbeats: list[float] | None = None,
+    beat_strengths: list[float] | None = None,
+    stems: dict | None = None,
+    use_key_prior: bool = True,
+    alpha_harm: float = 0.50,
+    beta_bass: float = 0.50,
+    weights: dict | None = None,
+    log_fn=None,
+    style: str = "default",
+    key_hint: dict | None = None,
+):
+    """Beat-synchronous, stem-aware chord estimator.
+    Combines harmonic chroma (guitar/piano/other/vocals) with bass-root evidence.
+    Returns list of segments [{start,end,label,conf,beat_sync=True}].
+    """
+    from audio_engine import _load_audio_any
+
+    # Normalize style names (robust to non-string inputs)
+    style_map = {
+        'default': 'rock_pop',
+        'rock': 'rock_pop', 'rock/pop': 'rock_pop', 'pop': 'rock_pop',
+        'blues': 'blues', 'reggae': 'reggae', 'jazz': 'jazz',
+        'rock_pop': 'rock_pop'
+    }
+    _style_key = style
+    try:
+        if _style_key is None:
+            _style_key = 'rock_pop'
+        # If someone passed a QAction, function, etc., coerce to string safely
+        if not isinstance(_style_key, str):
+            _style_key = str(_style_key)
+        _style_key = _style_key.lower()
+    except Exception:
+        _style_key = 'rock_pop'
+    style = style_map.get(_style_key, 'rock_pop')
+
+    y_stereo, sr_loaded = _load_audio_any(audio_path)
+    sr = sr_loaded if sr is None else int(sr)
+    # Build mono reference at target sr
+    y_mono = _resample_mono(y_stereo, sr_loaded, sr)
+    if callable(log_fn):
+        try:
+            log_fn(f"stem_aware: sr_loaded={sr_loaded}, sr_used={sr}")
+        except Exception:
+            pass
+
+    # Build harmonic mix from stems (exclude vocals/drums); fallback to mono
+    y_harm = None
+    used_stems = []
+    if stems:
+        w = {'guitar': 1.0, 'piano': 1.0, 'other': 0.5, 'bass': 0.0, 'vocals': 0.0, 'drums': 0.0}
+        if isinstance(weights, dict):
+            w.update(weights)
+        acc = None
+        for k, arr in stems.items():
+            try:
+                # resample each stem to sr
+                mono_in = arr.mean(axis=1).astype(np.float32) if arr.ndim == 2 else arr.astype(np.float32)
+                # resample to match target sr
+                if 'sr' in getattr(arr, '__dict__', {}):
+                    mono = _resample_mono(arr, getattr(arr, 'sr'), sr)
+                else:
+                    # stems are same sr as source audio; use sr_loaded
+                    mono = librosa.resample(mono_in, orig_sr=sr_loaded, target_sr=sr) if sr_loaded != sr else mono_in
+                gain = float(w.get(k.lower(), w.get(k, 0.0)))
+                if gain <= 0.0:
+                    continue
+                used_stems.append(f"{k}:{gain:.2f}")
+                if acc is None:
+                    acc = gain * mono
+                else:
+                    L = max(acc.shape[0], mono.shape[0])
+                    if acc.shape[0] < L: acc = np.pad(acc, (0, L - acc.shape[0]))
+                    if mono.shape[0] < L: mono = np.pad(mono, (0, L - mono.shape[0]))
+                    acc = acc + gain * mono
+            except Exception:
+                continue
+        if acc is not None:
+            y_harm = acc
+    if y_harm is None:
+        y_harm = y_mono
+
+    # Framewise chroma and times
+    chroma_frames = librosa.feature.chroma_cqt(y=y_harm, sr=sr, hop_length=hop)
+    frame_times = librosa.frames_to_time(np.arange(chroma_frames.shape[1]), sr=sr, hop_length=hop)
+
+    # Beats (if not given)
+    if beats is None:
+        bd = estimate_beats(audio_path, sr=sr, hop=512)
+        beats = bd.get("beats", [])
+        downbeats = bd.get("downbeats", []) if downbeats is None else downbeats
+        beat_strengths = bd.get("beat_strengths", []) if beat_strengths is None else beat_strengths
+
+    # Beat-sync chroma
+    if beats:
+        chroma, _ = _beat_sync_chroma(chroma_frames, frame_times, beats, reduce='median')
+        times = np.asarray(beats, dtype=float)
+    else:
+        chroma = chroma_frames
+        times = frame_times
+
+    # Normalize chroma columns
+    chroma = chroma / (np.linalg.norm(chroma, axis=0, keepdims=True) + 1e-12)
+
+    # Harmonic template log-likelihoods (60,T)
+    harm_scores = chord_likelihoods(chroma) + 1e-6
+    log_harm = np.log(harm_scores)
+
+    # Bass root evidence from bass stem (12,Tb) → expand to (60,Tb)
+    bass_y = None
+    if stems and isinstance(stems.get('bass', None), np.ndarray):
+        b = stems['bass']
+        bass_y = _resample_mono(b, sr_loaded, sr)
+    bass_logits, _ = _bass_root_logits(bass_y, sr, hop=hop,
+                                       frame_times=frame_times,
+                                       beats_sec=beats if beats else None)
+
+    if bass_logits.shape[1] and (beats or chroma.shape[1] == bass_logits.shape[1]):
+        T = min(log_harm.shape[1], bass_logits.shape[1])
+        log_harm = log_harm[:, :T]
+        bass_logits = bass_logits[:, :T]
+        log_bass = np.vstack([bass_logits for _ in range(5)])  # 5 families * 12 roots
+    else:
+        log_bass = np.zeros_like(log_harm)
+    # --- Bass-root emphasis: favor top-2 bass pitch classes per beat ---
+    bass_boost = np.zeros_like(log_harm)
+    if bass_logits.shape[1] == log_harm.shape[1]:
+        # For each time step, find top-2 bass roots and boost those roots (all families)
+        top2 = np.argpartition(bass_logits, -2, axis=0)[-2:,:]
+        for t in range(bass_logits.shape[1]):
+            roots = set(int(r) for r in top2[:, t].tolist())
+            if not roots:
+                continue
+            for fam in range(5):  # 0 maj,1 min,2 7,3 maj7,4 m7
+                for r in roots:
+                    bass_boost[fam*12 + r, t] += 0.6  # strong push
+        # Mild penalty to non-top-2 roots so we don't make everything flat
+        bass_boost -= 0.3
+    # else: leave bass_boost zeros if we couldn't align times
+
+    # Optional key prior – genre aware
+    key_bonus = np.zeros_like(log_harm)
+    if use_key_prior:
+        try:
+            tonic_idx, mode = _estimate_key_from_chroma(chroma)
+            # Slightly softer key lock for jazz (allows modulations)
+            base_scale_w = 0.03 if style == 'jazz' else 0.05
+            scale = {0,2,4,5,7,9,11} if mode == 'maj' else {0,2,3,5,7,8,10}
+            for fam in range(5):
+                for r in range(12):
+                    if ((r - tonic_idx) % 12) in scale:
+                        key_bonus[fam*12 + r, :] += base_scale_w
+
+            I  = int(tonic_idx % 12)
+            II = int((tonic_idx + 2) % 12)
+            III= int((tonic_idx + 4) % 12)
+            IV = int((tonic_idx + 5) % 12)
+            V  = int((tonic_idx + 7) % 12)
+            VI = int((tonic_idx + 9) % 12)
+
+            if style == 'blues':
+                # Favor dominant 7 on I/IV/V; de-emphasize maj7 in general
+                for t in range(log_harm.shape[1]):
+                    for root in (I, IV, V):
+                        key_bonus[2*12 + root, t] += 0.20   # dom7 boost
+                key_bonus[3*12:(3*12)+12, :] -= 0.10  # maj7 downweight
+            elif style == 'reggae':
+                # Reggae: prefer clean I–IV–V major triads; allow V7 slightly; boost ii/vi minors a bit
+                if mode == 'maj':
+                    for t in range(log_harm.shape[1]):
+                        key_bonus[0*12 + I,  t] += 0.35  # I
+                        key_bonus[0*12 + IV, t] += 0.25  # IV
+                        key_bonus[0*12 + V,  t] += 0.25  # V
+                        key_bonus[4*12 + II, t] += 0.10  # ii m7 subtle
+                        key_bonus[4*12 + VI, t] += 0.10  # vi m7 subtle
+                        key_bonus[2*12 + V,  t] += 0.08  # V7 small allowance
+                    # De-emphasize blanket dom7 and maj7 away from cadence
+                    key_bonus[2*12:(2*12)+12, :] -= 0.05
+                    key_bonus[3*12:(3*12)+12, :] -= 0.05
+            elif style == 'jazz':
+                # Jazz: prefer 7th chords; emphasize ii–V–I and soften plain triads
+                if mode == 'maj':
+                    for t in range(log_harm.shape[1]):
+                        key_bonus[4*12 + II, t] += 0.22  # ii m7
+                        key_bonus[2*12 + V,  t] += 0.28  # V7
+                        key_bonus[3*12 + I,  t] += 0.24  # I maj7
+                        key_bonus[4*12 + VI, t] += 0.10  # vi m7 (common)
+                        key_bonus[4*12 + III,t] += 0.06  # iii m7 (softer)
+                    # Downweight plain triads to reflect 7th-heavy vocabulary
+                    key_bonus[0*12:(0*12)+12, :] -= 0.05
+                    key_bonus[1*12:(1*12)+12, :] -= 0.05
+                else:  # minor key jazz: iiø–V7–i (approximate iiø as m7 here)
+                    i_pc = int(tonic_idx % 12)
+                    ii_pc = int((tonic_idx + 2) % 12)
+                    V_pc  = int((tonic_idx + 7) % 12)
+                    for t in range(log_harm.shape[1]):
+                        key_bonus[4*12 + ii_pc, t] += 0.20  # ii m7 (proxy for iiø)
+                        key_bonus[2*12 + V_pc,  t] += 0.28  # V7
+                        key_bonus[4*12 + i_pc,  t] += 0.16  # i m7 (proxy)
+                    key_bonus[0*12:(0*12)+12, :] -= 0.04
+                    key_bonus[1*12:(1*12)+12, :] -= 0.02
+            else:  # rock/pop (default)
+                if mode == 'maj':
+                    for t in range(log_harm.shape[1]):
+                        key_bonus[0*12 + I,  t] += 0.25
+                        key_bonus[0*12 + IV, t] += 0.18
+                        key_bonus[0*12 + V,  t] += 0.20
+                        key_bonus[2*12 + V,  t] += 0.06  # light V7 boost
+        except Exception:
+            pass
+    if callable(log_fn):
+        try:
+            log_fn(f"key: {key_hint.get('pretty', 'unknown')}, style: {style}")
+        except Exception:
+            pass
+
+    # Combined emissions
+    log_probs = alpha_harm * log_harm + beta_bass * log_bass + key_bonus + bass_boost
+
+    # Time-varying stay prob from beat context
+    T = log_probs.shape[1]
+    stay = np.full(T, 0.997, dtype=np.float64)
+    if beats:
+        down_set = set(np.round(np.asarray(downbeats or []) * 1000).astype(int).tolist())
+        beat_ms = np.round(np.asarray(beats) * 1000).astype(int).tolist()
+        strengths = beat_strengths or [1.0]*len(beat_ms)
+        for i, (bm, s) in enumerate(zip(beat_ms, strengths)):
+            is_down = bm in down_set
+            base = 0.994 if is_down else 0.997
+            stay_i = np.clip(base - 0.08 * float(s), 0.94, 0.999)
+            if i < T:
+                stay[i] = stay_i
+
+    states = viterbi_timevarying(log_probs, stay)
+
+    # Enharmonic naming by key
+    tonic_idx, mode = _estimate_key_from_chroma(chroma)
+    use_flats = _use_flats_for_key(tonic_idx, mode)
+
+    def _state_to_label(s: int) -> str:
+        fam = s // 12
+        root_pc = int(s % 12)
+        root = _pc_name(root_pc, use_flats)
+        return (
+            root if fam == 0 else
+            f"{root}m" if fam == 1 else
+            f"{root}7" if fam == 2 else
+            f"{root}maj7" if fam == 3 else
+            f"{root}m7"
+        )
+
+    labels = [_state_to_label(int(s)) for s in states]
+
+    # Confidence = margin(best vs 2nd)
+    best = np.max(log_probs, axis=0)
+    srt = np.sort(log_probs, axis=0)
+    margin = best - srt[-2]
+    avg_margin = float(np.median(margin)) if margin.size else 0.0
+    try:
+        stem_keys = sorted(list(stems.keys())) if isinstance(stems, dict) else []
+        msg = f"stem_aware: beats={len(beats or [])}, stems={stem_keys}, used={used_stems}, avg_margin={avg_margin:.3f}"
+        if callable(log_fn):
+            log_fn(msg)
+        else:
+            print(msg)
+    except Exception:
+        pass
+    try:
+        from collections import Counter
+        cnt = Counter(labels)
+        top5 = ", ".join(f"{k}:{v}" for k, v in cnt.most_common(5))
+        if callable(log_fn):
+            log_fn(f"stem_aware: top labels → {top5}")
+        else:
+            print(f"stem_aware: top labels → {top5}")
+    except Exception:
+        pass
+
+    segments = []
+    start = 0
+    for i in range(1, len(labels) + 1):
+        if i == len(labels) or labels[i] != labels[start]:
+            conf = float(np.median(margin[start:i])) if i > start else float(margin[start])
+            segments.append({
+                "start": float(times[start]),
+                "end": float(times[min(i, len(times)-1)]),
+                "label": labels[start],
+                "conf": conf,
+            })
+            start = i
+
+    # Post passes
+    segments = _refine_minor_sevenths(segments, audio_path)
+    segments = _root_sanity_pass(segments, audio_path, use_flats=use_flats)
+
+    if beats:
+        segments = [dict(s, beat_sync=True) for s in segments]
+    return segments
+
 def estimate_chords(
     audio_path: str,
     sr=22050,
@@ -539,18 +947,20 @@ def estimate_chords(
     beat_strengths: list[float] | None = None,
     stems: dict | None = None,
     use_hpss: bool = True,
+    key_hint: dict | None = None,
 ):
     from audio_engine import _load_audio_any
     y_stereo, sr_loaded = _load_audio_any(audio_path)
-    if sr is None:
-        sr = sr_loaded
+    sr = sr_loaded if sr is None else int(sr)
 
-    # Build harmonic mix: prefer stems, else HPSS on the mono mix
-    y_mono = y_stereo.mean(axis=1).astype(np.float32)
+    # Build harmonic mix: prefer stems, else HPSS on the mono mix (resampled)
+    y_mono = _resample_mono(y_stereo, sr_loaded, sr)
 
     y_harm = None
     if stems:
         y_harm, _ = _mix_from_stems(stems, sr)
+        if y_harm is not None and sr_loaded != sr:
+            y_harm = librosa.resample(y_harm.astype(np.float32), orig_sr=sr_loaded, target_sr=sr)
     if y_harm is None:
         if use_hpss:
             try:
@@ -596,9 +1006,9 @@ def estimate_chords(
         for i, (bm, s) in enumerate(zip(beat_ms, strengths)):
             # If this beat is a downbeat, allow more switching
             is_down = bm in down_set
-            base = 0.994 if is_down else 0.997
+            base = 0.990 if is_down else 0.997
             # Stronger beat -> lower stay (more likely to change)
-            stay_i = np.clip(base - 0.08 * float(s), 0.94, 0.999)
+            stay_i = np.clip(base - 0.08 * float(s), 0.92, 0.999)
             # Map to time index i (beat-synchronous)
             if i < T:
                 stay[i] = stay_i

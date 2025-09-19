@@ -9,7 +9,7 @@ import numpy as np
 import traceback
 import logging
 from audio_engine import LoopPlayer
-from chords import estimate_chords as _estimate_chords_base, estimate_key, estimate_beats
+from chords import estimate_chords_stem_aware as _stem_aware, estimate_chords as _fast_est, estimate_key, estimate_beats
 try:
     from timestretch import render_time_stretch
     HAS_STRETCH = True
@@ -212,6 +212,13 @@ class WaveformView(QtWidgets.QWidget):
 
     def set_player(self, player: 'LoopPlayer'):
         self.player = player
+        try:
+            _ = int(getattr(self.player, 'sr', 0) or 0)
+            _y = getattr(self.player, 'y', None)
+            if _ is None or _ <= 0 or _y is None:
+                return
+        except Exception:
+            pass
         self.update()
 
     def set_show_stems(self, show: bool):
@@ -404,44 +411,61 @@ class WaveformView(QtWidgets.QWidget):
         return self._window_from_center(t)
 
     def _mono_slice_minmax(self, start_s: float, end_s: float, width: int):
-        if not self.player or width <= 2:
+        try:
+            if not self.player or width <= 2:
+                return None, None
+            y = getattr(self.player, 'y', None)
+            sr = int(getattr(self.player, 'sr', 0) or 0)
+            if y is None or sr <= 0:
+                return None, None
+            # Ensure ndarray and contiguous float32
+            y = np.asarray(y)
+            if y.ndim == 2:
+                y = y.mean(axis=1)
+            y = np.asarray(y, dtype=np.float32, order='C')
+            N_total = int(y.shape[0])
+            if N_total <= 1:
+                return np.zeros(width), np.zeros(width)
+            total_s = N_total / float(sr)
+            # Overlap of requested window with actual audio
+            ov_start = max(0.0, float(start_s))
+            ov_end = min(float(end_s), total_s)
+            mins = np.zeros(width, dtype=np.float32)
+            maxs = np.zeros(width, dtype=np.float32)
+            if ov_end <= ov_start:
+                return mins, maxs
+            # Map overlap to pixel columns
+            span = float(end_s - start_s) if float(end_s - start_s) != 0.0 else 1.0
+            x0 = int((ov_start - start_s) / span * width)
+            x1 = int((ov_end   - start_s) / span * width)
+            x0 = max(0, min(width, x0))
+            x1 = max(x0 + 1, min(width, x1))
+            # Slice audio safely
+            a = max(0, min(N_total, int(ov_start * sr)))
+            b = max(a + 1, min(N_total, int(ov_end   * sr)))
+            seg = y[a:b]
+            if seg.size <= 1:
+                return mins, maxs
+            # Downsample to the overlap width
+            seg_w = x1 - x0
+            if seg_w <= 0:
+                return mins, maxs
+            step = max(1, seg.size // seg_w)
+            trimmed_len = (seg.size // step) * step
+            if trimmed_len <= 0:
+                return mins, maxs
+            seg = np.ascontiguousarray(seg[:trimmed_len])
+            reshaped = seg.reshape(-1, step)
+            mins_seg = reshaped.min(axis=1)
+            maxs_seg = reshaped.max(axis=1)
+            L = min(seg_w, len(mins_seg))
+            if L > 0:
+                mins[x0:x0+L] = mins_seg[:L]
+                maxs[x0:x0+L] = maxs_seg[:L]
+            return mins, maxs
+        except Exception:
+            # Fail safe: draw nothing rather than crash
             return None, None
-        y = self.player.y
-        sr = self.player.sr
-        total_s = self.player.n / float(sr)
-        # Overlap of requested window with actual audio
-        ov_start = max(0.0, start_s)
-        ov_end = min(end_s, total_s)
-        # Pre-allocate blank columns for full width
-        mins = np.zeros(width, dtype=float)
-        maxs = np.zeros(width, dtype=float)
-        if ov_end <= ov_start:
-            return mins, maxs  # entire window is outside audio → all blank
-        # Map overlap to pixel columns
-        x0 = int((ov_start - start_s) / (end_s - start_s) * width)
-        x1 = int((ov_end   - start_s) / (end_s - start_s) * width)
-        x0 = max(0, min(width, x0))
-        x1 = max(x0 + 1, min(width, x1))
-        # Slice audio
-        a = int(ov_start * sr)
-        b = int(ov_end   * sr)
-        mono = y[a:b].mean(axis=1)
-        N = mono.shape[0]
-        if N <= 1:
-            return mins, maxs
-        # Downsample to the overlap width
-        seg_w = x1 - x0
-        step = max(1, N // seg_w)
-        trimmed = mono[: (N // step) * step]
-        if trimmed.size == 0:
-            return mins, maxs
-        reshaped = trimmed.reshape(-1, step)
-        mins_seg = reshaped.min(axis=1)
-        maxs_seg = reshaped.max(axis=1)
-        L = min(seg_w, len(mins_seg))
-        mins[x0:x0+L] = mins_seg[:L]
-        maxs[x0:x0+L] = maxs_seg[:L]
-        return mins, maxs
 
     def _get_stems_for_display(self):
         """Return a list of (name, array) stems to draw if available, else [].
@@ -510,50 +534,48 @@ class WaveformView(QtWidgets.QWidget):
         return False
 
     def _slice_minmax_for_array(self, y: np.ndarray, start_s: float, end_s: float, width: int, sr: int):
-        """Downsample an arbitrary (mono or stereo) array to min/max columns over [start_s,end_s)
-        and return (mins, maxs, x0, x1) where x0..x1 are the pixel columns inside the current window.
-        This mirrors the offset behavior of _mono_slice_minmax so that if start_s < 0, we draw starting at x0>0.
-        """
-        if width <= 2 or y is None or sr is None:
-            return None, None, 0, 0
         try:
+            if width <= 2 or y is None or sr is None:
+                return None, None, 0, 0
+            sr = int(sr)
+            if sr <= 0:
+                return None, None, 0, 0
+            y = np.asarray(y)
             if y.ndim == 2:
-                mono = y.mean(axis=1)
-            else:
-                mono = y
-            mono = np.asarray(mono, dtype=np.float32)
+                y = y.mean(axis=1)
+            y = np.asarray(y, dtype=np.float32, order='C')
+            N_total = int(y.shape[0])
+            if N_total <= 1:
+                return None, None, 0, 0
+            total_s = N_total / float(sr)
+            ov_start = max(0.0, float(start_s))
+            ov_end = min(float(end_s), total_s)
+            if ov_end <= ov_start:
+                return np.zeros(0, dtype=np.float32), np.zeros(0, dtype=np.float32), 0, 0
+            span = float(end_s - start_s) if float(end_s - start_s) != 0.0 else 1.0
+            x0 = int((ov_start - start_s) / span * width)
+            x1 = int((ov_end   - start_s) / span * width)
+            x0 = max(0, min(width, x0))
+            x1 = max(x0 + 1, min(width, x1))
+            a = max(0, min(N_total, int(ov_start * sr)))
+            b = max(a + 1, min(N_total, int(ov_end   * sr)))
+            seg = y[a:b]
+            if seg.size <= 1:
+                return np.zeros(0, dtype=np.float32), np.zeros(0, dtype=np.float32), x0, x0
+            seg_w = x1 - x0
+            if seg_w <= 0:
+                return np.zeros(0, dtype=np.float32), np.zeros(0, dtype=np.float32), x0, x0
+            step = max(1, seg.size // seg_w)
+            trimmed_len = (seg.size // step) * step
+            if trimmed_len <= 0:
+                return np.zeros(0, dtype=np.float32), np.zeros(0, dtype=np.float32), x0, x0
+            seg = np.ascontiguousarray(seg[:trimmed_len])
+            reshaped = seg.reshape(-1, step)
+            mins_seg = reshaped.min(axis=1)
+            maxs_seg = reshaped.max(axis=1)
+            return mins_seg, maxs_seg, x0, x1
         except Exception:
             return None, None, 0, 0
-        N_total = int(mono.shape[0])
-        if N_total <= 1:
-            return None, None, 0, 0
-        total_s = N_total / float(sr)
-        # Overlap of requested window with actual audio [0,total_s]
-        ov_start = max(0.0, start_s)
-        ov_end = min(end_s, total_s)
-        # Precompute blank columns for full width
-        if ov_end <= ov_start:
-            return np.zeros(0, dtype=float), np.zeros(0, dtype=float), 0, 0
-        # Map overlap to pixel columns within current window
-        x0 = int((ov_start - start_s) / (end_s - start_s) * width)
-        x1 = int((ov_end   - start_s) / (end_s - start_s) * width)
-        x0 = max(0, min(width, x0))
-        x1 = max(x0 + 1, min(width, x1))
-        # Slice audio corresponding to overlap
-        a = int(ov_start * sr)
-        b = int(ov_end   * sr)
-        seg = mono[a:b]
-        if seg.size <= 1:
-            return np.zeros(0, dtype=float), np.zeros(0, dtype=float), x0, x0
-        seg_w = x1 - x0
-        step = max(1, seg.size // seg_w)
-        trimmed = seg[: (seg.size // step) * step]
-        if trimmed.size == 0:
-            return np.zeros(0, dtype=float), np.zeros(0, dtype=float), x0, x0
-        reshaped = trimmed.reshape(-1, step)
-        mins_seg = reshaped.min(axis=1)
-        maxs_seg = reshaped.max(axis=1)
-        return mins_seg, maxs_seg, x0, x1
 
     def contextMenuEvent(self, e: QtGui.QContextMenuEvent):
         # Chord box context menu when right-clicking in the chord lane
@@ -922,156 +944,159 @@ class WaveformView(QtWidgets.QWidget):
         p.save()
         p.setClipRect(0, 0, w, wf_h)
 
-        # Draw waveform(s) and playhead below the top strip
-        body_top = min(wf_h, self.FLAG_STRIP)
-        body_h = max(1, wf_h - body_top)
-        have_beats = bool(self.beats)
-        have_bars = bool(self.bars)
-        long_len = min(12, wf_h)
-        short_len = min(6, wf_h)
+        try:
+            # Draw waveform(s) and playhead below the top strip
+            body_top = min(wf_h, self.FLAG_STRIP)
+            body_h = max(1, wf_h - body_top)
+            have_beats = bool(self.beats)
+            have_bars = bool(self.bars)
+            long_len = min(12, wf_h)
+            short_len = min(6, wf_h)
 
-        stems = self._get_stems_for_display() if getattr(self, "show_stems", True) else []
-        if stems:
-            # Divide body area into rows for each stem
-            rows = len(stems)
-            row_gap = 2
-            row_h = max(14, int((body_h - (rows-1)*row_gap) / max(1, rows)))
-            y_cursor = body_top
-            for (stem_name, arr) in stems:
-                # Background (dim if muted)
-                muted = self._is_stem_muted(stem_name)
-                bg = QtGui.QColor(40, 40, 40) if muted else QtGui.QColor(28, 28, 28)
-                p.fillRect(0, y_cursor, w, row_h, bg)
-                # Border
-                p.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0)))
-                p.drawRect(0, y_cursor, max(1, w-1), max(1, row_h-1))
-                # Envelope
-                sr = getattr(self.player, 'sr', None)
-                mins, maxs, x0_seg, x1_seg = self._slice_minmax_for_array(arr, t0, t1, w, sr)
-                if mins is not None and maxs is not None:
-                    mid = y_cursor + row_h // 2
-                    amp = max(1, int(row_h * 0.45))
-                    # Envelope color: lighter when muted
-                    if muted:
-                        p.setPen(QtGui.QPen(QtGui.QColor(170, 190, 210)))  # light grey-blue for muted
-                    else:
-                        p.setPen(QtGui.QPen(QtGui.QColor(0, 180, 255)))   # bright cyan for active
-                    L = min(len(mins), max(0, x1_seg - x0_seg), w - x0_seg)
-                    for i in range(L):
-                        x = x0_seg + i
-                        y1 = mid - int(maxs[i] * amp)
-                        y2 = mid - int(mins[i] * amp)
+            stems = self._get_stems_for_display() if getattr(self, "show_stems", True) else []
+            if stems:
+                # Divide body area into rows for each stem
+                rows = len(stems)
+                row_gap = 2
+                row_h = max(14, int((body_h - (rows-1)*row_gap) / max(1, rows)))
+                y_cursor = body_top
+                for (stem_name, arr) in stems:
+                    # Background (dim if muted)
+                    muted = self._is_stem_muted(stem_name)
+                    bg = QtGui.QColor(40, 40, 40) if muted else QtGui.QColor(28, 28, 28)
+                    p.fillRect(0, y_cursor, w, row_h, bg)
+                    # Border
+                    p.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0)))
+                    p.drawRect(0, y_cursor, max(1, w-1), max(1, row_h-1))
+                    # Envelope
+                    sr = getattr(self.player, 'sr', None)
+                    mins, maxs, x0_seg, x1_seg = self._slice_minmax_for_array(arr, t0, t1, w, sr)
+                    if mins is not None and maxs is not None:
+                        mid = y_cursor + row_h // 2
+                        amp = max(1, int(row_h * 0.45))
+                        # Envelope color: lighter when muted
+                        if muted:
+                            p.setPen(QtGui.QPen(QtGui.QColor(170, 190, 210)))  # light grey-blue for muted
+                        else:
+                            p.setPen(QtGui.QPen(QtGui.QColor(0, 180, 255)))   # bright cyan for active
+                        L = min(len(mins), max(0, x1_seg - x0_seg), w - x0_seg)
+                        for i in range(L):
+                            x = x0_seg + i
+                            y1 = mid - int(maxs[i] * amp)
+                            y2 = mid - int(mins[i] * amp)
+                            if y1 > y2:
+                                y1, y2 = y2, y1
+                            p.drawLine(x, y1, x, y2)
+                    # Stem label at top-left inside the row
+                    p.setPen(QtGui.QPen(QtGui.QColor(210, 220, 230)))
+                    fm = p.fontMetrics()
+                    text_y = y_cursor + fm.ascent() + 2  # small top padding
+                    p.drawText(6, text_y, str(stem_name))
+                    y_cursor += row_h + row_gap
+            else:
+                # Fallback: single mixed waveform from the player's audio buffer
+                mins, maxs = self._mono_slice_minmax(t0, t1, w)
+                if mins is not None:
+                    mid = body_top + body_h // 2
+                    p.setPen(QtGui.QPen(QtGui.QColor(0, 180, 255)))
+                    for x, (mn, mx) in enumerate(zip(mins, maxs)):
+                        y1 = mid - int(mx * (body_h * 0.45))
+                        y2 = mid - int(mn * (body_h * 0.45))
                         if y1 > y2:
                             y1, y2 = y2, y1
                         p.drawLine(x, y1, x, y2)
-                # Stem label at top-left inside the row
-                p.setPen(QtGui.QPen(QtGui.QColor(210, 220, 230)))
-                fm = p.fontMetrics()
-                text_y = y_cursor + fm.ascent() + 2  # small top padding
-                p.drawText(6, text_y, str(stem_name))
-                y_cursor += row_h + row_gap
-        else:
-            # Fallback: single mixed waveform from the player's audio buffer
-            mins, maxs = self._mono_slice_minmax(t0, t1, w)
-            if mins is not None:
-                mid = body_top + body_h // 2
-                p.setPen(QtGui.QPen(QtGui.QColor(0, 180, 255)))
-                for x, (mn, mx) in enumerate(zip(mins, maxs)):
-                    y1 = mid - int(mx * (body_h * 0.45))
-                    y2 = mid - int(mn * (body_h * 0.45))
-                    if y1 > y2:
-                        y1, y2 = y2, y1
-                    p.drawLine(x, y1, x, y2)
 
-        # Draw dashed bar grid lines across the waveform area (moved after waveforms)
-        if have_bars and self.bars:
-            pen_bar = QtGui.QPen(QtGui.QColor(120, 130, 150, 110))  # light, subtle
-            pen_bar.setWidth(1)
-            pen_bar.setStyle(QtCore.Qt.DashLine)
-            p.setPen(pen_bar)
-            for bar_t in self.bars:
-                bt = float(bar_t)
-                if bt < t0 or bt > t1:
-                    continue
-                x = int((bt - t0) / (t1 - t0) * w)
-                p.drawLine(x, 0, x, wf_h)  # full height of waveform area
-            # Also draw a dashed line at the origin as bar 0
-            try:
-                x0 = int(((float(self.origin or 0.0)) - t0) / (t1 - t0) * w)
-                if 0 <= x0 <= w - 1:
-                    p.drawLine(x0, 0, x0, wf_h)
-            except Exception:
-                pass
+            # Draw dashed bar grid lines across the waveform area (moved after waveforms)
+            if have_bars and self.bars:
+                pen_bar = QtGui.QPen(QtGui.QColor(120, 130, 150, 110))  # light, subtle
+                pen_bar.setWidth(1)
+                pen_bar.setStyle(QtCore.Qt.DashLine)
+                p.setPen(pen_bar)
+                for bar_t in self.bars:
+                    bt = float(bar_t)
+                    if bt < t0 or bt > t1:
+                        continue
+                    x = int((bt - t0) / (t1 - t0) * w)
+                    p.drawLine(x, 0, x, wf_h)  # full height of waveform area
+                # Also draw a dashed line at the origin as bar 0
+                try:
+                    x0 = int(((float(self.origin or 0.0)) - t0) / (t1 - t0) * w)
+                    if 0 <= x0 <= w - 1:
+                        p.drawLine(x0, 0, x0, wf_h)
+                except Exception:
+                    pass
 
-        # loop overlay (if available), now after grid/waveforms
-        if self.loopA is not None and self.loopB is not None:
-            a = max(t0, min(t1, float(self.loopA)))
-            b = max(t0, min(t1, float(self.loopB)))
-            if b < a:
-                a, b = b, a
-            x0 = int((a - t0) / (t1 - t0) * w)
-            x1 = int((b - t0) / (t1 - t0) * w)
-            # Overlay: greenish-blue fill, clipped to waveform area, more opacity
-            p.fillRect(QtCore.QRect(x0, 0, max(1, x1 - x0), wf_h), QtGui.QColor(0, 200, 180, 48))
-            p.setPen(QtGui.QPen(QtGui.QColor(210, 210, 210)))
-            p.drawLine(x0, 0, x0, wf_h)
-            p.drawLine(x1, 0, x1, wf_h)
-            # flags at top strip for the active loop
-            tip_y = 2
-            base_y = min(self.FLAG_STRIP - 2, tip_y + self.FLAG_H)
-            flag_poly_a = QtGui.QPolygon([
-                QtCore.QPoint(x0, tip_y),
-                QtCore.QPoint(x0 - self.FLAG_W//2, base_y),
-                QtCore.QPoint(x0 + self.FLAG_W//2, base_y),
-            ])
-            flag_poly_b = QtGui.QPolygon([
-                QtCore.QPoint(x1, tip_y),
-                QtCore.QPoint(x1 - self.FLAG_W//2, base_y),
-                QtCore.QPoint(x1 + self.FLAG_W//2, base_y),
-            ])
-            # Yellow flags for active loop
-            p.setPen(QtGui.QPen(QtGui.QColor(255, 215, 0)))
-            p.setBrush(QtGui.QColor(255, 215, 0))  # yellow
-            p.drawPolygon(flag_poly_a)
-            p.drawPolygon(flag_poly_b)
-
-        # Draw saved loops' flags & labels in the top strip (now after overlays)
-        if hasattr(self, 'saved_loops') and self.saved_loops:
-            tip_y = 2
-            base_y = min(self.FLAG_STRIP - 2, tip_y + self.FLAG_H)
-            # Yellow flags for saved loops
-            p.setPen(QtGui.QPen(QtGui.QColor(255, 215, 0)))
-            p.setBrush(QtGui.QColor(255, 215, 0))  # yellow
-            for L in self.saved_loops:
-                a = float(L['a']); b = float(L['b'])
-                x0 = self._x_from_time(a, t0, t1, w)
-                x1 = self._x_from_time(b, t0, t1, w)
-                # start flag
-                flag_poly = QtGui.QPolygon([
+            # loop overlay (if available), now after grid/waveforms
+            if self.loopA is not None and self.loopB is not None:
+                a = max(t0, min(t1, float(self.loopA)))
+                b = max(t0, min(t1, float(self.loopB)))
+                if b < a:
+                    a, b = b, a
+                x0 = int((a - t0) / (t1 - t0) * w)
+                x1 = int((b - t0) / (t1 - t0) * w)
+                # Overlay: greenish-blue fill, clipped to waveform area, more opacity
+                p.fillRect(QtCore.QRect(x0, 0, max(1, x1 - x0), wf_h), QtGui.QColor(0, 200, 180, 48))
+                p.setPen(QtGui.QPen(QtGui.QColor(210, 210, 210)))
+                p.drawLine(x0, 0, x0, wf_h)
+                p.drawLine(x1, 0, x1, wf_h)
+                # flags at top strip for the active loop
+                tip_y = 2
+                base_y = min(self.FLAG_STRIP - 2, tip_y + self.FLAG_H)
+                flag_poly_a = QtGui.QPolygon([
                     QtCore.QPoint(x0, tip_y),
                     QtCore.QPoint(x0 - self.FLAG_W//2, base_y),
                     QtCore.QPoint(x0 + self.FLAG_W//2, base_y),
                 ])
-                p.drawPolygon(flag_poly)
-                # end flag
                 flag_poly_b = QtGui.QPolygon([
                     QtCore.QPoint(x1, tip_y),
                     QtCore.QPoint(x1 - self.FLAG_W//2, base_y),
                     QtCore.QPoint(x1 + self.FLAG_W//2, base_y),
                 ])
+                # Yellow flags for active loop
+                p.setPen(QtGui.QPen(QtGui.QColor(255, 215, 0)))
+                p.setBrush(QtGui.QColor(255, 215, 0))  # yellow
+                p.drawPolygon(flag_poly_a)
                 p.drawPolygon(flag_poly_b)
-                # label (if any): near start flag; if start flag is offscreen but the loop overlaps, pin to left margin
-                label = str(L.get('label', '') or '')
-                if label:
-                    x_label = x0 + self.FLAG_W + 4
-                    # If start flag is left of view but the loop overlaps the window, pin to left margin
-                    if x0 < 0 and x1 > 0:
-                        x_label = 4
-                    # Only draw label if any part of the loop is visible
-                    if x0 <= w and x1 >= 0:
-                        p.setPen(QtGui.QPen(QtGui.QColor(210, 220, 230)))
-                        p.drawText(int(max(0, min(w - 40, x_label))), int(base_y - 2), label)
-                        p.setPen(QtGui.QPen(QtGui.QColor(220, 220, 220)))
+
+            # Draw saved loops' flags & labels in the top strip (now after overlays)
+            if hasattr(self, 'saved_loops') and self.saved_loops:
+                tip_y = 2
+                base_y = min(self.FLAG_STRIP - 2, tip_y + self.FLAG_H)
+                # Yellow flags for saved loops
+                p.setPen(QtGui.QPen(QtGui.QColor(255, 215, 0)))
+                p.setBrush(QtGui.QColor(255, 215, 0))  # yellow
+                for L in self.saved_loops:
+                    a = float(L['a']); b = float(L['b'])
+                    x0 = self._x_from_time(a, t0, t1, w)
+                    x1 = self._x_from_time(b, t0, t1, w)
+                    # start flag
+                    flag_poly = QtGui.QPolygon([
+                        QtCore.QPoint(x0, tip_y),
+                        QtCore.QPoint(x0 - self.FLAG_W//2, base_y),
+                        QtCore.QPoint(x0 + self.FLAG_W//2, base_y),
+                    ])
+                    p.drawPolygon(flag_poly)
+                    # end flag
+                    flag_poly_b = QtGui.QPolygon([
+                        QtCore.QPoint(x1, tip_y),
+                        QtCore.QPoint(x1 - self.FLAG_W//2, base_y),
+                        QtCore.QPoint(x1 + self.FLAG_W//2, base_y),
+                    ])
+                    p.drawPolygon(flag_poly_b)
+                    # label (if any): near start flag; if start flag is offscreen but the loop overlaps, pin to left margin
+                    label = str(L.get('label', '') or '')
+                    if label:
+                        x_label = x0 + self.FLAG_W + 4
+                        # If start flag is left of view but the loop overlaps the window, pin to left margin
+                        if x0 < 0 and x1 > 0:
+                            x_label = 4
+                        # Only draw label if any part of the loop is visible
+                        if x0 <= w and x1 >= 0:
+                            p.setPen(QtGui.QPen(QtGui.QColor(210, 220, 230)))
+                            p.drawText(int(max(0, min(w - 40, x_label))), int(base_y - 2), label)
+                            p.setPen(QtGui.QPen(QtGui.QColor(220, 220, 220)))
+        except Exception:
+            pass
 
         # --- TOP RULER: Prefer BEAT ruler; back-fill beats prior to first downbeat. Fallback → time ruler.
         if have_beats:
@@ -1284,9 +1309,11 @@ class ChordWorker(QThread):
     status = Signal(str)
     demucs_line = Signal(str)  # forward Demucs logs to LogDock
     stems_ready = Signal(str)  # emits the stem **leaf** directory path
-    def __init__(self, path: str):
+    def __init__(self, path: str, style: str = 'rock_pop'):
         super().__init__()
         self.path = path
+        self.style = style
+        self.key_hint = None
 
     def _log(self, msg: str):
         s = str(msg)
@@ -1398,6 +1425,10 @@ class ChordWorker(QThread):
         Wrapper: always run beat detection first, and attach stems if available,
         then call chords.estimate_chords with these as inputs.
         """
+        # If Main gave us a key_hint, propagate
+        if getattr(self, "key_hint", None) and not kwargs.get("key_hint"):
+            kwargs["key_hint"] = dict(self.key_hint)
+
         # If caller didn't provide beat info, compute it now.
         if not kwargs.get("beats"):
             bd = estimate_beats(audio_path, sr=sr, hop=512)
@@ -1470,7 +1501,27 @@ class ChordWorker(QThread):
                 self.status.emit("Proceeding without stems (timeout or missing files).")
             except Exception:
                 pass
-        return _estimate_chords_base(audio_path, sr=sr, hop=hop, **kwargs)
+
+        beats_kw = kwargs.get("beats")
+        down_kw = kwargs.get("downbeats")
+        bs_kw = kwargs.get("beat_strengths")
+        stems_kw = kwargs.get("stems")
+        if stems_kw and beats_kw:
+            self._log("Using stem-aware chord detector")
+            return _stem_aware(audio_path, sr=sr, hop=hop,
+                            beats=beats_kw, downbeats=down_kw, beat_strengths=bs_kw,
+                            stems=stems_kw,
+                            key_hint=kwargs.get("key_hint"),
+                            log_fn=lambda m: self._log(m),
+                            style=getattr(self, "style", "rock_pop"))
+        else:
+            self._log("Using fast chord detector (no stems)")
+            return _fast_est(audio_path, sr=sr, hop=hop,
+                            beats=beats_kw, downbeats=down_kw, beat_strengths=bs_kw,
+                            stems=stems_kw,
+                            key_hint=kwargs.get("key_hint"),
+                            log_fn=lambda m: self._log(m),
+                            style=getattr(self, "style", "rock_pop"))
 
     def run(self):
         try:
@@ -1656,6 +1707,72 @@ class Main(QtWidgets.QMainWindow):
     def _demucs_log(self, text: str):
         if hasattr(self, 'log_dock') and self.log_dock is not None:
             self.log_dock.write(text)
+
+
+    def _action_reextract_stems(self):
+        """Force Demucs re-extraction, then recompute beats+chords using new stems."""
+        if not getattr(self, 'current_path', None):
+            self.statusBar().showMessage("No audio loaded.", 1500)
+            return
+        # Cancel any running chord worker cleanly
+        try:
+            if getattr(self, 'chord_worker', None) and self.chord_worker.isRunning():
+                self.chord_worker.requestInterruption(); self.chord_worker.quit(); self.chord_worker.wait()
+        except Exception:
+            pass
+        # Force re-separation for this run
+        try:
+            self._force_stems_recompute = True
+        except Exception:
+            pass
+        # Make sure Demucs log dock is visible
+        try:
+            if not hasattr(self, 'log_dock') or self.log_dock is None:
+                self.log_dock = LogDock(parent=self)
+                self.addDockWidget(Qt.BottomDockWidgetArea, self.log_dock)
+            self.log_dock.setWindowTitle('Demucs Log')
+            self.log_dock.show(); self.log_dock.raise_(); self.log_dock.clear()
+        except Exception:
+            pass
+        # Clear previous analysis; force fresh beats+key+chords and stems reload
+        self._clear_cached_analysis(keep_stems=False)
+        self.statusBar().showMessage("Recomputing: beats + key + chords…")
+        # Recompute visible beats/bars for the ruler in parallel
+        try:
+            self.populate_beats_async(self.current_path)
+            self.populate_key_async(self.current_path)
+        except Exception:
+            pass
+        # Kick the integrated pipeline (ChordWorker waits for stems, then estimates chords)
+        self.start_chord_analysis(self.current_path)
+
+    def _action_recompute_analysis(self):
+        """Recompute beats+chords using existing stems (do not re-run Demucs)."""
+        if not getattr(self, 'current_path', None):
+            self.statusBar().showMessage("No audio loaded.", 1500)
+            return
+        # Cancel any running chord worker cleanly
+        try:
+            if getattr(self, 'chord_worker', None) and self.chord_worker.isRunning():
+                self.chord_worker.requestInterruption(); self.chord_worker.quit(); self.chord_worker.wait()
+        except Exception:
+            pass
+        # Do NOT force stems; reuse cached stems
+        try:
+            self._force_stems_recompute = False
+        except Exception:
+            pass
+        # Clear previous analysis but keep current stems
+        self._clear_cached_analysis(keep_stems=True)
+        self.statusBar().showMessage("Recomputing: beats + key + chords…")
+        # Recompute visible beats/bars for the ruler in parallel
+        try:
+            self.populate_beats_async(self.current_path)
+            self.populate_key_async(self.current_path)
+        except Exception:
+            pass
+        # Start analysis
+        self.start_chord_analysis(self.current_path)
 
     def _on_stems_ready(self, stem_dir_str: str):
         """Always wire stems into the player and show the mixer dock when stems are ready."""
@@ -1937,24 +2054,86 @@ class Main(QtWidgets.QMainWindow):
 
             self.act_view_stems = QtGui.QAction("Show Stem Waveforms", self)
             self.act_view_stems.setCheckable(True)
-            self.act_view_stems.setChecked(True if getattr(self, 'wave', None) is None else bool(self.wave.show_stems))
-            self.act_view_stems.triggered.connect(lambda: self._set_waveform_view_mode(True))
+            self.act_view_stems.setChecked(False if getattr(self, 'wave', None) is None else bool(self.wave.show_stems))
+            self.act_view_stems.triggered.connect(lambda: self._set_waveform_view_mode(False))
             view_group.addAction(self.act_view_stems)
 
             self.act_view_combined = QtGui.QAction("Show Combined Waveform", self)
             self.act_view_combined.setCheckable(True)
-            self.act_view_combined.setChecked(False if getattr(self, 'wave', None) is None else not bool(self.wave.show_stems))
-            self.act_view_combined.triggered.connect(lambda: self._set_waveform_view_mode(False))
+            self.act_view_combined.setChecked(True if getattr(self, 'wave', None) is None else not bool(self.wave.show_stems))
+            self.act_view_combined.triggered.connect(lambda: self._set_waveform_view_mode(True))
             view_group.addAction(self.act_view_combined)
 
             view_menu.addAction(self.act_view_stems)
             view_menu.addAction(self.act_view_combined)
 
-            # Insert Analysis menu after View
-            analysisMenu = mb.addMenu("Analysis")
-            analysisMenu.addAction(self.actRecompute)
-            analysisMenu.addSeparator()
-            analysisMenu.addAction(self.actAlwaysRecompute)
+            # ---- Analysis menu (after File) ----
+            analysis_menu = None
+            for a in self.menuBar().actions():
+                if a.text() == "Analysis":
+                    analysis_menu = a.menu()
+                    break
+            if analysis_menu is None:
+                analysis_menu = self.menuBar().addMenu("Analysis")
+
+            self.actReextractStems = QAction("Re-extract Stems", self)
+            self.actReextractStems.setStatusTip("Run Demucs again and refresh stems before chord detection")
+            self.actReextractStems.triggered.connect(self._action_reextract_stems)
+
+            self.actRecomputeAnalysis = QAction("Recompute Analysis", self)
+            self.actRecomputeAnalysis.setStatusTip("Recompute beats & chords using current stems")
+            self.actRecomputeAnalysis.triggered.connect(self._action_recompute_analysis)
+
+            analysis_menu.addAction(self.actReextractStems)
+            analysis_menu.addAction(self.actRecomputeAnalysis)
+
+            # Default analysis style
+            if not hasattr(self, 'analysis_style'):
+                self.analysis_style = 'rock_pop'
+
+            # Ensure an Analysis menu exists
+            try:
+                analysis_menu = None
+                for w in self.menuBar().findChildren(QtWidgets.QMenu):
+                    if w.title() == 'Analysis':
+                        analysis_menu = w
+                        break
+                if analysis_menu is None:
+                    analysis_menu = self.menuBar().addMenu('Analysis')
+
+                # Add Style submenu
+                style_menu = None
+                for w in analysis_menu.findChildren(QtWidgets.QMenu):
+                    if w.title() == 'Style':
+                        style_menu = w
+                        break
+                if style_menu is None:
+                    style_menu = analysis_menu.addMenu('Style')
+
+                # Exclusive action group
+                self._style_group = QtGui.QActionGroup(self)
+                self._style_group.setExclusive(True)
+
+                styles = [
+                    ('Rock/Pop', 'rock_pop'),
+                    ('Blues', 'blues'),
+                    ('Reggae', 'reggae'),
+                    ('Jazz', 'jazz'),
+                ]
+                self._style_actions = {}
+                for text, key in styles:
+                    act = QtGui.QAction(text, self, checkable=True)
+                    act.setChecked(key == self.analysis_style)
+                    act.triggered.connect(lambda checked, k=key: self._set_analysis_style(k))
+                    self._style_group.addAction(act)
+                    style_menu.addAction(act)
+                    self._style_actions[key] = act
+
+                if self.analysis_style not in self._style_actions:
+                    self.analysis_style = 'rock_pop'
+                    self._style_actions['rock_pop'].setChecked(True)
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -2008,12 +2187,12 @@ class Main(QtWidgets.QMainWindow):
         self.toolbar.addWidget(self.rate_spin)
         self.toolbar.addAction(self.act_render)
         self.toolbar.addSeparator()
-        try:
-            self.actRecompute.setToolTip("Delete cached analysis and re-run stems + chords (Ctrl+Shift+R)")
-        except Exception:
-            pass
-        self.toolbar.addAction(self.actRecompute)
-
+        self.analysis_toolbar = getattr(self, 'analysis_toolbar', None)
+        if self.analysis_toolbar is None:
+            self.analysis_toolbar = self.addToolBar("Analysis")
+            self.analysis_toolbar.setObjectName("AnalysisToolbar")
+        self.analysis_toolbar.addAction(self.actReextractStems)
+        self.analysis_toolbar.addAction(self.actRecomputeAnalysis)
         # === Stems UI (dock hidden by default) ===
         self.stems_dock = QtWidgets.QDockWidget("Stems", self)
         self.stems_dock.setObjectName("StemsDock")
@@ -2046,7 +2225,7 @@ class Main(QtWidgets.QMainWindow):
         self.wave.requestSplitChordAt.connect(self._split_chord_at_time)
         self.wave.requestJoinChordForward.connect(self._join_chord_forward_at_time)
         try:
-            self._set_waveform_view_mode(True)
+            self._set_waveform_view_mode(False)
         except Exception:
             pass
         central = QtWidgets.QWidget()
@@ -2097,7 +2276,7 @@ class Main(QtWidgets.QMainWindow):
             path = getattr(self, "current_path", None)
             if not path:
                 return
-            self._clear_cached_analysis(path, remove_stems=True)
+            self._clear_cached_analysis(keep_stems=False)
             self._clear_stem_rows()
             self.start_chord_analysis(path)  # runs Demucs + waits + chords
         except Exception:
@@ -2178,6 +2357,8 @@ class Main(QtWidgets.QMainWindow):
                 self.log_dock.clear()
         except Exception:
             pass
+        self.last_key = None
+        self.populate_key_async(self.current_path)
 
     def _session_sidecar_path(self, audio_path: str) -> Path:
         p = Path(audio_path)
@@ -2464,6 +2645,34 @@ class Main(QtWidgets.QMainWindow):
                 self.act_view_combined.setChecked(not bool(show_stems))
         except Exception:
             pass
+
+    def _set_analysis_style(self, style_key: str):
+        self.analysis_style = style_key
+        try:
+            self.statusBar().showMessage(f"Analysis style: {style_key}", 1500)
+        except Exception:
+            pass
+
+    def populate_key_async(self, path: str):
+        if getattr(self, 'key_worker', None) and self.key_worker.isRunning():
+            self.key_worker.requestInterruption(); self.key_worker.quit(); self.key_worker.wait(1000)
+        kw = KeyWorker(path)
+        kw.setParent(self)
+        kw.done.connect(self._key_ready)
+        kw.finished.connect(lambda: setattr(self, "key_worker", None))
+        self.key_worker = kw
+        kw.start()
+
+    def _key_ready(self, info: dict):
+        try:
+            self.last_key = dict(info or {})
+        except Exception:
+            self.last_key = {"pretty": "unknown"}
+        label = self.last_key.get("pretty") or "unknown"
+        self.statusBar().showMessage(f"Key: {label}", 1500)
+        if getattr(self, "_pending_chords_waiting_for_key", False) and getattr(self, "current_path", None):
+            self._pending_chords_waiting_for_key = False
+            self.start_chord_analysis(self.current_path)
 
     def load_session(self):
         # Use current file’s sidecar if a song is loaded; else prompt for JSON
@@ -3123,32 +3332,67 @@ class Main(QtWidgets.QMainWindow):
             out_dir = self._song_cache_dir(audio_path)
         return Path(out_dir) / model / p.stem
 
-    def _clear_cached_analysis(self, audio_path: str, remove_stems: bool = True):
-        # Delete sidecar JSON
+    def _clear_cached_analysis(self, keep_stems: bool = True):
+        """Clear computed analysis so recompute truly recalculates beats, key, chords.
+        If keep_stems is False, also forget any cached stems metadata (not files)."""
+        # Clear in-memory analysis caches/fields if present
+        for attr in (
+            'last_beats', 'last_downbeats', 'last_beat_strengths',
+            'last_chords', 'last_key', 'beat_grid', 'last_bars', 'last_tempo',
+        ):
+            if hasattr(self, attr):
+                try:
+                    setattr(self, attr, None)
+                except Exception:
+                    pass
+        # Clear any session dict entries if used
         try:
-            sidecar = self._sidecar_path(audio_path)
-            if sidecar.exists():
-                sidecar.unlink()
+            if hasattr(self, 'session') and isinstance(self.session, dict):
+                for k in ('beats', 'downbeats', 'beat_strengths', 'chords', 'key', 'tempo', 'bars'):
+                    self.session.pop(k, None)
         except Exception:
             pass
-        # Optionally delete stems leaf
-        if remove_stems:
-            try:
-                leaf = self._stem_leaf_dir(audio_path, "htdemucs_6s")
-                if leaf.exists():
-                    shutil.rmtree(leaf)
-            except Exception:
-                pass
-        # Clear in-memory chords and the view
+        # Reset visual caches
         try:
-            self.last_chords = []
-        except Exception:
-            pass
-        try:
-            if hasattr(self, "wave"):
+            if getattr(self, 'wave', None):
+                self.wave.set_beats([], [])
                 self.wave.set_chords([])
         except Exception:
             pass
+
+        # Remove on-disk analysis sidecars for this track (do not touch audio or stems)
+        try:
+            cur = getattr(self, 'current_path', None)
+            if cur:
+                p = Path(cur)
+                candidates = []
+                # Common patterns used by earlier versions
+                candidates.append(p.with_suffix(p.suffix + ".json"))   # e.g., song.mp3.json
+                candidates.append(p.with_suffix(".json"))               # e.g., song.json
+                for base in ("chords", "beats", "analysis", "session"):
+                    candidates.append(p.parent / f"{p.stem}.{base}.json")
+                # Also look under .musicpractice next to the audio
+                dot = p.parent / ".musicpractice"
+                for name in ("chords.json", "beats.json", "analysis.json", f"{p.stem}.json"):
+                    candidates.append(dot / name)
+                # Delete any that exist
+                for f in candidates:
+                    try:
+                        if f and f.is_file():
+                            f.unlink()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # Optionally clear stems metadata so UI will reload them (files remain on disk)
+        if not keep_stems:
+            for attr in ('_loaded_stems', '_loaded_stems_leaf'):
+                if hasattr(self, attr):
+                    try:
+                        setattr(self, attr, None)
+                    except Exception:
+                        pass
 
     # === Actions ===
     def _rate_changed(self, val: float):
@@ -3266,7 +3510,7 @@ class Main(QtWidgets.QMainWindow):
             pass
         try:
             if hasattr(self, "actAlwaysRecompute") and self.actAlwaysRecompute.isChecked():
-                self._clear_cached_analysis(self.current_path, remove_stems=True)
+                self._clear_cached_analysis(keep_stems=False)
         except Exception:
             pass
         # Compute only what is missing
@@ -3289,23 +3533,21 @@ class Main(QtWidgets.QMainWindow):
         # with live logs and waits for stems before estimating chords.
         return self.start_chord_analysis(path)
 
-    def populate_key_async(self, path: str):
-        if self.key_worker and self.key_worker.isRunning():
-            self.key_worker.requestInterruption(); self.key_worker.quit(); self.key_worker.wait(1000)
-        kw = KeyWorker(path)
-        kw.setParent(self)
-        kw.done.connect(self._key_ready)
-        kw.finished.connect(lambda: setattr(self, "key_worker", None))
-        self.key_worker = kw
-        kw.start()
-
     def start_chord_analysis(self, path: str):
         # Stop any existing chord worker
         if hasattr(self, "chord_worker") and self.chord_worker and self.chord_worker.isRunning():
             self.chord_worker.requestInterruption()
             self.chord_worker.quit()
             self.chord_worker.wait()
-        cw = ChordWorker(path)
+
+        if not getattr(self, "last_key", None):
+            self._pending_chords_waiting_for_key = True
+            self.populate_key_async(path)
+            self.statusBar().showMessage("Estimating key first…")
+            return
+
+        cw = ChordWorker(path, style=getattr(self, "analysis_style", "rock_pop"))
+        cw.key_hint = dict(getattr(self, "last_key", {}) or {})
         cw.setParent(self)
         # Ensure Demucs logs are visible and wire stem loading
         if not hasattr(self, "log_dock") or self.log_dock is None:
@@ -3340,11 +3582,6 @@ class Main(QtWidgets.QMainWindow):
         # Clear the waiting message after a short delay
         self.statusBar().showMessage(f"Chords: {len(self.last_chords)} segments")
         QtCore.QTimer.singleShot(1500, lambda: self.statusBar().clearMessage())
-
-    def _key_ready(self, info: dict):
-        self.last_key = info or {}
-        self.key_header_label.setText(f"Key: {self.last_key.get('pretty','—')}")
-        self.save_session()
 
     def toggle_play(self):
         if not self.player:
@@ -3439,7 +3676,7 @@ class Main(QtWidgets.QMainWindow):
             pass
         try:
             if hasattr(self, "actAlwaysRecompute") and self.actAlwaysRecompute.isChecked():
-                self._clear_cached_analysis(self.current_path, remove_stems=True)
+                self._clear_cached_analysis(keep_stems=False)
         except Exception:
             pass
         if not self.last_beats:
