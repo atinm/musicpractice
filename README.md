@@ -61,6 +61,16 @@ python app.py
   - Arrow keys to pan left/right
 - **Time Stretching**: Adjust rate slider (0.5x - 1.5x) for pitch-preserving tempo changes
 
+### Keyboard Shortcuts
+
+- **Space**: Play/Pause
+- **Left/Right Arrow**: Skip to previous/next bar
+- **Home**: Go to start of track
+- **Ctrl+O**: Open audio file
+- **Ctrl+S**: Save session
+- **Ctrl+Shift+O**: Load session
+- **Ctrl+Shift+R**: Recompute analysis
+
 ### Advanced Features
 
 #### Stem Separation
@@ -70,11 +80,23 @@ python app.py
 - Individual volume and mute controls for each stem
 - Uses Demucs AI model for high-quality separation
 
+#### Waveform View Modes
+
+- View → Show Stem Waveforms: Display individual waveforms for each separated stem
+- View → Show Combined Waveform: Display the original full mix waveform
+- Toggle between views to analyze individual parts or the complete mix
+
 #### Session Management
 
 - File → Save Session: Saves loops, analysis data, and settings
 - File → Load Session: Restores previous session state
 - Sessions are automatically saved alongside audio files
+
+#### Analysis Management
+
+- Analysis → Recompute analysis (Ctrl+Shift+R): Force re-analysis of current track
+- Analysis → Always recompute on open: Automatically clear cache and re-analyze when opening files
+- Clears cached chord detection, beat tracking, and stem separation data
 
 #### Beat Snapping
 
@@ -123,3 +145,5 @@ musicpractice/
 - Stem separation requires significant CPU/GPU resources and may take several minutes
 - Session files are saved as `.musicpractice.json` alongside audio files
 - All analysis is cached and restored when reopening files
+- Use "Recompute analysis" if you need fresh analysis results or encounter issues
+- Stem separation results are cached in `.musicpractice/stems/` directories

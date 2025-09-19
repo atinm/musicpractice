@@ -171,6 +171,8 @@ class WaveformView(QtWidgets.QWidget):
         self.content_end = None  # seconds; last non-silent audio
         self.loopA = None  # visual loop start (seconds)
         self.loopB = None  # visual loop end (seconds)
+        # Visual mode: stacked stems (True) vs single combined waveform (False)
+        self.show_stems = True
         self._drag_mode = None  # 'set' | 'resizeA' | 'resizeB' | 'move' | None
         self.snap_enabled = True  # whether to snap to beats when dragging loop
         self._press_t = None
@@ -212,6 +214,10 @@ class WaveformView(QtWidgets.QWidget):
         self.player = player
         self.update()
 
+    def set_show_stems(self, show: bool):
+        self.show_stems = bool(show)
+        self.update()
+
     def set_chords(self, segments: list[dict]):
         """Replace chord segments and trigger a repaint."""
         import copy
@@ -222,7 +228,6 @@ class WaveformView(QtWidgets.QWidget):
                 self._chords_viz_cache.clear()
             except Exception:
                 self._chords_viz_cache = None
-        print(f"[DBG] set_chords: {len(self.chords)} segments; first={self.chords[0] if self.chords else None}")
         self.update()
 
     def set_origin_offset(self, seconds: float):
@@ -266,11 +271,9 @@ class WaveformView(QtWidgets.QWidget):
         lane_top = wf_h
         lane_bottom = wf_h + 32
         in_lane = not (y < (lane_top - 4) or y >= (lane_bottom + 4))
-        print(f"[DBG] _time_in_chord_lane: pos=({x},{y}) lane=({lane_top},{lane_bottom}) in_lane={in_lane}")
         if not in_lane:
             return None
         t = self._time_at_x(x, t0, t1, w)
-        print(f"[DBG] _time_in_chord_lane: time={t:.3f}s")
         return t
 
     def _open_chord_context_at(self, pos: QtCore.QPoint, global_pos: QtCore.QPoint):
@@ -278,9 +281,7 @@ class WaveformView(QtWidgets.QWidget):
         t0, t1 = self._current_window()
         w = self.width(); h = self.height(); wf_h, _ = self._wf_geom()
         t_ch = self._time_in_chord_lane(pos, t0, t1, w, wf_h)
-        print(f"[DBG] _open_chord_context_at: pos={pos}, t_ch={t_ch}")
         if t_ch is None:
-            print("[DBG] _open_chord_context_at: not in chord lane → False")
             return False
 
         # Determine if join-with-next is allowed: must be contiguous and within the same bar
@@ -305,9 +306,7 @@ class WaveformView(QtWidgets.QWidget):
                 bi1 = self._bar_index_at(m1); bi2 = self._bar_index_at(m2)
                 same_bar = (bi1 is not None and bi1 == bi2)
                 allow_join = bool(contiguous and same_bar)
-                print(f"[DBG] chord-join: idx={idx} contiguous={contiguous} same_bar={same_bar} (bi1={bi1}, bi2={bi2})")
         except Exception as ex:
-            print(f"[DBG] chord-join check failed: {ex}")
             allow_join = False
 
         menu = QtWidgets.QMenu(self)
@@ -323,7 +322,6 @@ class WaveformView(QtWidgets.QWidget):
             self.requestSplitChordAt.emit(float(t_ch))
         elif actJoin is not None and chosen == actJoin:
             self.requestJoinChordForward.emit(float(t_ch))
-        print("[DBG] _open_chord_context_at: menu handled = True")
         return True
 
     def _hit_test(self, pos: QtCore.QPoint, t0: float, t1: float, w: int, wf_h: int):
@@ -564,7 +562,6 @@ class WaveformView(QtWidgets.QWidget):
             pos_global = e.globalPos()
         except Exception:
             pos_global = QtGui.QCursor.pos()
-        print(f"[DBG] contextMenuEvent: local={pos_local}, global={pos_global}")
         if self._open_chord_context_at(pos_local, pos_global):
             e.accept()
             return
@@ -594,7 +591,6 @@ class WaveformView(QtWidgets.QWidget):
     def mousePressEvent(self, e: QtGui.QMouseEvent):
         # Right-click: let the standard contextMenuEvent handle it (no action on press)
         if e.button() == Qt.RightButton:
-            print("[DBG] mousePressEvent RightButton: delegating to contextMenuEvent")
             e.ignore()
             return
         # For left/middle clicks, we require a player to interact
@@ -934,7 +930,7 @@ class WaveformView(QtWidgets.QWidget):
         long_len = min(12, wf_h)
         short_len = min(6, wf_h)
 
-        stems = self._get_stems_for_display()
+        stems = self._get_stems_for_display() if getattr(self, "show_stems", True) else []
         if stems:
             # Divide body area into rows for each stem
             rows = len(stems)
@@ -1900,12 +1896,6 @@ class Main(QtWidgets.QMainWindow):
         self.act_pause = QAction("Pause", self)
         self.act_pause.triggered.connect(self.pause)
 
-        self.act_setA = QAction("Set A", self)
-        self.act_setA.triggered.connect(self.set_A)
-
-        self.act_setB = QAction("Set B", self)
-        self.act_setB.triggered.connect(self.set_B)
-
         self.act_render = QAction("Render@Rate", self)
         self.act_render.setEnabled(HAS_STRETCH)
         if not HAS_STRETCH:
@@ -1936,7 +1926,27 @@ class Main(QtWidgets.QMainWindow):
             fileMenu.addSeparator()
             fileMenu.addAction(QAction("Save Session", self, shortcut=QKeySequence.StandardKey.Save, triggered=self.save_session))
             fileMenu.addAction(QAction("Load Session", self, shortcut=QKeySequence("Ctrl+Shift+O"), triggered=self.load_session))
-            # Insert Analysis menu after File
+            # ---- View menu (after File) ----
+            view_menu = self.menuBar().addMenu("View")
+            view_group = QtGui.QActionGroup(self)
+            view_group.setExclusive(True)
+
+            self.act_view_stems = QtGui.QAction("Show Stem Waveforms", self)
+            self.act_view_stems.setCheckable(True)
+            self.act_view_stems.setChecked(True if getattr(self, 'wave', None) is None else bool(self.wave.show_stems))
+            self.act_view_stems.triggered.connect(lambda: self._set_waveform_view_mode(True))
+            view_group.addAction(self.act_view_stems)
+
+            self.act_view_combined = QtGui.QAction("Show Combined Waveform", self)
+            self.act_view_combined.setCheckable(True)
+            self.act_view_combined.setChecked(False if getattr(self, 'wave', None) is None else not bool(self.wave.show_stems))
+            self.act_view_combined.triggered.connect(lambda: self._set_waveform_view_mode(False))
+            view_group.addAction(self.act_view_combined)
+
+            view_menu.addAction(self.act_view_stems)
+            view_menu.addAction(self.act_view_combined)
+
+            # Insert Analysis menu after View
             analysisMenu = mb.addMenu("Analysis")
             analysisMenu.addAction(self.actRecompute)
             analysisMenu.addSeparator()
@@ -1947,12 +1957,49 @@ class Main(QtWidgets.QMainWindow):
         # Populate toolbar
         self.toolbar.addAction(self.act_open)
         self.toolbar.addSeparator()
-        self.toolbar.addAction(self.act_play)
-        self.toolbar.addAction(self.act_pause)
-        self.toolbar.addSeparator()
-        self.toolbar.addAction(self.act_setA)
-        self.toolbar.addAction(self.act_setB)
-        self.toolbar.addSeparator()
+        # --- Transport toolbar (universal media symbols) ---
+        self.transport_tb = self.addToolBar("Transport")
+        self.transport_tb.setObjectName("TransportToolbar")
+        self.transport_tb.setMovable(False)
+        self.transport_tb.setFloatable(False)
+        self.transport_tb.setIconSize(QtCore.QSize(18, 18))
+        self.transport_tb.setToolButtonStyle(Qt.ToolButtonIconOnly)
+
+        style = self.style()
+        ico_start = style.standardIcon(QtWidgets.QStyle.SP_MediaSkipBackward)
+        ico_play  = style.standardIcon(QtWidgets.QStyle.SP_MediaPlay)
+        ico_skip_back = self.style().standardIcon(QtWidgets.QStyle.SP_MediaSeekBackward)
+        ico_skip_fwd  = self.style().standardIcon(QtWidgets.QStyle.SP_MediaSeekForward)
+
+        self.act_skip_back = QtGui.QAction(ico_skip_back, "", self)
+        self.act_skip_back.setToolTip("Skip backward 1 bar")
+        self.act_skip_back.setShortcut(Qt.Key_Left)
+        self.act_skip_back.triggered.connect(self._skip_prev_bar)
+
+        self.act_skip_fwd = QtGui.QAction(ico_skip_fwd, "", self)
+        self.act_skip_fwd.setToolTip("Skip forward 1 bar")
+        self.act_skip_fwd.setShortcut(Qt.Key_Right)
+        self.act_skip_fwd.triggered.connect(self._skip_next_bar)
+        # Go to start
+        self.act_goto_start = QtGui.QAction(ico_start, "", self)
+        self.act_goto_start.setToolTip("Go to start")
+        self.act_goto_start.setShortcut(Qt.Key_Home)
+        self.act_goto_start.triggered.connect(self._goto_start)
+
+        # Play/Pause toggle (icon updates dynamically)
+        self.act_playpause = QtGui.QAction(ico_play, "", self)
+        self.act_playpause.setToolTip("Play/Pause (Space)")
+        self.act_playpause.setShortcut(Qt.Key_Space)
+        self.act_playpause.triggered.connect(self._toggle_playpause)
+
+        self.transport_tb.addAction(self.act_goto_start)
+        self.transport_tb.addAction(self.act_skip_back)
+        self.transport_tb.addAction(self.act_playpause)
+        self.transport_tb.addAction(self.act_skip_fwd)
+        try:
+            self._dock_transport_next_to_load()
+        except Exception:
+            pass
         self.toolbar.addWidget(self.rate_label)
         self.toolbar.addWidget(self.rate_spin)
         self.toolbar.addAction(self.act_render)
@@ -1994,7 +2041,10 @@ class Main(QtWidgets.QMainWindow):
         self.wave.requestEditChord.connect(self._edit_chord_at_time)
         self.wave.requestSplitChordAt.connect(self._split_chord_at_time)
         self.wave.requestJoinChordForward.connect(self._join_chord_forward_at_time)
-
+        try:
+            self._set_waveform_view_mode(True)
+        except Exception:
+            pass
         central = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(central)
         layout.setContentsMargins(8, 6, 8, 6)
@@ -2054,6 +2104,286 @@ class Main(QtWidgets.QMainWindow):
         folder = p.parent / ".musicpractice"
         folder.mkdir(parents=True, exist_ok=True)
         return folder / f"{p.stem}.musicpractice.json"
+
+    def _dock_transport_next_to_load(self):
+        """Place transport controls (icon-only buttons) to the RIGHT of the Load/Open action
+        on an existing toolbar. Ensure order: [Go to Start] then [Play/Pause].
+        Falls back to the dedicated transport toolbar if no suitable toolbar is found.
+        """
+        try:
+            if not hasattr(self, "act_goto_start") or not hasattr(self, "act_playpause"):
+                return  # actions not created yet
+
+            # Find a toolbar that already has a Load/Open action
+            target_tb = None
+            load_act = None
+            for tb in self.findChildren(QtWidgets.QToolBar):
+                for act in tb.actions():
+                    txt = (act.text() or "").lower().replace("&", "")
+                    if "load" in txt or "open" in txt:
+                        target_tb = tb
+                        load_act = act
+                        break
+                if target_tb:
+                    break
+
+            if not target_tb or load_act is None:
+                return  # keep dedicated transport toolbar
+
+            # Remove the standalone transport toolbar if present; we'll host icon buttons instead.
+            try:
+                if hasattr(self, "transport_tb") and self.transport_tb is not None:
+                    self.removeToolBar(self.transport_tb)
+            except Exception:
+                pass
+
+            # Build icon-only buttons if not created yet
+            if not hasattr(self, "_transport_btn_start") or self._transport_btn_start is None:
+                self._transport_btn_start = QtWidgets.QToolButton(target_tb)
+                self._transport_btn_start.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_MediaSkipBackward))
+                self._transport_btn_start.setToolTip("Go to start")
+                self._transport_btn_start.setAutoRaise(True)
+                self._transport_btn_start.clicked.connect(self._goto_start)
+
+            if not hasattr(self, "_transport_btn_skip_back") or self._transport_btn_skip_back is None:
+                self._transport_btn_skip_back = QtWidgets.QToolButton(target_tb)
+                self._transport_btn_skip_back.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_MediaSeekBackward))
+                self._transport_btn_skip_back.setToolTip("Skip backward 1 bar")
+                self._transport_btn_skip_back.setAutoRaise(True)
+                self._transport_btn_skip_back.clicked.connect(self._skip_prev_bar)
+
+            if not hasattr(self, "_transport_btn_play") or self._transport_btn_play is None:
+                self._transport_btn_play = QtWidgets.QToolButton(target_tb)
+                self._transport_btn_play.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_MediaPlay))
+                self._transport_btn_play.setToolTip("Play/Pause (Space)")
+                self._transport_btn_play.setAutoRaise(True)
+                self._transport_btn_play.clicked.connect(self._toggle_playpause)
+
+            if not hasattr(self, "_transport_btn_skip_fwd") or self._transport_btn_skip_fwd is None:
+                self._transport_btn_skip_fwd = QtWidgets.QToolButton(target_tb)
+                self._transport_btn_skip_fwd.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_MediaSeekForward))
+                self._transport_btn_skip_fwd.setToolTip("Skip forward 1 bar")
+                self._transport_btn_skip_fwd.setAutoRaise(True)
+                self._transport_btn_skip_fwd.clicked.connect(self._skip_next_bar)
+
+            # Insert immediately AFTER Load/Open; order: Start, SkipBack, Play, SkipFwd
+            acts = list(target_tb.actions())
+            try:
+                idx = acts.index(load_act)
+            except ValueError:
+                idx = -1
+            insert_after = acts[idx + 1] if (idx >= 0 and (idx + 1) < len(acts)) else None
+
+            if insert_after is None:
+                target_tb.addWidget(self._transport_btn_start)
+                target_tb.addWidget(self._transport_btn_skip_back)
+                target_tb.addWidget(self._transport_btn_play)
+                target_tb.addWidget(self._transport_btn_skip_fwd)
+            else:
+                target_tb.insertWidget(insert_after, self._transport_btn_start)
+                target_tb.insertWidget(insert_after, self._transport_btn_skip_back)
+                target_tb.insertWidget(insert_after, self._transport_btn_play)
+                target_tb.insertWidget(insert_after, self._transport_btn_skip_fwd)
+
+            # Keep play/pause icon synced
+            self._refresh_transport_icon()
+        except Exception:
+            pass
+
+    def _refresh_transport_icon(self):
+        try:
+            style = self.style()
+            if self._is_playing():
+                icon = style.standardIcon(QtWidgets.QStyle.SP_MediaPause)
+            else:
+                icon = style.standardIcon(QtWidgets.QStyle.SP_MediaPlay)
+            # Update the action (for menus/shortcuts)
+            if hasattr(self, 'act_playpause') and self.act_playpause is not None:
+                self.act_playpause.setIcon(icon)
+            # Update the toolbar button if present
+            if hasattr(self, '_transport_btn_play') and self._transport_btn_play is not None:
+                self._transport_btn_play.setIcon(icon)
+        except Exception:
+            pass
+
+    def _goto_start(self):
+        # Seek to musical origin if known; otherwise 0.0
+        try:
+            t0 = float(getattr(self.wave, "origin", 0.0) or 0.0)
+        except Exception:
+            t0 = 0.0
+        try:
+            if self.player and hasattr(self.player, "seek_seconds"):
+                self.player.seek_seconds(t0)
+            elif self.player and hasattr(self.player, "set_position_seconds"):
+                self.player.set_position_seconds(t0)
+            else:
+                self.wave.requestSeek.emit(float(t0))
+        except Exception:
+            self.wave.requestSeek.emit(float(t0))
+        # recentre the view if it was frozen by a click
+        try:
+            if hasattr(self, "wave") and self.wave is not None:
+                self.wave.unfreeze_and_center()
+        except Exception:
+            pass
+
+    def _is_playing(self) -> bool:
+        p = getattr(self, 'player', None)
+        if not p:
+            return False
+        try:
+            # Prefer explicit paused/playing queries
+            if hasattr(p, 'is_paused') and callable(p.is_paused):
+                return not bool(p.is_paused())
+            if hasattr(p, 'paused'):
+                return not bool(getattr(p, 'paused'))
+            if hasattr(p, 'state'):
+                st = getattr(p, 'state')
+                if isinstance(st, str):
+                    return st.lower() in ('play', 'playing', 'running')
+                try:
+                    return int(st) == 1  # commonly 1 == playing
+                except Exception:
+                    pass
+            if hasattr(p, 'is_playing') and callable(p.is_playing):
+                return bool(p.is_playing())
+            if hasattr(p, 'playing'):
+                return bool(getattr(p, 'playing'))
+        except Exception:
+            pass
+        return False
+
+    def _toggle_playpause(self):
+        p = getattr(self, 'player', None)
+        if not p:
+            return
+        try:
+            if self._is_playing():
+                # --- PAUSE fallbacks ---
+                if hasattr(p, 'pause') and callable(p.pause):
+                    p.pause()
+                elif hasattr(p, 'set_paused') and callable(p.set_paused):
+                    p.set_paused(True)
+                elif hasattr(p, 'toggle_pause') and callable(p.toggle_pause):
+                    p.toggle_pause()
+                elif hasattr(p, 'play') and callable(p.play):
+                    # Some players accept a boolean
+                    try:
+                        p.play(False)
+                    except Exception:
+                        pass
+            else:
+                # --- PLAY/RESUME fallbacks ---
+                if hasattr(p, 'play') and callable(p.play):
+                    try:
+                        p.play()
+                    except TypeError:
+                        # In case play(bool) exists
+                        try:
+                            p.play(True)
+                        except Exception:
+                            pass
+                elif hasattr(p, 'set_paused') and callable(p.set_paused):
+                    p.set_paused(False)
+                elif hasattr(p, 'resume') and callable(p.resume):
+                    p.resume()
+        finally:
+            # Keep the icon in sync regardless of outcome
+            try:
+                self._refresh_transport_icon()
+            except Exception:
+                pass
+
+    def _current_position_seconds(self) -> float:
+        try:
+            if self.player and hasattr(self.player, 'position_seconds'):
+                return float(self.player.position_seconds())
+        except Exception:
+            pass
+        return 0.0
+
+    def _bars_list(self) -> list[float]:
+        # Prefer WaveformView's bars; fall back to cached last_bars
+        try:
+            if hasattr(self, 'wave') and self.wave and getattr(self.wave, 'bars', None):
+                return [float(b) for b in self.wave.bars]
+        except Exception:
+            pass
+        try:
+            if getattr(self, 'last_bars', None):
+                return [float(b) for b in self.last_bars]
+        except Exception:
+            pass
+        return []
+
+    def _seek_seconds(self, t: float):
+        try:
+            if self.player and hasattr(self.player, 'seek_seconds'):
+                self.player.seek_seconds(float(t))
+            elif self.player and hasattr(self.player, 'set_position_seconds'):
+                self.player.set_position_seconds(float(t))
+            else:
+                self.wave.requestSeek.emit(float(t))
+        except Exception:
+            self.wave.requestSeek.emit(float(t))
+
+    def _skip_prev_bar(self):
+        bars = sorted(self._bars_list())
+        pos = self._current_position_seconds()
+        if bars:
+            try:
+                origin = float(getattr(self.wave, 'origin', 0.0) or 0.0)
+            except Exception:
+                origin = 0.0
+            if all(abs(origin - b) > 1e-6 for b in bars):
+                bars = [origin] + bars
+            prevs = [b for b in bars if b < pos - 1e-6]
+            t_new = prevs[-1] if prevs else bars[0]
+        else:
+            step = getattr(self.wave, 'window_s', 2.0) if hasattr(self, 'wave') and self.wave else 2.0
+            t_new = max(0.0, pos - step)
+        self._seek_seconds(t_new)
+        try:
+            if hasattr(self, 'wave') and self.wave: self.wave.unfreeze_and_center()
+        except Exception:
+            pass
+
+    def _skip_next_bar(self):
+        bars = sorted(self._bars_list())
+        pos = self._current_position_seconds()
+        if bars:
+            try:
+                origin = float(getattr(self.wave, 'origin', 0.0) or 0.0)
+            except Exception:
+                origin = 0.0
+            if all(abs(origin - b) > 1e-6 for b in bars):
+                bars = [origin] + bars
+            nexts = [b for b in bars if b > pos + 1e-6]
+            t_new = nexts[0] if nexts else bars[-1]
+        else:
+            step = getattr(self.wave, 'window_s', 2.0) if hasattr(self, 'wave') and self.wave else 2.0
+            t_new = pos + step
+        self._seek_seconds(t_new)
+        try:
+            if hasattr(self, 'wave') and self.wave: self.wave.unfreeze_and_center()
+        except Exception:
+            pass
+
+    def _set_waveform_view_mode(self, show_stems: bool):
+        try:
+            if hasattr(self, 'wave') and self.wave is not None:
+                self.wave.set_show_stems(bool(show_stems))
+        except Exception:
+            pass
+        # keep menu states in sync
+        try:
+            if hasattr(self, 'act_view_stems') and self.act_view_stems:
+                self.act_view_stems.setChecked(bool(show_stems))
+            if hasattr(self, 'act_view_combined') and self.act_view_combined:
+                self.act_view_combined.setChecked(not bool(show_stems))
+        except Exception:
+            pass
 
     def load_session(self):
         # Use current file’s sidecar if a song is loaded; else prompt for JSON
@@ -2201,16 +2531,13 @@ class Main(QtWidgets.QMainWindow):
 
     def _edit_chord_at_time(self, t: float):
         """Rename the chord segment whose interval contains time t; persist and redraw."""
-        print(f"[DBG] _edit_chord_at_time(t={t:.3f})")
         idx = self._find_chord_index_at_time(float(t))
         if idx is None:
-            print("[DBG] _edit_chord_at_time: no chord at time")
             return
         cur = dict(self.last_chords[idx]) if (0 <= idx < len(self.last_chords)) else {}
         cur_label = str(cur.get('label', ''))
         text, ok = QtWidgets.QInputDialog.getText(self, "Change chord", "Chord label:", text=cur_label)
         if not ok:
-            print("[DBG] _edit_chord_at_time: cancelled")
             return
         cur['label'] = str(text)
         self.last_chords[idx] = cur
@@ -2222,7 +2549,6 @@ class Main(QtWidgets.QMainWindow):
             pass
         self.save_session()
         self.statusBar().showMessage(f"Chord updated → {text}", 1500)
-        print(f"[DBG] _edit_chord_at_time: updated idx={idx} → '{text}'")
 
     def _split_chord_at_time(self, t: float):
         """Split the chord containing time t so the two parts have equal beat counts;
@@ -2230,22 +2556,18 @@ class Main(QtWidgets.QMainWindow):
         The split is snapped to a beat strictly inside the chord span when possible.
         """
         t = float(t)
-        print(f"[DBG] _split_chord_at_time(request t={t:.3f})")
 
         # Find chord index at click time
         idx = self._find_chord_index_at_time(t)
         if idx is None:
-            print("[DBG] _split_chord_at_time: no chord at click time")
             return
         try:
             seg = dict(self.last_chords[idx])
             a = float(seg.get('start')); b = float(seg.get('end'))
             lab = seg.get('label')
         except Exception:
-            print("[DBG] _split_chord_at_time: bad segment data")
             return
         if not (b > a + 1e-6):
-            print("[DBG] _split_chord_at_time: zero/negative length segment; abort")
             return
 
         # Collect beats strictly inside (a, b)
@@ -2265,11 +2587,9 @@ class Main(QtWidgets.QMainWindow):
             k = int(np.ceil((m + 1) / 2.0))  # 1-based index
             k = max(1, min(m, k))
             split_t = float(inside[k - 1])
-            print(f"[DBG] _split_chord_at_time: interior beats m={m} → k={k} → split_t={split_t:.3f}")
         else:
             # Fallback: use the temporal midpoint
             split_t = 0.5 * (a + b)
-            print(f"[DBG] _split_chord_at_time: no interior beats → midpoint split_t={split_t:.3f}")
 
         # Keep strictly inside the span
         eps = 1e-3
@@ -2294,15 +2614,12 @@ class Main(QtWidgets.QMainWindow):
         self.wave.set_chords(self.last_chords)
         self.save_session()
         self.statusBar().showMessage(f"Chord split at {split_t:.2f}s", 1200)
-        print(f"[DBG] _split_chord_at_time: idx={idx} split at {split_t:.3f}s → two segments")
 
     def _join_chord_forward_at_time(self, t: float):
         """Join the chord at time t with the next chord if contiguous and within same bar."""
         t = float(t)
-        print(f"[DBG] _join_chord_forward_at_time(t={t:.3f})")
         idx = self._find_chord_index_at_time(t)
         if idx is None or idx + 1 >= len(self.last_chords):
-            print("[DBG] _join_chord_forward_at_time: no join candidate")
             return
         cur = self.last_chords[idx]
         nxt = self.last_chords[idx + 1]
@@ -2310,15 +2627,12 @@ class Main(QtWidgets.QMainWindow):
             cmid = 0.5 * (float(cur['start']) + float(cur['end']))
             nmid = 0.5 * (float(nxt['start']) + float(nxt['end']))
         except Exception:
-            print("[DBG] _join_chord_forward_at_time: bad segments")
             return
         bar_cur = self._bar_index_at_time(cmid)
         bar_nxt = self._bar_index_at_time(nmid)
         if bar_cur is None or bar_nxt is None or bar_cur != bar_nxt:
-            print("[DBG] _join_chord_forward_at_time: different bars")
             return
         if abs(float(cur['end']) - float(nxt['start'])) > 1e-3:
-            print("[DBG] _join_chord_forward_at_time: not contiguous")
             return
         merged = {
             'start': float(cur['start']),
@@ -2328,7 +2642,6 @@ class Main(QtWidgets.QMainWindow):
         self.last_chords = self.last_chords[:idx] + [merged] + self.last_chords[idx+2:]
         self.wave.set_chords(self.last_chords)
         self.save_session()
-        print(f"[DBG] _join_chord_forward_at_time: merged idx={idx} & idx={idx+1}")
 
     def _add_stem_row(self, name: str, array: np.ndarray):
         row = QtWidgets.QWidget(self)
@@ -2824,6 +3137,10 @@ class Main(QtWidgets.QMainWindow):
             self.player.stop(); self.player.close()
         self.player = LoopPlayer(fn)
         self.wave.set_player(self.player)
+        try:
+            self._refresh_transport_icon()
+        except Exception:
+            pass
         # Apply current UI rate to fresh player (keeps UI and audio consistent)
         self._rate_changed(self.rate_spin.value())
 
@@ -2997,6 +3314,10 @@ class Main(QtWidgets.QMainWindow):
         self.title_label.setText(name)
         self.player = LoopPlayer(path)
         self.wave.set_player(self.player)
+        try:
+            self._refresh_transport_icon()
+        except Exception:
+            pass
         # Apply current UI rate so playback speed matches the control
         self._rate_changed(self.rate_spin.value())
         # Align visual time 0 to first non‑silent audio

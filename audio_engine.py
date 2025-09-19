@@ -408,6 +408,15 @@ class LoopPlayer:
                 pos += take
             self._frames_out = pos
 
+    def is_playing(self) -> bool:
+        try:
+            return bool(self.stream is not None and self.stream.active)
+        except Exception:
+            return False
+
+    def is_paused(self) -> bool:
+        return not self.is_playing()
+
     def play(self):
         if self.stream is None:
             import sounddevice as sd
@@ -420,10 +429,12 @@ class LoopPlayer:
             )
         if not self.stream.active:
             self.stream.start()
+        self._playing = True
 
     def pause(self):
         if self.stream is not None and self.stream.active:
             self.stream.stop()
+        self._playing = False
 
     def start(self):
         if not self._playing:
@@ -438,5 +449,6 @@ class LoopPlayer:
     def close(self):
         try:
             self.stream.close()
+            self._playing = False
         except Exception:
             pass
