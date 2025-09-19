@@ -1405,58 +1405,62 @@ class ChordWorker(QThread):
             kwargs["downbeats"] = bd.get("downbeats", [])
             kwargs["beat_strengths"] = bd.get("beat_strengths", [])
 
-        # Always-on stem extraction (force run)
+        # Always-on stems: prefer cached; run Demucs only if missing or forced
         model = "htdemucs_6s"
         out_dir = self._song_cache_dir(audio_path)
         leaf = self._stem_leaf_dir(audio_path, out_dir, model)
         maybe_pre = None
+
         # Only force a fresh Demucs render if Main requested recompute
         try:
             force = bool(getattr(self.parent(), "_force_stems_recompute", False))
         except Exception:
             force = False
-        try:
-            if leaf.exists() and force:
-                self._log(f"Removing existing stems leaf to force render: {leaf}")
-                shutil.rmtree(leaf)
-        except Exception as e:
-            self._log_exc("Pre-clean leaf dir", e)
-        self._log(f"[ENTRY] estimate_chords: Demucs run (force={force}) for {audio_path}")        # Start Demucs and stream logs; always wait afterwards
-        self._log(f"Demucs starting: {model} → {out_dir}")
-        try:
-            worker = DemucsWorker(audio_path, str(out_dir), model)
-            # Forward every line to the main LogDock through ChordWorker.demucs_line
-            worker.line.connect(lambda s: self.demucs_line.emit(s))
-            # Block this worker thread until Demucs finishes
-            loop = QtCore.QEventLoop()
-            worker.done.connect(lambda _p: loop.quit())
-            worker.failed.connect(lambda _e: loop.quit())
-            worker.start()
-            loop.exec()
-        except Exception as e:
-            self._log_exc("Demucs run", e)
 
-        self._log("Demucs finished rendering. Verifying files…")
-        try:
-            maybe_pre = self._wait_for_stems(audio_path, out_dir, model=model, timeout_s=900)
-            if isinstance(maybe_pre, dict) and maybe_pre:
-                leaf_dir = self._stem_leaf_dir(audio_path, out_dir, model)
-                self.stems_ready.emit(str(leaf_dir))
-        except Exception as e:
-            self._log_exc("Wait for stems", e)
-            maybe_pre = None
+        # Determine if all six expected stems already exist in the leaf
+        expected = {"bass", "drums", "guitar", "piano", "other", "vocals"}
+        have_all = leaf.is_dir() and all((leaf / f"{n}.wav").exists() for n in expected)
 
-        if not maybe_pre:
-            # Last resort: attempt direct load and log outcome
+        # If cached stems are present and not forcing, load them and skip Demucs
+        if have_all and not force:
             try:
+                self._log(f"Reusing cached stems: {leaf}")
                 maybe_pre = load_stem_arrays(leaf)
-                if maybe_pre:
-                    self._log("Loaded stems via direct scan of leaf directory.")
+                if isinstance(maybe_pre, dict) and maybe_pre:
                     self.stems_ready.emit(str(leaf))
-                else:
-                    self._log("Direct leaf load returned empty dict.")
             except Exception as e:
-                self._log_exc("Direct leaf load", e)
+                self._log_exc("Load cached stems", e)
+                maybe_pre = None
+        else:
+            # Optional pre-clean if forcing
+            if force and leaf.exists():
+                try:
+                    self._log(f"Removing existing stems leaf to force render: {leaf}")
+                    shutil.rmtree(leaf)
+                except Exception as e:
+                    self._log_exc("Pre-clean leaf dir", e)
+            # Run Demucs and stream logs; then wait for files
+            self._log(f"[ENTRY] estimate_chords: Demucs run (force={force}) for {audio_path}")
+            self._log(f"Demucs starting: {model} → {out_dir}")
+            try:
+                worker = DemucsWorker(audio_path, str(out_dir), model)
+                worker.line.connect(lambda s: self.demucs_line.emit(s))
+                loop = QtCore.QEventLoop()
+                worker.done.connect(lambda _p: loop.quit())
+                worker.failed.connect(lambda _e: loop.quit())
+                worker.start()
+                loop.exec()
+            except Exception as e:
+                self._log_exc("Demucs run", e)
+
+            self._log("Demucs finished rendering. Verifying files…")
+            try:
+                maybe_pre = self._wait_for_stems(audio_path, out_dir, model=model, timeout_s=900)
+                if isinstance(maybe_pre, dict) and maybe_pre:
+                    leaf_dir = self._stem_leaf_dir(audio_path, out_dir, model)
+                    self.stems_ready.emit(str(leaf_dir))
+            except Exception as e:
+                self._log_exc("Wait for stems", e)
                 maybe_pre = None
 
         if not kwargs.get("stems") and isinstance(maybe_pre, dict) and maybe_pre:
@@ -1840,7 +1844,7 @@ class Main(QtWidgets.QMainWindow):
                 if w and w.isRunning():
                     w.requestInterruption()
                     w.quit()
-                    w.wait(-1)
+                    w.wait()
             except Exception:
                 pass
 
@@ -2096,6 +2100,82 @@ class Main(QtWidgets.QMainWindow):
             self._clear_cached_analysis(path, remove_stems=True)
             self._clear_stem_rows()
             self.start_chord_analysis(path)  # runs Demucs + waits + chords
+        except Exception:
+            pass
+
+    def _reset_state_for_new_track(self):
+        """Reset playback, workers, analysis caches, stems UI, and visuals so a new
+        audio load behaves like first run and the pipeline (beats→stems→chords) is fresh."""
+        # Stop playback
+        try:
+            if getattr(self, 'player', None) and hasattr(self.player, 'stop'):
+                self.player.stop()
+        except Exception:
+            pass
+
+        # Cancel background workers
+        for wname in ('beat_worker', 'chord_worker', 'key_worker'):
+            try:
+                w = getattr(self, wname, None)
+                if w and w.isRunning():
+                    w.requestInterruption(); w.quit(); w.wait(-1)
+                setattr(self, wname, None)
+            except Exception:
+                pass
+
+        # Clear in-memory analysis/session state
+        for attr, val in (
+            ('last_tempo', None),
+            ('last_beats', []),
+            ('last_bars', []),
+            ('last_key', None),
+            ('last_chords', []),
+            ('A', None), ('B', None)
+        ):
+            try:
+                setattr(self, attr, val)
+            except Exception:
+                pass
+
+        # Clear stems from engine and UI dock
+        try:
+            if getattr(self, 'player', None):
+                if hasattr(self.player, 'set_stems_arrays'):
+                    self.player.set_stems_arrays({})
+                setattr(self.player, 'stems_arrays', {})
+                setattr(self.player, 'stem_mute', {})
+        except Exception:
+            pass
+        try:
+            if hasattr(self, 'stems_layout') and self.stems_layout is not None:
+                while self.stems_layout.count():
+                    item = self.stems_layout.takeAt(0)
+                    w = item.widget()
+                    if w is not None:
+                        w.setParent(None); w.deleteLater()
+        except Exception:
+            pass
+
+        # Clear waveform overlays and chords
+        try:
+            if hasattr(self, 'wave') and self.wave is not None:
+                self.wave.set_beats([], [])
+                self.wave.set_chords([])
+                if hasattr(self.wave, 'clear_loop_visual'):
+                    self.wave.clear_loop_visual()
+                self.wave.selected_loop_id = None
+                self.wave.update()
+        except Exception:
+            pass
+
+        # Clear status and Demucs log
+        try:
+            self.statusBar().clearMessage()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, 'log_dock') and self.log_dock:
+                self.log_dock.clear()
         except Exception:
             pass
 
@@ -3122,7 +3202,31 @@ class Main(QtWidgets.QMainWindow):
         fn, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open Audio", start_dir, "Audio (*.wav *.mp3 *.flac *.m4a)")
         if not fn:
             return
+        # Fresh start for new track
+        self._reset_state_for_new_track()
+
+        # Update current path ASAP
         self.current_path = fn
+
+        # Respect "Always recompute on open" toggle by forcing stems/chords recompute
+        try:
+            self._force_stems_recompute = bool(self.actAlwaysRecompute.isChecked())
+        except Exception:
+            pass
+
+        # Ensure Demucs Log dock is visible for this run
+        try:
+            if not hasattr(self, 'log_dock') or self.log_dock is None:
+                self.log_dock = LogDock(parent=self)
+                self.addDockWidget(Qt.BottomDockWidgetArea, self.log_dock)
+            self.log_dock.setWindowTitle('Demucs Log')
+            self.log_dock.show(); self.log_dock.raise_(); self.log_dock.clear()
+        except Exception:
+            pass
+
+        # Kick the integrated pipeline: ChordWorker will do beats → Demucs (wait) → chords
+        self.start_chord_analysis(self.current_path)
+
         # Clear any active loop visuals when opening a file
         if hasattr(self, "wave") and self.wave:
             self.wave.clear_loop_visual()
@@ -3200,7 +3304,7 @@ class Main(QtWidgets.QMainWindow):
         if hasattr(self, "chord_worker") and self.chord_worker and self.chord_worker.isRunning():
             self.chord_worker.requestInterruption()
             self.chord_worker.quit()
-            self.chord_worker.wait(-1)
+            self.chord_worker.wait()
         cw = ChordWorker(path)
         cw.setParent(self)
         # Ensure Demucs logs are visible and wire stem loading
