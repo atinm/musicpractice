@@ -955,7 +955,11 @@ class WaveformView(QtWidgets.QWidget):
                 if mins is not None and maxs is not None:
                     mid = y_cursor + row_h // 2
                     amp = max(1, int(row_h * 0.45))
-                    p.setPen(QtGui.QPen(QtGui.QColor(0, 180, 255)))
+                    # Envelope color: lighter when muted
+                    if muted:
+                        p.setPen(QtGui.QPen(QtGui.QColor(170, 190, 210)))  # light grey-blue for muted
+                    else:
+                        p.setPen(QtGui.QPen(QtGui.QColor(0, 180, 255)))   # bright cyan for active
                     L = min(len(mins), max(0, x1_seg - x0_seg), w - x0_seg)
                     for i in range(L):
                         x = x0_seg + i
@@ -2328,38 +2332,60 @@ class Main(QtWidgets.QMainWindow):
 
     def _add_stem_row(self, name: str, array: np.ndarray):
         row = QtWidgets.QWidget(self)
-        lay = QtWidgets.QHBoxLayout(row)
-        lay.setContentsMargins(6, 2, 6, 2)
-        lay.setSpacing(8)
+        vlay = QtWidgets.QVBoxLayout(row)
+        vlay.setContentsMargins(6, 4, 6, 6)
+        vlay.setSpacing(4)
 
-        # Mute
+        # --- Top line: Label (left) + Mute (right) ---
+        top = QtWidgets.QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(8)
+
+        lbl = QtWidgets.QLabel(str(name), row)
+        f = lbl.font()
+        f.setBold(True)
+        lbl.setFont(f)
+        top.addWidget(lbl, 0, Qt.AlignVCenter | Qt.AlignLeft)
+        top.addStretch(1)
+
         chk = QtWidgets.QCheckBox("Mute", row)
         chk.setChecked(False)
-        lay.addWidget(chk)
+        top.addWidget(chk, 0, Qt.AlignVCenter | Qt.AlignRight)
+        vlay.addLayout(top)
 
-        # Label
-        lbl = QtWidgets.QLabel(str(name), row)
-        lbl.setMinimumWidth(70)
-        lay.addWidget(lbl)
+        # --- Second line: 0  [==== slider with ticks ====]  100 ---
+        slider_line = QtWidgets.QHBoxLayout()
+        slider_line.setContentsMargins(0, 0, 0, 0)
+        slider_line.setSpacing(6)
 
-        # Volume (0..100 → 0..1 linear)
+        lbl0 = QtWidgets.QLabel("0", row)
+        lbl100 = QtWidgets.QLabel("100", row)
+
         sld = QtWidgets.QSlider(Qt.Horizontal, row)
         sld.setRange(0, 100)
         sld.setValue(100)
-        sld.setFixedWidth(120)
-        lay.addWidget(sld)
+        sld.setSingleStep(1)
+        sld.setPageStep(5)
+        sld.setTracking(True)
+        sld.setTickPosition(QtWidgets.QSlider.TicksBelow)
+        sld.setTickInterval(10)
+
+        slider_line.addWidget(lbl0, 0, Qt.AlignVCenter)
+        slider_line.addWidget(sld, 1)
+        slider_line.addWidget(lbl100, 0, Qt.AlignVCenter)
+        vlay.addLayout(slider_line)
 
         stem_key = str(name)
 
         def _apply_mute(m: bool):
             m = bool(m)
-            # update engine
+            # Update engine (if supported)
             try:
-                if self.player and hasattr(self.player, "set_stem_mute"):
-                    self.player.set_stem_mute(stem_key, bool(m))
+                if self.player and hasattr(self.player, 'set_stem_mute'):
+                    self.player.set_stem_mute(stem_key, m)
             except Exception:
                 pass
-            # update public mute map so WaveformView._is_stem_muted can read it
+            # Update public mute map so WaveformView can dim the background
             try:
                 if self.player is not None:
                     mute_map = getattr(self.player, 'stem_mute', None)
@@ -2369,11 +2395,11 @@ class Main(QtWidgets.QMainWindow):
                     setattr(self.player, 'stem_mute', mute_map)
             except Exception:
                 pass
-            # repaint the main waveform so the stem row greys out immediately
+            # Repaint the main waveform immediately
             try:
-                if hasattr(self, "wave") and self.wave is not None:
+                if hasattr(self, 'wave') and self.wave is not None:
                     self.wave.update()
-                    QtCore.QTimer.singleShot(0, self.wave.update)  # ensure a deferred paint too
+                    QtCore.QTimer.singleShot(0, self.wave.update)
             except Exception:
                 pass
 
@@ -2387,8 +2413,11 @@ class Main(QtWidgets.QMainWindow):
 
         chk.toggled.connect(_apply_mute)
         sld.valueChanged.connect(_apply_gain)
+
+        # Init visual/engine state
         _apply_gain(100)
 
+        # Add row to the dock's layout
         self.stems_layout.addWidget(row)
 
     def _sync_saved_loops_to_view(self):
