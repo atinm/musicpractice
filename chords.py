@@ -117,6 +117,39 @@ def _use_flats_for_key(tonic_idx: int, mode: str) -> bool:
 def _pc_name(pc: int, use_flats: bool) -> str:
     return FLAT_NAMES[pc] if use_flats else SHARP_NAMES[pc]
 
+# --- Key hint parser ---
+def _parse_key_hint(key_hint) -> tuple[int | None, str | None]:
+    """Return (tonic_idx, mode) from a flexible key_hint dict.
+    Accepts keys like: 'tonic_idx' (int), 'tonic_name'/'tonic' (str), and 'mode'/'scale' ('maj'/'major'/'min'/'minor').
+    Returns (None, None) if unusable.
+    """
+    if not isinstance(key_hint, dict):
+        return None, None
+    tonic_idx = None
+    mode = None
+    try:
+        if 'tonic_idx' in key_hint and key_hint['tonic_idx'] is not None:
+            tonic_idx = int(key_hint['tonic_idx']) % 12
+        else:
+            name = key_hint.get('tonic_name') or key_hint.get('tonic')
+            if isinstance(name, str):
+                lookup = {
+                    'C':0,'C#':1,'Db':1,'D':2,'D#':3,'Eb':3,'E':4,'F':5,'F#':6,'Gb':6,
+                    'G':7,'G#':8,'Ab':8,'A':9,'A#':10,'Bb':10,'B':11
+                }
+                if name.strip() in lookup:
+                    tonic_idx = lookup[name.strip()]
+        m = key_hint.get('mode') or key_hint.get('scale')
+        if isinstance(m, str):
+            m = m.strip().lower()
+            if m.startswith('maj'):
+                mode = 'maj'
+            elif m.startswith('min'):
+                mode = 'min'
+    except Exception:
+        pass
+    return tonic_idx, mode
+
 def viterbi(log_probs, trans=0.995):
     """
     log_probs: (N_states, T) framewise log-likelihoods
@@ -362,7 +395,7 @@ def _bass_root_logits(bass_y: np.ndarray | None, sr: int, hop: int = 2048,
     # Softmax-ish logits per time over PCs
     Cb = Cb + 1e-6
     Cb = Cb / (np.linalg.norm(Cb, axis=0, keepdims=True) + 1e-12)
-    Cb = Cb ** 1.5          # sharpen
+    Cb = Cb ** 2.5          # sharpen more (clearer bass roots)
     Cb = Cb / (np.sum(Cb, axis=0, keepdims=True) + 1e-12)
     logits = np.log(Cb + 1e-9)
     tvec = np.asarray(beats_sec, dtype=float) if beats_sec else times
@@ -643,8 +676,8 @@ def estimate_chords_stem_aware(
     beat_strengths: list[float] | None = None,
     stems: dict | None = None,
     use_key_prior: bool = True,
-    alpha_harm: float = 0.50,
-    beta_bass: float = 0.50,
+    alpha_harm: float = 0.40,
+    beta_bass: float = 0.70,
     weights: dict | None = None,
     log_fn=None,
     style: str = "default",
@@ -674,7 +707,7 @@ def estimate_chords_stem_aware(
     except Exception:
         _style_key = 'rock_pop'
     style = style_map.get(_style_key, 'rock_pop')
-
+    _use_fl = False
     y_stereo, sr_loaded = _load_audio_any(audio_path)
     sr = sr_loaded if sr is None else int(sr)
     # Build mono reference at target sr
@@ -756,13 +789,390 @@ def estimate_chords_stem_aware(
                                        frame_times=frame_times,
                                        beats_sec=beats if beats else None)
 
-    if bass_logits.shape[1] and (beats or chroma.shape[1] == bass_logits.shape[1]):
-        T = min(log_harm.shape[1], bass_logits.shape[1])
-        log_harm = log_harm[:, :T]
-        bass_logits = bass_logits[:, :T]
-        log_bass = np.vstack([bass_logits for _ in range(5)])  # 5 families * 12 roots
-    else:
-        log_bass = np.zeros_like(log_harm)
+    # --- Bass-root-first decoding path ---
+    use_bass_first = bass_logits.shape[1] > 0
+    if use_bass_first:
+        # Align lengths with harmonic emissions
+        T_align = min(log_harm.shape[1], bass_logits.shape[1])
+        log_h = log_harm[:, :T_align]
+        log_b = bass_logits[:, :T_align]
+        times = times[:T_align]
+        if callable(log_fn):
+            try:
+                log_fn(f"DBG[bass_first]: T_align={T_align}, beats={len(beats or [])}, log_h={log_h.shape}, log_b={log_b.shape}, times={len(times)}")
+            except Exception:
+                pass
+
+        # Augment bass logits to account for bass playing the fifth instead of the root (common in reggae/rock)
+        # Mix a portion of probability mass from ±7 semitones (perfect fifth up/down) into each class.
+        try:
+            with np.errstate(over='ignore'):
+                pb_b = np.exp(log_b - np.max(log_b, axis=0, keepdims=True))
+                pb_b /= (np.sum(pb_b, axis=0, keepdims=True) + 1e-12)
+            def _roll(x, k):
+                return np.roll(x, k, axis=0)
+            eps = 0.25  # share from fifths
+            pb_aug = (1.0 - eps) * pb_b + (eps/2.0) * (_roll(pb_b, +7) + _roll(pb_b, -7))
+            log_b = np.log(pb_aug + 1e-9)
+        except Exception:
+            pass
+
+        # Build a surrogate "bass" from the harmonic mix (guitar/piano/other) for early bars without bass
+        try:
+            # Reuse the already computed y_harm (mono acc mix) and create logits the same way as bass
+            harm_logits_full, _ = _bass_root_logits(y_harm, sr, hop=hop,
+                                                    frame_times=frame_times,
+                                                    beats_sec=beats if beats else None)
+            log_b_harm = harm_logits_full[:, :T_align] if harm_logits_full.shape[1] >= T_align else harm_logits_full
+            if log_b_harm.shape[1] != T_align:
+                # pad with minimal uniform evidence if needed
+                pad_T = T_align - log_b_harm.shape[1]
+                if pad_T > 0:
+                    log_b_harm = np.pad(log_b_harm, ((0,0),(0,pad_T)), mode='edge')
+        except Exception:
+            log_b_harm = None
+
+        # Confidence gating: if bass is weak, fall back to harmonic-root evidence for those beats
+        TH_CONF = 0.40
+        with np.errstate(over='ignore'):
+            pb = np.exp(log_b - np.max(log_b, axis=0, keepdims=True)); pb /= (np.sum(pb, axis=0, keepdims=True) + 1e-12)
+        maxpb = np.max(pb, axis=0)
+        if log_b_harm is not None and log_b_harm.shape[1] == T_align:
+            with np.errstate(over='ignore'):
+                ph = np.exp(log_b_harm - np.max(log_b_harm, axis=0, keepdims=True)); ph /= (np.sum(ph, axis=0, keepdims=True) + 1e-12)
+            maxph = np.max(ph, axis=0)
+            # Use harmonic surrogate where bass is not yet confident; otherwise keep bass
+            use_harm_mask = (maxpb < TH_CONF) & (maxph >= (TH_CONF - 0.05))
+            if np.any(use_harm_mask):
+                log_b[:, use_harm_mask] = log_b_harm[:, use_harm_mask]
+                pb[:, use_harm_mask] = ph[:, use_harm_mask]
+                maxpb[use_harm_mask] = maxph[use_harm_mask]
+
+        # Compute current top bass root per beat (after augmentation/merge)
+        top_pc = np.argmax(pb, axis=0)            # (T_align,)
+        top_conf = maxpb.copy()                    # (T_align,)
+
+        # Add debug on bass confidence stats
+        if callable(log_fn):
+            try:
+                q = np.quantile(top_conf, [0.25, 0.50, 0.75]).tolist()
+                log_fn(f"DBG[bass_first]: top_conf quartiles={q}")
+            except Exception:
+                pass
+
+        # Detect late bass entrance: first confident beat
+        t0 = int(np.argmax(top_conf >= TH_CONF)) if np.any(top_conf >= TH_CONF) else 0
+        # Snap t0 forward to the next downbeat if available to avoid splitting inside a bar
+        if beats and downbeats:
+            beat_arr = np.asarray(beats)[:T_align]
+            down_arr = np.asarray(downbeats)
+            try:
+                t0_time = times[t0]
+                dn_after = down_arr[down_arr >= t0_time]
+                if dn_after.size:
+                    t0_time = float(dn_after[0])
+                    idx = np.searchsorted(beat_arr, t0_time, side='left')
+                    t0 = int(np.clip(idx, 0, T_align-1))
+            except Exception:
+                pass
+
+        # 1) Root Viterbi (12 states) with key/style prior on roots only
+        # If bass enters late (t0>0), run Viterbi on t0..end, then backfill 0..t0-1 with first root.
+        root_log_emissions = log_b.copy()
+        # (A) Blend in harmonic root evidence when bass confidence is low
+        try:
+            # Build per-root harmonic emissions by taking max over families at each root
+            # log_h has shape (60, T_align): 5 families × 12 roots
+            harm_root = np.empty((12, T_align), dtype=np.float64)
+            for r in range(12):
+                harm_root[r, :] = np.max(log_h[r::12, :], axis=0)
+            # Confidence-dependent blend: w_bass in [0.30, 1.0]
+            w_bass = 0.30 + 1.40 * np.clip(top_conf, 0.0, 1.0)
+            w_bass = np.clip(w_bass, 0.30, 1.0)  # shape (T_align,)
+            # Expand to (12,T)
+            root_log_emissions = (w_bass[None, :] * root_log_emissions) + ((1.0 - w_bass)[None, :] * harm_root)
+            if callable(log_fn):
+                try:
+                    log_fn(f"DBG[bass_first]: harm-blend median_w_bass={float(np.median(w_bass)):.3f} low_pct={(float(np.mean(w_bass<0.6))*100):.1f}%")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        if use_key_prior:
+            try:
+                hk_tonic, hk_mode = _parse_key_hint(key_hint)
+                if hk_tonic is not None and hk_mode in ('maj','min'):
+                    tonic_idx_r, mode_r = hk_tonic, hk_mode
+                else:
+                    tonic_idx_r, mode_r = _estimate_key_from_chroma(chroma[:, :T_align])
+                scale = {0,2,4,5,7,9,11} if mode_r == 'maj' else {0,2,3,5,7,8,10}
+                rel = np.fromiter((((r - tonic_idx_r) % 12) for r in range(12)), dtype=int)
+                in_scale_mask = np.isin(rel, list(scale)).astype(np.float32)
+                base_in  = 0.06 if style != 'jazz' else 0.03
+                base_out = 0.08 if style != 'jazz' else 0.00
+                root_log_emissions += in_scale_mask[:, None] * base_in
+                root_log_emissions -= (1.0 - in_scale_mask)[:, None] * base_out
+                # Cadence push I/IV/V for reggae/rock_pop and suppress III
+                if mode_r == 'maj' and style in ('rock_pop','reggae'):
+                    I  = int(tonic_idx_r % 12)
+                    IV = int((tonic_idx_r + 5) % 12)
+                    V  = int((tonic_idx_r + 7) % 12)
+                    root_log_emissions[I,  :] += (0.35 if style=='rock_pop' else 0.40)
+                    root_log_emissions[IV, :] += (0.25 if style=='rock_pop' else 0.30)
+                    root_log_emissions[V,  :] += (0.33 if style=='rock_pop' else 0.40)
+                    # Additional suppression of mediant (III) in major for rock/reggae
+                    III = int((tonic_idx_r + 4) % 12)
+                    root_log_emissions[III, :] -= 0.06
+                    # (B) Suppress leading tone (VII) in major for rock/reggae
+                    VII = int((tonic_idx_r + 11) % 12)
+                    root_log_emissions[VII, :] -= 0.12
+            except Exception:
+                pass
+
+        # Cadence heuristic: in 4/4, encourage V on the last beat of a bar and I on the downbeat
+        try:
+            if beats and downbeats and mode_r == 'maj' and style in ('rock_pop','reggae'):
+                I  = int(tonic_idx_r % 12)
+                V  = int((tonic_idx_r + 7) % 12)
+                beat_arr = np.asarray(beats)[:T_align]
+                down_arr = np.asarray(downbeats)
+                # Map each beat index to its bar position (0..3) by counting beats since last downbeat
+                # Assume units_per_bar = 4
+                db_idx = np.searchsorted(beat_arr, down_arr, side='left')
+                db_set = set(int(i) for i in db_idx if 0 <= i < T_align)
+                last_in_bar = set(int(i+3) for i in db_idx if 0 <= i+3 < T_align)
+                for i in range(T_align):
+                    if i in db_set:
+                        root_log_emissions[I, i] += 0.10  # push I on bar start
+                    if i in last_in_bar:
+                        root_log_emissions[V, i] += 0.12  # push V on beat 4
+        except Exception:
+            pass
+
+        # (C) Debug: show first few blended root emissions
+        if callable(log_fn):
+            try:
+                rr0 = ",".join(f"{float(x):.2f}" for x in root_log_emissions[:,0][:5])
+                log_fn(f"DBG[bass_first]: root_emit_col0(first5)={rr0}")
+            except Exception:
+                pass
+
+        # Bass-driven nudge: when bass top root is confident, favor that root explicitly
+        try:
+            BASS_STRONG = 0.40
+            NUDGE = 0.28 if style in ('rock_pop','reggae') else 0.16
+            for i in range(T_align):
+                if top_conf[i] >= BASS_STRONG:
+                    r = int(top_pc[i]) % 12
+                    root_log_emissions[r, i] += NUDGE
+        except Exception:
+            pass
+
+        # Track bass-change points to relax stay on clear changes
+        bass_change = np.zeros(T_align, dtype=np.float32)
+        try:
+            # Require either both strong OR a clear margin flip on current frame
+            MARGIN = 0.08  # prob advantage of new top over previous top
+            for i in range(1, T_align):
+                changed = (int(top_pc[i]) % 12 != int(top_pc[i-1]) % 12)
+                if not changed:
+                    continue
+                strong_flip = (top_conf[i] >= BASS_STRONG and top_conf[i-1] >= BASS_STRONG)
+                try:
+                    prev_pc = int(top_pc[i-1]) % 12
+                    margin_flip = (pb[int(top_pc[i]) % 12, i] - pb[prev_pc, i]) >= MARGIN
+                except Exception:
+                    margin_flip = False
+                if strong_flip or margin_flip:
+                    bass_change[i] = 1.0
+        except Exception:
+            pass
+        # Root stay-prob by beats: allow changes more on downbeats/strong beats
+        stay_r = np.full(T_align, 0.996, dtype=np.float64)
+        if beats:
+            down_set = set(np.round(np.asarray(downbeats or []) * 1000).astype(int).tolist())
+            beat_ms = np.round(np.asarray(beats)[:T_align] * 1000).astype(int).tolist()
+            strengths = (beat_strengths or [1.0]*len(beat_ms))[:T_align]
+            for i, (bm, s) in enumerate(zip(beat_ms, strengths)):
+                is_down = bm in down_set
+                base = 0.985 if is_down else 0.996
+                stay_i = base - 0.10 * float(s)
+                # If bass clearly changed roots here, relax stay more so we can switch
+                if 'bass_change' in locals() and bass_change[i] > 0:
+                    stay_i -= 0.10  # stronger relaxation on change beats
+                stay_r[i] = float(np.clip(stay_i, 0.90, 0.998))
+        if t0 <= 0:
+            root_path = viterbi_timevarying(root_log_emissions, stay_r)
+        else:
+            # Run Viterbi only on the confident tail and backfill the head with the first root
+            root_tail = viterbi_timevarying(root_log_emissions[:, t0:], stay_r[t0:])
+            root_path = np.empty(T_align, dtype=np.int16)
+            root_path[t0:] = root_tail
+            root_path[:t0] = root_tail[0]
+        if callable(log_fn):
+            try:
+                rp_head = ",".join(str(int(x)) for x in root_path[:8])
+                log_fn(f"DBG[bass_first]: root_path len={len(root_path)} head={rp_head}")
+            except Exception:
+                pass
+        # Debug: show bass_change indices
+        if callable(log_fn):
+            try:
+                ch_idx = ",".join(str(i) for i in np.nonzero(bass_change)[0][:12].tolist())
+                log_fn(f"DBG[bass_first]: bass_change idx=({ch_idx}) strong_thresh=0.52")
+            except Exception:
+                pass
+
+        # 2) Family Viterbi (5 states) with emissions taken at chosen root per time
+        fam_emissions = np.zeros((5, T_align), dtype=np.float64)
+        for t in range(T_align):
+            r = int(root_path[t]) % 12
+            for fam in range(5):
+                fam_emissions[fam, t] = log_h[fam*12 + r, t]
+        # Add style/key family priors (subset of key_bonus that depends on family, at chosen roots)
+        try:
+            fam_bonus = np.zeros_like(fam_emissions)
+            # Reuse previously computed style/key context
+            hk_tonic, hk_mode = _parse_key_hint(key_hint)
+            if hk_tonic is not None and hk_mode in ('maj','min'):
+                tonic_idx_f, mode_f = hk_tonic, hk_mode
+            else:
+                tonic_idx_f, mode_f = _estimate_key_from_chroma(chroma[:, :T_align])
+            I  = int(tonic_idx_f % 12); IV = (I + 5) % 12; V = (I + 7) % 12
+            II = (I + 2) % 12; VI = (I + 9) % 12
+            if style == 'blues':
+                for t in range(T_align):
+                    r = int(root_path[t])
+                    if r in (I, IV, V):
+                        fam_bonus[2, t] += 0.20  # dom7 on I/IV/V
+                fam_bonus[3, :] -= 0.10
+            elif style == 'reggae' and mode_f == 'maj':
+                for t in range(T_align):
+                    r = int(root_path[t])
+                    if r == I:  fam_bonus[0, t] += 0.38
+                    if r == IV: fam_bonus[0, t] += 0.28
+                    if r == V:  fam_bonus[0, t] += 0.28
+                    if r == II: fam_bonus[4, t] += 0.10
+                    if r == VI: fam_bonus[4, t] += 0.10
+                    if r == V:
+                        fam_bonus[2, t] += 0.15  # prefer V7 a bit more on V
+                        fam_bonus[0, t] -= 0.04  # discourage plain V triad slightly
+                fam_bonus[2, :] -= 0.05; fam_bonus[3, :] -= 0.06
+            elif style == 'jazz':
+                if mode_f == 'maj':
+                    fam_bonus[4, :] += 0.10  # general m7 favor
+                    fam_bonus[3, :] += 0.08  # maj7 favor
+                else:
+                    fam_bonus[4, :] += 0.06
+                    fam_bonus[2, :] += 0.10
+            else:  # rock_pop
+                if mode_f == 'maj':
+                    for t in range(T_align):
+                        r = int(root_path[t])
+                        if r == I:  fam_bonus[0, t] += 0.35
+                        if r == IV: fam_bonus[0, t] += 0.25
+                        if r == V:  fam_bonus[0, t] += 0.28
+                        if r == V:  fam_bonus[2, t] += 0.08
+                    fam_bonus[3, :] -= 0.08
+        except Exception:
+            fam_bonus = 0.0
+        fam_emissions = fam_emissions + fam_bonus
+
+        # Family stay-prob (favor staying within a bar, changes on downbeats/strong beats)
+        stay_f = np.full(T_align, 0.997, dtype=np.float64)
+        if beats:
+            down_set = set(np.round(np.asarray(downbeats or []) * 1000).astype(int).tolist())
+            beat_ms = np.round(np.asarray(beats)[:T_align] * 1000).astype(int).tolist()
+            strengths = (beat_strengths or [1.0]*len(beat_ms))[:T_align]
+            for i, (bm, s) in enumerate(zip(beat_ms, strengths)):
+                is_down = bm in down_set
+                base = 0.988 if is_down else 0.997
+                stay_i = np.clip(base - 0.12 * float(s), 0.93, 0.999)
+                stay_f[i] = stay_i
+        fam_path = viterbi_timevarying(fam_emissions, stay_f)
+        if callable(log_fn):
+            try:
+                fp_head = ",".join(str(int(x)) for x in fam_path[:8])
+                log_fn(f"DBG[bass_first]: fam_path len={len(fam_path)} head={fp_head}")
+            except Exception:
+                pass
+
+        # Map (root, family) → label (compute local enharmonic preference)
+        try:
+            tonic_idx2, mode2 = _parse_key_hint(key_hint)
+            if tonic_idx2 is None or mode2 not in ('maj','min'):
+                tonic_idx2, mode2 = _estimate_key_from_chroma(chroma[:, :T_align])
+            _use_fl = _use_flats_for_key(int(tonic_idx2), mode2)
+        except Exception:
+            _use_fl = False
+
+        def _fam_label(root_pc: int, fam: int, _use_flats_bound=_use_fl) -> str:
+            root = _pc_name(root_pc, _use_flats_bound)
+            return (
+                root if fam == 0 else
+                f"{root}m" if fam == 1 else
+                f"{root}7" if fam == 2 else
+                f"{root}maj7" if fam == 3 else
+                f"{root}m7"
+            )
+
+        labels = [_fam_label(int(r), int(f)) for r, f in zip(root_path, fam_path)]
+
+        # Confidence = margin vs. second-best family at chosen root
+        best = np.max(fam_emissions, axis=0)
+        srt = np.sort(fam_emissions, axis=0)
+        margin = best - srt[-2]
+        avg_margin = float(np.median(margin)) if margin.size else 0.0
+
+        # Collapse runs into segments
+        segments = []
+        start_idx = 0
+        for i in range(1, len(labels) + 1):
+            if i == len(labels) or labels[i] != labels[start_idx]:
+                segments.append({
+                    'start': float(times[start_idx]),
+                    'end': float(times[min(i, len(times)-1)]),
+                    'label': labels[start_idx],
+                    'conf': float(np.median(margin[start_idx:i])) if i > start_idx else float(margin[start_idx]),
+                })
+                start_idx = i
+        if callable(log_fn):
+            try:
+                t0 = times[0] if len(times) else 0.0
+                t1 = times[-1] if len(times) else 0.0
+                log_fn(f"DBG[bass_first]: labels={len(labels)}, segments={len(segments)}, time_span=[{t0:.2f},{t1:.2f}]")
+            except Exception:
+                pass
+
+        # Post passes
+        segments = _refine_minor_sevenths(segments, audio_path)
+        segments = _root_sanity_pass(segments, audio_path, use_flats=_use_fl)
+        if beats:
+            segments = [dict(s, beat_sync=True) for s in segments]
+        # Log debug summary: roots-only and full labels
+        try:
+            from collections import Counter
+            def _root_of(lbl: str) -> str:
+                r = lbl[:1]
+                if len(lbl) >= 2 and lbl[1] in ('#','b'):
+                    r = lbl[:2]
+                return r
+            roots = [_root_of(s['label']) for s in segments]
+            fams  = [s['label'][len(_root_of(s['label'])):] or 'maj' for s in segments]
+            cnt_roots = Counter(roots)
+            cnt_labels = Counter([s['label'] for s in segments])
+            top_roots = ", ".join(f"{k}:{v}" for k, v in cnt_roots.most_common(5))
+            top_labels = ", ".join(f"{k}:{v}" for k, v in cnt_labels.most_common(5))
+            msg = f"bass_first: roots → {top_roots} | labels → {top_labels} | segs={len(segments)}"
+            if callable(log_fn):
+                log_fn(msg)
+            else:
+                print(msg)
+        except Exception:
+            pass
+        return segments
+    # --- Bass-root emphasis: favor top-2 bass pitch classes per beat ---
+    # (rest of original code follows as fallback)
     # --- Bass-root emphasis: favor top-2 bass pitch classes per beat ---
     bass_boost = np.zeros_like(log_harm)
     if bass_logits.shape[1] == log_harm.shape[1]:
@@ -774,24 +1184,48 @@ def estimate_chords_stem_aware(
                 continue
             for fam in range(5):  # 0 maj,1 min,2 7,3 maj7,4 m7
                 for r in roots:
-                    bass_boost[fam*12 + r, t] += 0.6  # strong push
-        # Mild penalty to non-top-2 roots so we don't make everything flat
-        bass_boost -= 0.3
+                    bass_boost[fam*12 + r, t] += 0.7  # stronger push
+        # Stronger penalty to non-top-2 roots
+        bass_boost -= 0.4
     # else: leave bass_boost zeros if we couldn't align times
 
     # Optional key prior – genre aware
     key_bonus = np.zeros_like(log_harm)
     if use_key_prior:
         try:
-            tonic_idx, mode = _estimate_key_from_chroma(chroma)
+            # Prefer UI-provided key_hint if available
+            hk_tonic, hk_mode = _parse_key_hint(key_hint)
+            if hk_tonic is not None and hk_mode in ('maj','min'):
+                tonic_idx, mode = hk_tonic, hk_mode
+                if callable(log_fn):
+                    try: log_fn(f"key_prior: using key_hint tonic={tonic_idx} mode={mode}")
+                    except Exception: pass
+            else:
+                tonic_idx, mode = _estimate_key_from_chroma(chroma)
+                if callable(log_fn):
+                    try: log_fn(f"key_prior: estimated tonic={tonic_idx} mode={mode}")
+                    except Exception: pass
             # Slightly softer key lock for jazz (allows modulations)
-            base_scale_w = 0.03 if style == 'jazz' else 0.05
+            base_scale_w = 0.03 if style == 'jazz' else 0.06
+            base_out_w   = 0.00 if style == 'jazz' else 0.08
             scale = {0,2,4,5,7,9,11} if mode == 'maj' else {0,2,3,5,7,8,10}
+            rel = np.fromiter((((r - tonic_idx) % 12) for r in range(12)), dtype=int)
+            in_mask = np.isin(rel, list(scale))
+            out_mask = ~in_mask
             for fam in range(5):
-                for r in range(12):
-                    if ((r - tonic_idx) % 12) in scale:
-                        key_bonus[fam*12 + r, :] += base_scale_w
-
+                row = fam*12
+                key_bonus[row:row+12, :] += in_mask[:, None] * base_scale_w
+                if base_out_w > 0.0:
+                    key_bonus[row:row+12, :] -= out_mask[:, None] * base_out_w
+            # Extra: suppress mediant (III) in major for rock/reggae to avoid false iii
+            if mode == 'maj' and style in ('rock_pop','reggae'):
+                III = int((tonic_idx + 4) % 12)
+                key_bonus[0*12 + III, :] -= 0.06
+                key_bonus[1*12 + III, :] -= 0.06
+                key_bonus[2*12 + III, :] -= 0.06
+                key_bonus[3*12 + III, :] -= 0.06
+                key_bonus[4*12 + III, :] -= 0.06
+            # --- rest of style/genre specific pushes ---
             I  = int(tonic_idx % 12)
             II = int((tonic_idx + 2) % 12)
             III= int((tonic_idx + 4) % 12)
@@ -818,6 +1252,9 @@ def estimate_chords_stem_aware(
                     # De-emphasize blanket dom7 and maj7 away from cadence
                     key_bonus[2*12:(2*12)+12, :] -= 0.05
                     key_bonus[3*12:(3*12)+12, :] -= 0.05
+                    # In reggae, lean even more on bass root evidence
+                    beta_bass *= 1.2
+                    alpha_harm *= 0.9
             elif style == 'jazz':
                 # Jazz: prefer 7th chords; emphasize ii–V–I and soften plain triads
                 if mode == 'maj':
@@ -847,11 +1284,18 @@ def estimate_chords_stem_aware(
                         key_bonus[0*12 + IV, t] += 0.18
                         key_bonus[0*12 + V,  t] += 0.20
                         key_bonus[2*12 + V,  t] += 0.06  # light V7 boost
+                    # Rock/pop: bass is still strong, but balance with harmony
+                    beta_bass *= 1.1
+                    alpha_harm *= 0.95
         except Exception:
             pass
     if callable(log_fn):
         try:
-            log_fn(f"key: {key_hint.get('pretty', 'unknown')}, style: {style}")
+            try:
+                kh_pretty = (key_hint or {}).get('pretty', 'unknown')
+            except Exception:
+                kh_pretty = 'unknown'
+            log_fn(f"key: {kh_pretty}, style: {style}")
         except Exception:
             pass
 
@@ -867,16 +1311,18 @@ def estimate_chords_stem_aware(
         strengths = beat_strengths or [1.0]*len(beat_ms)
         for i, (bm, s) in enumerate(zip(beat_ms, strengths)):
             is_down = bm in down_set
-            base = 0.994 if is_down else 0.997
-            stay_i = np.clip(base - 0.08 * float(s), 0.94, 0.999)
+            base = 0.988 if is_down else 0.997
+            stay_i = np.clip(base - 0.12 * float(s), 0.93, 0.999)
             if i < T:
                 stay[i] = stay_i
 
     states = viterbi_timevarying(log_probs, stay)
 
-    # Enharmonic naming by key
-    tonic_idx, mode = _estimate_key_from_chroma(chroma)
-    use_flats = _use_flats_for_key(tonic_idx, mode)
+    # Enharmonic naming by key, prefer key_hint if available
+    tonic_idx2, mode2 = _parse_key_hint(key_hint)
+    if tonic_idx2 is None or mode2 not in ('maj','min'):
+        tonic_idx2, mode2 = _estimate_key_from_chroma(chroma)
+    use_flats = _use_fl
 
     def _state_to_label(s: int) -> str:
         fam = s // 12
@@ -1014,9 +1460,11 @@ def estimate_chords(
                 stay[i] = stay_i
     states = viterbi_timevarying(log_probs, stay)
 
-    # Choose enharmonics based on estimated key
-    tonic_idx, mode = _estimate_key_from_chroma(chroma)
-    use_flats = _use_flats_for_key(tonic_idx, mode)
+    # Choose enharmonics based on key_hint if available, else estimated key
+    tonic_idx2, mode2 = _parse_key_hint(key_hint)
+    if tonic_idx2 is None or mode2 not in ('maj','min'):
+        tonic_idx2, mode2 = _estimate_key_from_chroma(chroma)
+    use_flats = _use_flats_for_key(int(tonic_idx2), mode2)
 
     # State layout: 0..11 maj, 12..23 min, 24..35 dom7, 36..47 maj7, 48..59 min7
     def _state_to_label(s: int) -> str:

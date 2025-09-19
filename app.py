@@ -2054,14 +2054,20 @@ class Main(QtWidgets.QMainWindow):
 
             self.act_view_stems = QtGui.QAction("Show Stem Waveforms", self)
             self.act_view_stems.setCheckable(True)
-            self.act_view_stems.setChecked(False if getattr(self, 'wave', None) is None else bool(self.wave.show_stems))
-            self.act_view_stems.triggered.connect(lambda: self._set_waveform_view_mode(False))
-            view_group.addAction(self.act_view_stems)
-
             self.act_view_combined = QtGui.QAction("Show Combined Waveform", self)
             self.act_view_combined.setCheckable(True)
-            self.act_view_combined.setChecked(True if getattr(self, 'wave', None) is None else not bool(self.wave.show_stems))
-            self.act_view_combined.triggered.connect(lambda: self._set_waveform_view_mode(True))
+            # Default to combined waveform on startup
+            current_show_stems = False if getattr(self, 'wave', None) is None else bool(self.wave.show_stems)
+            # Force default to combined = not show_stems
+            if getattr(self, 'wave', None) is not None:
+                self.wave.show_stems = False
+                current_show_stems = False
+            self.act_view_stems.setChecked(current_show_stems)
+            self.act_view_combined.setChecked(not current_show_stems)
+            self.act_view_stems.triggered.connect(lambda: self._set_waveform_view_mode(True))
+            view_group.addAction(self.act_view_stems)
+
+            self.act_view_combined.triggered.connect(lambda: self._set_waveform_view_mode(False))
             view_group.addAction(self.act_view_combined)
 
             view_menu.addAction(self.act_view_stems)

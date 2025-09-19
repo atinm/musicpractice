@@ -4,10 +4,31 @@ import sounddevice as sd
 import soundfile as sf
 import threading
 import warnings
+# Silence noisy librosa warning when buffers are shorter than n_fft during transient operations
+warnings.filterwarnings(
+    "ignore",
+    message=r"n_fft=\d+ is too large for input signal of length=\d+",
+    category=UserWarning,
+    module=r"librosa\.core\.spectrum"
+)
 import shutil
 import tempfile
 import subprocess
 import os
+
+# --- Per-file decode serialization to avoid concurrent opens of the same file ---
+_DECODE_LOCKS: dict[str, threading.Lock] = {}
+_DECODE_LOCKS_GUARD = threading.Lock()
+
+def _decode_lock_for(path: str) -> threading.Lock:
+    key = str(path)
+    with _DECODE_LOCKS_GUARD:
+        lk = _DECODE_LOCKS.get(key)
+        if lk is None:
+            lk = threading.Lock()
+            _DECODE_LOCKS[key] = lk
+        return lk
+
 
 try:
     import librosa
@@ -16,6 +37,37 @@ except Exception as e:
     _LIBROSA_IMPORT_ERROR = e
 else:
     _LIBROSA_IMPORT_ERROR = None
+
+# Guard lengths for librosa phase‑vocoder to avoid n_fft warnings on tiny buffers
+_MIN_STRETCH_SAMPLES = 2048
+
+def _safe_time_stretch(y: np.ndarray, rate: float) -> np.ndarray:
+    """Phase‑vocoder stretch with guard for very short signals.
+    If input is shorter than _MIN_STRETCH_SAMPLES, pad before stretching and then
+    trim the output back to round(len(y)/rate). Returns float32 1‑D array.
+    """
+    if librosa is None or y is None:
+        return y.astype(np.float32, copy=False) if isinstance(y, np.ndarray) else y
+    yf = y.astype(float, copy=False)
+    L = int(yf.shape[0])
+    target = max(1, int(round(L / max(rate, 1e-6))))
+    if L < _MIN_STRETCH_SAMPLES:
+        pad = _MIN_STRETCH_SAMPLES - L
+        yf = np.pad(yf, (0, pad))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            out = librosa.effects.time_stretch(y=yf, rate=rate)
+        out = out[:target]
+    else:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            out = librosa.effects.time_stretch(y=yf, rate=rate)
+        if out.shape[0] != target:
+            if out.shape[0] > target:
+                out = out[:target]
+            else:
+                out = np.pad(out, (0, target - out.shape[0]))
+    return out.astype(np.float32, copy=False)
 
 # Prefer ffmpeg decode over audioread to avoid deprecation warnings and speed up loads
 _DEF_FFMPEG = shutil.which("ffmpeg")
@@ -51,34 +103,61 @@ def _decode_via_ffmpeg(path: str, stereo: bool = True):
 
 def _load_audio_any(path: str):
     """Load audio and return (y, sr) where y is float32 (N, C).
-    Try soundfile (WAV/FLAC/AIFF), then ffmpeg (MP3/M4A/AAC/etc), then librosa as last resort.
+    Order of preference:
+      • Compressed (mp3/m4a/aac/ogg/opus): ffmpeg → WAV, then librosa/audioread, then soundfile as last resort.
+      • PCM (wav/flac/aiff): soundfile first, then ffmpeg, then librosa.
+    Also serializes decoding per path to avoid crashy concurrent opens in underlying libs.
     """
-    # 1) Fast path: wav/flac/aiff via soundfile
-    try:
-        y, sr = sf.read(path, dtype='float32', always_2d=True)
-        return y, sr
-    except Exception:
-        pass
+    import os
+    ext = os.path.splitext(str(path))[1].lower()
+    compressed_exts = {'.mp3', '.m4a', '.aac', '.ogg', '.opus'}
 
-    # 2) ffmpeg decode for compressed formats (avoids audioread warnings)
-    try:
-        return _decode_via_ffmpeg(path, stereo=True)
-    except Exception:
-        pass
-
-    # 3) Final fallback to librosa/audioread (silence deprecation warnings)
-    if librosa is None:
-        raise RuntimeError(
-            "Could not decode audio. Install ffmpeg or librosa to handle compressed formats."
-        )
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        y, sr = librosa.load(path, sr=None, mono=False)
-    if y.ndim == 1:
-        y = y.astype(np.float32)[:, None]
-    else:
-        y = y.T.astype(np.float32)
-    return y, sr
+    lk = _decode_lock_for(path)
+    with lk:
+        if ext in compressed_exts:
+            # 1) Prefer ffmpeg for compressed formats (avoid libsndfile mpeg_init path)
+            try:
+                return _decode_via_ffmpeg(path, stereo=True)
+            except Exception:
+                pass
+            # 2) librosa/audioread (CoreAudio/ffmpeg backend)
+            if librosa is not None:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    y, sr = librosa.load(path, sr=None, mono=False)
+                if y.ndim == 1:
+                    y = y.astype(np.float32)[:, None]
+                else:
+                    y = y.T.astype(np.float32)
+                return y, sr
+            # 3) Last resort: soundfile
+            y, sr = sf.read(path, dtype='float32', always_2d=True)
+            return y, sr
+        else:
+            # Likely PCM container → soundfile first
+            try:
+                y, sr = sf.read(path, dtype='float32', always_2d=True)
+                return y, sr
+            except Exception:
+                pass
+            # Fallback to ffmpeg → WAV
+            try:
+                return _decode_via_ffmpeg(path, stereo=True)
+            except Exception:
+                pass
+            # Final fallback to librosa/audioread
+            if librosa is None:
+                raise RuntimeError(
+                    "Could not decode audio. Install ffmpeg or librosa to handle this format."
+                )
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                y, sr = librosa.load(path, sr=None, mono=False)
+            if y.ndim == 1:
+                y = y.astype(np.float32)[:, None]
+            else:
+                y = y.T.astype(np.float32)
+            return y, sr
 
 
 class LoopPlayer:
@@ -234,13 +313,12 @@ class LoopPlayer:
             try:
                 if a.ndim == 1 or a.shape[1] == 1:
                     mono = a[:, 0] if a.ndim == 2 else a
-                    st = librosa.effects.time_stretch(y=mono.astype(float, copy=False), rate=self._rate)
-                    st = st.astype(np.float32, copy=False)
+                    st = _safe_time_stretch(mono, self._rate)
                     self._stems_play[k] = st.reshape(-1, 1)
                 else:
                     chans = []
                     for c in range(a.shape[1]):
-                        ch = librosa.effects.time_stretch(y=a[:, c].astype(float, copy=False), rate=self._rate)
+                        ch = _safe_time_stretch(a[:, c], self._rate)
                         chans.append(ch)
                     L = max(len(ch) for ch in chans)
                     chans = [np.pad(ch, (0, L - len(ch))) for ch in chans]
@@ -275,14 +353,13 @@ class LoopPlayer:
             try:
                 if y.ndim == 1 or y.shape[1] == 1:
                     mono = y[:, 0] if y.ndim == 2 else y
-                    y_st = librosa.effects.time_stretch(y=mono.astype(float), rate=rate)
-                    y_st = y_st.astype(np.float32, copy=False)
+                    y_st = _safe_time_stretch(mono, rate)
                     self._y_play = np.column_stack([y_st, y_st]) if (y.ndim == 2 and y.shape[1] == 2) else y_st.reshape(-1, 1)
                 else:
                     # per‑channel stretch and pad to equal length
                     chans = []
                     for c in range(y.shape[1]):
-                        ch = librosa.effects.time_stretch(y=y[:, c].astype(float), rate=rate)
+                        ch = _safe_time_stretch(y[:, c], rate)
                         chans.append(ch)
                     L = max(len(cch) for cch in chans)
                     chans = [np.pad(cch, (0, L - len(cch))) for cch in chans]
