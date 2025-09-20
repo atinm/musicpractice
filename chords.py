@@ -177,7 +177,132 @@ def viterbi(log_probs, trans=0.995):
 
 # --- Beat & tempo estimation -------------------------------------------------
 
-def estimate_beats(audio_path: str, sr=22050, hop=512, units_per_bar: int = 4, tightness: float = 100.0):
+
+# --- Beat & tempo estimation -------------------------------------------------
+
+def _estimate_beats_vamp(audio_path: str, units_per_bar: int = 4, log_fn=None):
+    """
+    Try to get beats and downbeats using QM BarBeatTracker via vamp.collect.
+    Returns dict compatible with estimate_beats (tempo might be None if plugin doesn't report it).
+    """
+    try:
+        import soundfile as sf
+        import numpy as np
+        import vamp
+    except Exception:
+        return None
+
+    try:
+        y, sr = sf.read(audio_path, always_2d=False)
+    except Exception:
+        return None
+    if y is None or np.asarray(y).size == 0:
+        return None
+    if y.ndim > 1:
+        y_mono = y.mean(axis=1)
+    else:
+        y_mono = y
+
+    try:
+        res = vamp.collect(y_mono, sr, "qm-vamp-plugins:qm-barbeattracker")
+    except Exception:
+        return None
+
+    # Parse outputs defensively: different builds may return dicts or lists
+    beats_sec = []
+    downbeats_sec = []
+
+    def _iter_feature_items(res_dict):
+        # res_dict: mapping name -> dict-with-{"list"/"values"} OR directly a list
+        for _, out in (res_dict or {}).items():
+            if isinstance(out, dict):
+                items = out.get("list") or out.get("values") or []
+                for it in items:
+                    yield it
+            elif isinstance(out, list):
+                for it in out:
+                    yield it
+
+    any_items = False
+    for it in _iter_feature_items(res):
+        any_items = True
+        if not isinstance(it, dict):
+            continue
+        t = it.get("timestamp")
+        if t is None:
+            continue
+        # Always collect beat time
+        try:
+            beats_sec.append(float(t))
+        except Exception:
+            continue
+        # Try to detect downbeats from value or label
+        vals = it.get("values")
+        lab = it.get("label")
+        beat_num = None
+        if isinstance(vals, (list, tuple)) and len(vals) > 0:
+            v0 = vals[0]
+            try:
+                beat_num = int(round(float(v0)))
+            except Exception:
+                beat_num = None
+        elif isinstance(lab, (int, float)):
+            try:
+                beat_num = int(round(float(lab)))
+            except Exception:
+                beat_num = None
+        elif isinstance(lab, str):
+            s = lab.strip()
+            if s.isdigit():
+                beat_num = int(s)
+        if beat_num == 1:
+            downbeats_sec.append(float(t))
+
+    beats_sec = sorted(set(beats_sec))
+
+    # If we didn't manage to parse downbeats explicitly, infer phase by picking the strongest modulo-N
+    if not downbeats_sec and beats_sec:
+        # Simple heuristic: assume constant meter units_per_bar
+        # Choose the offset k in [0..N-1] whose subset is most evenly spaced.
+        N = max(1, int(units_per_bar))
+        arr = np.asarray(beats_sec, dtype=float)
+        best_k, best_var = 0, 1e99
+        for k in range(N):
+            subset = arr[k::N]
+            if subset.size >= 3:
+                diffs = np.diff(subset)
+                v = float(np.var(diffs))
+            else:
+                v = 1e6
+            if v < best_var:
+                best_var = v
+                best_k = k
+        downbeats_sec = arr[best_k::N].tolist()
+
+    # Estimate tempo as median instantaneous tempo if possible
+    tempo = None
+    try:
+        if len(beats_sec) >= 2:
+            diffs = np.diff(np.asarray(beats_sec))
+            med = float(np.median(diffs))
+            if med > 0:
+                tempo = 60.0 / med
+    except Exception:
+        tempo = None
+
+    # Beat strengths are not provided by the plugin; fill with 1.0
+    beat_strengths = [1.0] * len(beats_sec)
+
+    return {
+        "tempo": float(tempo) if tempo is not None else 0.0,
+        "beats": [float(t) for t in beats_sec],
+        "downbeats": [float(t) for t in downbeats_sec],
+        "beat_strengths": beat_strengths,
+        "sr": int(sr),
+        "hop": int(512),  # not meaningful for Vamp path; keep a conventional value
+    }
+
+def estimate_beats(audio_path: str, sr=22050, hop=512, units_per_bar: int = 4, tightness: float = 100.0, prefer_vamp: bool = True):
     """Estimate tempo, beats (sec), and downbeats (bar starts in sec).
 
     Returns dict:
@@ -191,11 +316,16 @@ def estimate_beats(audio_path: str, sr=22050, hop=512, units_per_bar: int = 4, t
       }
 
     Method:
-      1) Track beats from onset envelope (librosa).
-      2) Infer bar phase (downbeat) by selecting the modulo-N offset whose
-         beat subset aligns best with onset energy (simple heuristic), where
-         N = units_per_bar (default 4 for 4/4).
+      • Prefer QM BarBeatTracker (vamp) if available.
+      • Otherwise: track beats from onset envelope (librosa), infer downbeat phase by maximizing average onset on beats modulo N.
     """
+    # 0) Try Vamp BarBeatTracker first
+    if prefer_vamp:
+        vb = _estimate_beats_vamp(audio_path, units_per_bar=units_per_bar)
+        if isinstance(vb, dict) and vb.get("beats"):
+            return vb
+
+    # 1) Fallback: Librosa
     from audio_engine import _load_audio_any
     y_stereo, sr_loaded = _load_audio_any(audio_path)
     if sr is None:
@@ -213,8 +343,6 @@ def estimate_beats(audio_path: str, sr=22050, hop=512, units_per_bar: int = 4, t
     if beat_times.size == 0:
         return {"tempo": float(tempo), "beats": [], "downbeats": [], "beat_strengths": [], "sr": int(sr), "hop": int(hop)}
 
-    # Heuristic downbeat phase: choose offset k in [0..N-1] maximizing average onset
-    N = max(1, int(units_per_bar))
     # Onset energy at each beat frame
     oenv_at_beats = []
     for f in beat_frames:
@@ -233,6 +361,8 @@ def estimate_beats(audio_path: str, sr=22050, hop=512, units_per_bar: int = 4, t
     else:
         beat_strengths = []
 
+    # Heuristic downbeat phase: choose offset k in [0..N-1] maximizing average onset
+    N = max(1, int(units_per_bar))
     best_k = 0
     best_score = -1.0
     for k in range(N):
