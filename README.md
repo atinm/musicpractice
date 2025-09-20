@@ -4,13 +4,17 @@ A minimal music practice application for musicians to analyze, loop, and practic
 
 ## Features
 
-- **Audio Analysis**: Automatic chord detection, key estimation, and beat tracking
+- **Chord Detection**: Advanced chord recognition with optional Chordino plugin support
+- **Key Detection**: Automatic key estimation with optional qm-keydetector plugin support
+- **Audio Analysis**: Beat tracking, tempo estimation, and harmonic analysis
 - **Interactive Waveform**: Visual waveform with chord annotations and beat markers
 - **Loop Management**: Create, save, and manage multiple loops with visual flags
 - **Time Stretching**: Pitch-preserving tempo adjustment (0.5x - 1.5x)
 - **Stem Separation**: AI-powered source separation using Demucs (vocals, drums, bass, etc.)
 - **Session Management**: Save and restore analysis data and loop configurations
 - **Cross-Platform**: Works on macOS, Windows, and Linux
+
+![Waveform View](WaveformView.png)
 
 ## Setup
 
@@ -80,6 +84,8 @@ python app.py
 - Individual volume and mute controls for each stem
 - Uses Demucs AI model for high-quality separation
 
+![Stems View](StemsView.png)
+
 #### Waveform View Modes
 
 - View → Show Stem Waveforms: Display individual waveforms for each separated stem
@@ -136,10 +142,13 @@ Chordino provides enhanced chord recognition capabilities. To install:
 
 1. **Download Chordino**: Visit the [NNLS Chroma project page](http://isophonics.net/nnls-chroma)
 2. **Install the plugin**:
-   - **macOS**: Copy `nnls-chroma.dylib` to `/Library/Audio/Plug-Ins/Vamp/`
+   - **macOS (Intel)**: Copy `nnls-chroma.dylib` to `/Library/Audio/Plug-Ins/Vamp/`
+   - **macOS (Apple Silicon)**: Build from source as pre-built binaries are not available for ARM64
    - **Linux**: Copy `nnls-chroma.so` to `/usr/local/lib/vamp/`
    - **Windows**: Copy `nnls-chroma.dll` to your Vamp plugins directory
 3. **Set permissions**: `sudo chmod 755 /path/to/nnls-chroma.*`
+
+**Note for Apple Silicon Macs**: The Chordino plugin must be built from source as pre-compiled ARM64 binaries are not available. Follow the build instructions in the NNLS Chroma repository.
 
 #### QM Key Detector (Key Estimation)
 
@@ -147,10 +156,13 @@ The QM Key Detector plugin provides improved key estimation. To install:
 
 1. **Download QM Vamp Plugins**: Visit the [QM Vamp Plugins page](https://code.soundsoftware.ac.uk/projects/qm-vamp-plugins/files)
 2. **Install the plugin**:
-   - **macOS**: Copy `qm-keydetector.dylib` to `/Library/Audio/Plug-Ins/Vamp/`
+   - **macOS (Intel)**: Copy `qm-keydetector.dylib` to `/Library/Audio/Plug-Ins/Vamp/`
+   - **macOS (Apple Silicon)**: Build from source as pre-built binaries are not available for ARM64
    - **Linux**: Copy `qm-keydetector.so` to `/usr/local/lib/vamp/`
    - **Windows**: Copy `qm-keydetector.dll` to your Vamp plugins directory
 3. **Set permissions**: `sudo chmod 755 /path/to/qm-keydetector.*`
+
+**Note for Apple Silicon Macs**: The QM Key Detector plugin must be built from source as pre-compiled ARM64 binaries are not available. Follow the build instructions in the QM Vamp Plugins repository.
 
 **Note**: These plugins are automatically detected if installed. The application will fall back to built-in analysis methods if the plugins are not available.
 
