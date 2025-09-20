@@ -4,6 +4,8 @@ A minimal music practice application for musicians to analyze, loop, and practic
 
 > **Note**: This application has primarily been tested on macOS Apple Silicon. While it should work on other platforms, some features may require additional setup or may not be fully optimized.
 
+> **🎯 For Best Results**: We highly recommend installing the optional Vamp plugins (Chordino, qm-vamp-plugins) for significantly improved chord detection, key estimation, and beat tracking accuracy. See the "Optional Enhanced Analysis Plugins" section below for installation instructions.
+
 ## Features
 
 - **Chord Detection**: Advanced chord recognition with optional Chordino plugin support
@@ -49,9 +51,103 @@ sudo apt-get update && sudo apt-get install -y python3-pip python3-venv portaudi
 
 ## Usage
 
+### Running from Source
+
 ```bash
 python app.py
 ```
+
+### Quick Launch (Recommended)
+
+The project includes ready-to-use launchers:
+
+#### **Command Line Launcher:**
+
+```bash
+./MusicPractice.sh
+```
+
+#### **macOS App Bundle:**
+
+```bash
+open dist/MusicPractice.app
+```
+
+Both launchers automatically activate your virtual environment and use all installed dependencies.
+
+### Creating Standalone Application
+
+To create a standalone application bundle that includes all dependencies:
+
+#### 1. Install Build Dependencies
+
+```bash
+pip install -r requirements-build.txt
+```
+
+#### 2. Convert Icons (Optional)
+
+If you need platform-specific icon formats:
+
+```bash
+python convert_icons.py
+```
+
+_Note: The project already includes icons in the `icons/` directory._
+
+#### 3. Build Application
+
+**Standard Build (Cross-Platform):**
+
+```bash
+python build_app.py
+```
+
+**macOS App Bundle:**
+
+```bash
+python build_app.py --macos
+```
+
+The built application will be in the `dist/` directory:
+
+- **Windows**: `dist/MusicPractice.exe`
+- **macOS**: `dist/MusicPractice.app` (if using --macos flag)
+- **Linux**: `dist/MusicPractice`
+
+#### 4. Distribution
+
+The standalone application includes all Python dependencies and can be distributed without requiring users to install Python or any dependencies.
+
+**Important: Vamp Plugins Highly Recommended**: While the bundled app works without Vamp plugins, **we strongly encourage installing them** for significantly improved accuracy. The built-in algorithms provide basic functionality, but Vamp plugins (Chordino, qm-vamp-plugins) offer professional-grade analysis quality that makes a substantial difference in practice sessions.
+
+### Bundled App Behavior
+
+The standalone application includes:
+
+✅ **Core Features** (always available):
+
+- Chord detection (internal algorithm)
+- Key estimation (Krumhansl-Schmuckler)
+- Beat tracking (Librosa-based)
+- Time stretching (phase vocoder)
+- Stem separation (Demucs AI)
+- All UI and playback features
+
+🎯 **Highly Recommended Enhancements** (significantly better accuracy):
+
+- **Professional chord detection** (Chordino plugin)
+- **Professional key detection** (qm-keydetector plugin)
+- **Professional beat tracking** (qm-barbeattracker plugin)
+
+**Why Install Vamp Plugins?**
+
+- **Much more accurate** chord recognition
+- **Better key detection** for complex harmonies
+- **More precise beat tracking** for rhythm practice
+- **Professional-grade analysis** used in music production
+
+The app automatically detects available plugins and uses them when present, falling back to built-in algorithms when plugins are not installed.
 
 ### Basic Controls
 
