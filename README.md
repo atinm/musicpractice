@@ -2,10 +2,12 @@
 
 A minimal music practice application for musicians to analyze, loop, and practice with audio tracks. Features real-time audio analysis, stem separation, and interactive waveform visualization.
 
+> **Note**: This application has primarily been tested on macOS Apple Silicon. While it should work on other platforms, some features may require additional setup or may not be fully optimized.
+
 ## Features
 
 - **Chord Detection**: Advanced chord recognition with optional Chordino plugin support
-- **Key Detection**: Automatic key estimation with optional qm-keydetector plugin support
+- **Key Detection**: Automatic key estimation with optional qm-keydetector and Chordino plugin support
 - **Audio Analysis**: Beat tracking, tempo estimation, and harmonic analysis
 - **Interactive Waveform**: Visual waveform with chord annotations and beat markers
 - **Loop Management**: Create, save, and manage multiple loops with visual flags
@@ -31,7 +33,7 @@ pip install -r requirements.txt
 #### macOS (Homebrew)
 
 ```bash
-brew install portaudio ffmpeg
+brew install portaudio ffmpeg vamp-plugin-sdk libsndfile
 ```
 
 #### Ubuntu/Debian
@@ -79,7 +81,7 @@ python app.py
 
 #### Stem Separation
 
-- View → Separate & Show Stems
+- View → Combined & Show Stems
 - Automatically separates audio into vocals, drums, bass, guitar, piano, and other
 - Individual volume and mute controls for each stem
 - Uses Demucs AI model for high-quality separation
@@ -113,12 +115,10 @@ python app.py
 
 ### Audio Analysis
 
-- **Chord Detection**: Template matching with Viterbi smoothing for major/minor triads and 7th chords
-- **Enhanced Chord Detection**: Optional Chordino plugin support for improved chord recognition (if installed)
-- **Key Estimation**: Krumhansl-Schmuckler key profiles with enharmonic spelling
-- **Enhanced Key Detection**: Optional qm-keydetector plugin support for improved key estimation (if installed)
-- **Beat Tracking**: Librosa-based onset detection and tempo estimation
-- **Time Stretching**: Phase vocoder implementation preserving pitch
+- **Chord Detection**: Template matching with Viterbi smoothing for major/minor triads and 7th chords, with optional Chordino plugin support for improved recognition
+- **Key Detection**: Krumhansl-Schmuckler key profiles with enharmonic spelling, with optional qm-keydetector and Chordino plugin support for improved estimation
+- **Beat Tracking**: Librosa-based onset detection and tempo estimation, with optional qm-barbeattracker plugin support for improved accuracy
+- **Time Stretching**: Librosa phase vocoder implementation preserving pitch (0.5x - 1.5x range)
 
 ### Supported Formats
 
@@ -130,6 +130,7 @@ python app.py
 - **Core**: PySide6 (Qt), NumPy, SciPy, Librosa, SoundDevice
 - **Audio Processing**: SoundFile, FFmpeg
 - **AI Separation**: Demucs, PyTorch (optional, CPU works)
+- **Enhanced Analysis**: Vamp Plugin SDK, nnls-chroma (Chordino), qm-vamp-plugins (optional)
 - **Utilities**: TQDM for progress bars
 
 ### Optional Enhanced Analysis Plugins
@@ -142,13 +143,13 @@ Chordino provides enhanced chord recognition capabilities. To install:
 
 1. **Download Chordino**: Visit the [NNLS Chroma project page](http://isophonics.net/nnls-chroma)
 2. **Install the plugin**:
-   - **macOS (Intel)**: Copy `nnls-chroma.dylib` to `/Library/Audio/Plug-Ins/Vamp/`
+   - **macOS (Intel)**: Copy `nnls-chroma.dylib` to `~/Library/Audio/Plug-Ins/Vamp/`
    - **macOS (Apple Silicon)**: Build from source as pre-built binaries are not available for ARM64
    - **Linux**: Copy `nnls-chroma.so` to `/usr/local/lib/vamp/`
    - **Windows**: Copy `nnls-chroma.dll` to your Vamp plugins directory
-3. **Set permissions**: `sudo chmod 755 /path/to/nnls-chroma.*`
+3. **Set permissions**: `chmod 755 ~/Library/Audio/Plug-Ins/Vamp/nnls-chroma.dylib`
 
-**Note for Apple Silicon Macs**: The Chordino plugin must be built from source as pre-compiled ARM64 binaries are not available. Follow the build instructions in the NNLS Chroma repository.
+**Note for Apple Silicon Macs**: The Chordino plugin must be built from source as pre-compiled ARM64 binaries are not available. Follow the build instructions in the NNLS Chroma repository. Alternatively, pre-built ARM64 binaries (`nnls-chroma.dylib`) are available in the `third-party/` directory of this project, but building from source is recommended.
 
 #### QM Key Detector (Key Estimation)
 
@@ -156,13 +157,13 @@ The QM Key Detector plugin provides improved key estimation. To install:
 
 1. **Download QM Vamp Plugins**: Visit the [QM Vamp Plugins page](https://code.soundsoftware.ac.uk/projects/qm-vamp-plugins/files)
 2. **Install the plugin**:
-   - **macOS (Intel)**: Copy `qm-keydetector.dylib` to `/Library/Audio/Plug-Ins/Vamp/`
+   - **macOS (Intel)**: Copy `qm-vamp-plugins.dylib` to `~/Library/Audio/Plug-Ins/Vamp/`
    - **macOS (Apple Silicon)**: Build from source as pre-built binaries are not available for ARM64
-   - **Linux**: Copy `qm-keydetector.so` to `/usr/local/lib/vamp/`
-   - **Windows**: Copy `qm-keydetector.dll` to your Vamp plugins directory
-3. **Set permissions**: `sudo chmod 755 /path/to/qm-keydetector.*`
+   - **Linux**: Copy `qm-vamp-plugins.so` to `/usr/local/lib/vamp/`
+   - **Windows**: Copy `qm-vamp-plugins.dll` to your Vamp plugins directory
+3. **Set permissions**: `chmod 755 ~/Library/Audio/Plug-Ins/Vamp/qm-vamp-plugins.dylib`
 
-**Note for Apple Silicon Macs**: The QM Key Detector plugin must be built from source as pre-compiled ARM64 binaries are not available. Follow the build instructions in the QM Vamp Plugins repository.
+**Note for Apple Silicon Macs**: The QM Key Detector plugin must be built from source as pre-compiled ARM64 binaries are not available. Follow the build instructions in the QM Vamp Plugins repository. Alternatively, pre-built ARM64 binaries (`qm-vamp-plugins.dylib`) are available in the `third-party/` directory of this project, but building from source is recommended.
 
 **Note**: These plugins are automatically detected if installed. The application will fall back to built-in analysis methods if the plugins are not available.
 
@@ -170,14 +171,23 @@ The QM Key Detector plugin provides improved key estimation. To install:
 
 ```
 musicpractice/
-├── app.py              # Main application and GUI
-├── audio_engine.py     # Audio playback and time stretching
-├── chords.py           # Chord detection and key estimation
-├── stems.py            # Stem separation with Demucs
-├── timestretch.py      # Time stretching utilities
-├── utils.py            # Helper functions
-├── requirements.txt    # Python dependencies
-└── README.md          # This file
+├── app.py                    # Main application and GUI with optimized waveform rendering
+├── audio_engine.py           # Audio playback and time stretching
+├── chords.py                 # Chord detection and key estimation with Vamp plugin support
+├── stems.py                  # Stem separation with Demucs
+├── timestretch.py            # Time stretching utilities
+├── utils.py                  # Helper functions
+├── requirements.txt          # Python dependencies
+├── README.md                # This file
+├── WaveformView.png         # Screenshot of main waveform interface
+├── StemsView.png            # Screenshot of stem separation interface
+└── third-party/             # Pre-built Vamp plugins for Apple Silicon
+    ├── nnls-chroma/
+    │   └── macosx-arm64/
+    │       └── nnls-chroma.dylib    # Chordino chord detection plugin
+    └── qm-vamp-plugins/
+        └── macosx-arm64/
+            └── qm-vamp-plugins.dylib # QM key detection plugin
 ```
 
 ## Notes
