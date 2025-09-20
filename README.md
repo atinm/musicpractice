@@ -108,7 +108,9 @@ python app.py
 ### Audio Analysis
 
 - **Chord Detection**: Template matching with Viterbi smoothing for major/minor triads and 7th chords
+- **Enhanced Chord Detection**: Optional Chordino plugin support for improved chord recognition (if installed)
 - **Key Estimation**: Krumhansl-Schmuckler key profiles with enharmonic spelling
+- **Enhanced Key Detection**: Optional qm-keydetector plugin support for improved key estimation (if installed)
 - **Beat Tracking**: Librosa-based onset detection and tempo estimation
 - **Time Stretching**: Phase vocoder implementation preserving pitch
 
@@ -123,6 +125,34 @@ python app.py
 - **Audio Processing**: SoundFile, FFmpeg
 - **AI Separation**: Demucs, PyTorch (optional, CPU works)
 - **Utilities**: TQDM for progress bars
+
+### Optional Enhanced Analysis Plugins
+
+For improved chord detection and key estimation, you can install these optional Vamp plugins:
+
+#### Chordino (Chord Detection)
+
+Chordino provides enhanced chord recognition capabilities. To install:
+
+1. **Download Chordino**: Visit the [NNLS Chroma project page](http://isophonics.net/nnls-chroma)
+2. **Install the plugin**:
+   - **macOS**: Copy `nnls-chroma.dylib` to `/Library/Audio/Plug-Ins/Vamp/`
+   - **Linux**: Copy `nnls-chroma.so` to `/usr/local/lib/vamp/`
+   - **Windows**: Copy `nnls-chroma.dll` to your Vamp plugins directory
+3. **Set permissions**: `sudo chmod 755 /path/to/nnls-chroma.*`
+
+#### QM Key Detector (Key Estimation)
+
+The QM Key Detector plugin provides improved key estimation. To install:
+
+1. **Download QM Vamp Plugins**: Visit the [QM Vamp Plugins page](https://code.soundsoftware.ac.uk/projects/qm-vamp-plugins/files)
+2. **Install the plugin**:
+   - **macOS**: Copy `qm-keydetector.dylib` to `/Library/Audio/Plug-Ins/Vamp/`
+   - **Linux**: Copy `qm-keydetector.so` to `/usr/local/lib/vamp/`
+   - **Windows**: Copy `qm-keydetector.dll` to your Vamp plugins directory
+3. **Set permissions**: `sudo chmod 755 /path/to/qm-keydetector.*`
+
+**Note**: These plugins are automatically detected if installed. The application will fall back to built-in analysis methods if the plugins are not available.
 
 ## File Structure
 

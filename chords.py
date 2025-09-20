@@ -427,7 +427,17 @@ def snap_interval_to_beats(a: float, b: float, beats: list[float]) -> tuple[floa
 # Public helper: estimate musical key from an audio file
 # Returns a dict with: {"tonic_idx": int, "mode": "maj"|"min", "tonic_name": str, "pretty": str}
 
-def estimate_key(audio_path: str, sr=22050, hop=2048):
+def estimate_key(audio_path: str, sr=22050, hop=2048, prefer_vamp: bool = True, log_fn=None):
+    # Prefer Vamp (QM Key Detector) if requested
+    if prefer_vamp:
+        try:
+            kv = estimate_key_vamp(audio_path, log_fn=log_fn)
+            if kv and isinstance(kv, dict) and "tonic_idx" in kv and "mode" in kv:
+                return kv
+        except Exception:
+            pass
+
+    # --- Fallback: internal KS-based key from chroma ---
     from audio_engine import _load_audio_any
     y_stereo, sr_loaded = _load_audio_any(audio_path)
     if sr is None:
@@ -444,6 +454,11 @@ def estimate_key(audio_path: str, sr=22050, hop=2048):
     use_flats = _use_flats_for_key(tonic_idx, mode)
     tonic_name = _pc_name(tonic_idx, use_flats)
     pretty = f"{tonic_name} {'major' if mode=='maj' else 'minor'}"
+    if callable(log_fn):
+        try:
+            log_fn(f"key(internal): {pretty}")
+        except Exception:
+            pass
     return {
         "tonic_idx": int(tonic_idx),
         "mode": mode,
@@ -1385,6 +1400,93 @@ def estimate_chords_stem_aware(
     if beats:
         segments = [dict(s, beat_sync=True) for s in segments]
     return segments
+
+def estimate_key_vamp(audio_path: str, log_fn=None):
+    """
+    Try QM Key Detector via Vamp; return a dict:
+      {"tonic_idx": int(0..11), "mode": "maj"|"min", "pretty": "A major"}
+    On failure, return {}.
+    """
+    import numpy as np
+    import soundfile as sf
+    import vamp
+
+    # --- load mono float32, contiguous
+    try:
+        y, sr = sf.read(audio_path, dtype='float32', always_2d=False)
+    except Exception as e:
+        if callable(log_fn): log_fn(f"key(vamp): read failed: {e}")
+        return {}
+    if y.ndim > 1:
+        y = y.mean(axis=1)
+    y = np.ascontiguousarray(y, dtype=np.float32)
+
+    def _pc_from_name(name: str) -> int | None:
+        table = {
+            "C":0,"C#":1,"Db":1,"D":2,"D#":3,"Eb":3,"E":4,"F":5,"F#":6,"Gb":6,
+            "G":7,"G#":8,"Ab":8,"A":9,"A#":10,"Bb":10,"B":11,"Cb":11,"E#":5,"B#":0
+        }
+        return table.get(name, None)
+
+    def _parse_key_label(lbl: str):
+        s = (lbl or "").strip()
+        # Accept "A major", "A maj", "A", "C# minor", "C#m", "C# min"
+        parts = s.replace("Min","min").replace("Maj","maj")
+        parts = parts.replace("minor","min").replace("major","maj")
+        if " " in parts:
+            tonic, mode = parts.split(None, 1)
+        else:
+            # compact forms like "C#m" or just "A"
+            tonic = parts.rstrip("m").rstrip("maj")
+            mode = "min" if parts.endswith("m") else ("maj" if parts.endswith("maj") else "maj")
+        tonic = tonic.strip()
+        mode = "min" if "min" in mode.lower() else "maj"
+        pc = _pc_from_name(tonic)
+        return pc, mode, f"{tonic} {'minor' if mode=='min' else 'major'}"
+
+    # Try QM plugin first
+    for plug, output in [
+        ("qm-vamp-plugins:qm-keydetector", "key"),
+        # Fallbacks if someone has a different bundle name or output id
+        ("qm-vamp-plugins:qm-keydetector", "keys"),
+        ("qm-vamp-plugins:qm-keydetector", None),
+    ]:
+        try:
+            res = vamp.collect(y, sr, plug, output=output) if output else vamp.collect(y, sr, plug)
+            evs = res.get("list", []) if isinstance(res, dict) else []
+            if not evs:
+                continue
+            # Heuristic: take the last (most global) or the highest-strength if available
+            best = evs[-1]
+            # Some builds include "label" like "A major" and "value" confidence
+            label = str(best.get("label", "")).strip()
+            if not label and "values" in best and best["values"]:
+                # some hosts expose numeric encoding; ignore for now
+                pass
+            pc, mode, pretty = _parse_key_label(label)
+            if pc is None:
+                continue
+            if callable(log_fn): log_fn(f"key(vamp): {pretty}")
+            return {"tonic_idx": int(pc), "mode": mode, "pretty": pretty}
+        except Exception as e:
+            # try next variant
+            if callable(log_fn): log_fn(f"key(vamp): {plug}/{output} failed: {e}")
+            continue
+
+    # Optional: very soft fallback to chordino (if it ever exposes key labels in your build)
+    try:
+        res = vamp.collect(y, sr, "nnls-chroma:chordino", output="key")
+        evs = res.get("list", [])
+        if evs:
+            label = str(evs[-1].get("label", "")).strip()
+            pc, mode, pretty = _parse_key_label(label)
+            if pc is not None:
+                if callable(log_fn): log_fn(f"key(vamp/chordino): {pretty}")
+                return {"tonic_idx": int(pc), "mode": mode, "pretty": pretty}
+    except Exception:
+        pass
+
+    return {}
 
 def estimate_chords_chordino_vamp(audio_path: str, beats=None, downbeats=None, **kwargs):
     """

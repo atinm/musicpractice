@@ -1387,11 +1387,8 @@ class WaveformView(QtWidgets.QWidget):
                 x0 = int((a_rel - rel_t0) / (rel_t1 - rel_t0) * w)
                 x1 = int((b_rel - rel_t0) / (rel_t1 - rel_t0) * w)
                 rect = QtCore.QRect(x0, wf_h, max(1, x1 - x0), ch_h)
-                p.fillRect(rect, QtGui.QColor(50, 80, 110))
-                # Brighter rounded outline for the chord box, with increased width
-                bright_pen = QtGui.QPen(QtGui.QColor(0, 0, 0))
-                bright_pen.setWidth(2)
-                p.setPen(bright_pen)
+                p.setBrush(QtGui.QColor(50, 80, 110))   # fill color
+                p.setPen(QtGui.QPen(QtGui.QColor(20, 20, 20)))  # outline
                 p.drawRoundedRect(rect, 6, 6)
                 # Draw a dashed beat grid inside the chord box if beats are available
                 if self.beats:
@@ -1620,9 +1617,11 @@ class ChordWorker(QThread):
         down_kw = kwargs.get("downbeats")
         bs_kw = kwargs.get("beat_strengths")
         stems_kw = kwargs.get("stems")
-        backend = getattr(self,'backend','internal')
+        backend = getattr(self, "backend", getattr(self, "chord_backend", "internal"))
+        backend = (backend or "internal").lower()
         self._log(f"Chord backend: {backend}")
-        if isinstance(backend, str) and backend.lower() == "chordino":
+
+        if backend == "chordino":
             return _chordino(
                 audio_path,
                 beats=kwargs.get("beats"),
@@ -1791,6 +1790,33 @@ class LogDock(QtWidgets.QDockWidget):
                 QtCore.Q_ARG(str, line.rstrip("\n"))
             )
 
+def _probe_chordino() -> bool:
+    try:
+        import vamp, numpy as np
+        # Quick check via plugin listing
+        ids = set(vamp.list_plugins())  # e.g. {'nnls-chroma:chordino', 'qm-vamp-plugins:qm-keydetector', ...}
+        if "nnls-chroma:chordino" not in ids:
+            return False
+        # Sanity-run a tiny collect so we know it actually loads
+        sr = 44100
+        y = np.zeros(sr, dtype=np.float32)  # 1 second of silence
+        _ = vamp.collect(y, sr, "nnls-chroma:chordino")
+        return True
+    except Exception:
+        return False
+
+def _probe_qm_key() -> bool:
+    try:
+        import vamp, numpy as np
+        if "qm-vamp-plugins:qm-keydetector" not in set(vamp.list_plugins()):
+            return False
+        sr = 44100
+        y = np.zeros(sr, dtype=np.float32)
+        _ = vamp.collect(y, sr, "qm-vamp-plugins:qm-keydetector")
+        return True
+    except Exception:
+        return False
+
 class Main(QtWidgets.QMainWindow):
     @staticmethod
     def _feq(a: float | None, b: float | None, eps: float = 1e-3) -> bool:
@@ -1867,7 +1893,7 @@ class Main(QtWidgets.QMainWindow):
         except Exception:
             pass
         # Kick the integrated pipeline (ChordWorker waits for stems, then estimates chords)
-        self.start_chord_analysis(self.current_path)
+        self.start_chord_analysis(self.current_path, force=False)
 
     def _action_recompute_analysis(self):
         """Recompute beats+chords using existing stems (do not re-run Demucs)."""
@@ -1892,10 +1918,9 @@ class Main(QtWidgets.QMainWindow):
         try:
             self.populate_beats_async(self.current_path)
             self.populate_key_async(self.current_path)
+            self.populate_chords_async(self.current_path, force=True)
         except Exception:
             pass
-        # Start analysis
-        self.start_chord_analysis(self.current_path)
 
     def _on_stems_ready(self, stem_dir_str: str):
         """Always wire stems into the player and show the mixer dock when stems are ready."""
@@ -2207,17 +2232,50 @@ class Main(QtWidgets.QMainWindow):
             backend_menu = analysis_menu.addMenu("Chord Backend")
             ag = QActionGroup(self); ag.setExclusive(True)
 
-            act_int = QAction("Internal", self, checkable=True)
-            act_aut = QAction("Chordino", self, checkable=True)
-            act_int.setChecked(True)
+            # --- Backend (Internal vs Chordino) ---
+            self.act_backend_internal = QAction("Internal", self, checkable=True)
+            self.act_backend_chordino = QAction("Chordino", self, checkable=True)
 
-            for a in (act_int, act_aut):
-                ag.addAction(a)
-                backend_menu.addAction(a)
+            ag = QActionGroup(self)
+            ag.setExclusive(True)
+            ag.addAction(self.act_backend_internal)
+            ag.addAction(self.act_backend_chordino)
+            backend_menu.addAction(self.act_backend_internal)
+            backend_menu.addAction(self.act_backend_chordino)
 
-            self.chord_backend = 'internal'
-            act_int.triggered.connect(lambda: setattr(self, 'chord_backend', 'internal'))
-            act_aut.triggered.connect(lambda: setattr(self, 'chord_backend', 'chordino'))
+            def _have_chordino():
+                try:
+                    return bool(_probe_chordino())
+                except Exception:
+                    return False
+
+            def _set_chord_backend(name: str):
+                name = (name or "internal").lower()
+                if name not in ("internal", "chordino"):
+                    name = "internal"
+                # One place of truth
+                self.chord_backend = name
+                self.backend = name  # keep legacy attr aligned
+                # reflect in menu
+                try:
+                    self.act_backend_internal.setChecked(name == "internal")
+                    self.act_backend_chordino.setChecked(name == "chordino")
+                except Exception:
+                    pass
+                # show/hide style menu
+                try:
+                    self._update_style_menu_visibility()
+                except Exception:
+                    pass
+
+            self._set_chord_backend = _set_chord_backend  # bind for reuse
+
+            have = _have_chordino()
+            print(f"have_chordino: {have} (default backend → {'chordino' if have else 'internal'})")
+            self._set_chord_backend('chordino' if have else 'internal')
+
+            self.act_backend_internal.triggered.connect(lambda _=False: self._on_backend_changed("internal"))
+            self.act_backend_chordino.triggered.connect(lambda _=False: self._on_backend_changed("chordino"))
 
             self.actReextractStems = QAction("Re-extract Stems", self)
             self.actReextractStems.setStatusTip("Run Demucs again and refresh stems before chord detection")
@@ -2245,13 +2303,13 @@ class Main(QtWidgets.QMainWindow):
                     analysis_menu = self.menuBar().addMenu('Analysis')
 
                 # Add Style submenu
-                style_menu = None
+                self.style_menu = None
                 for w in analysis_menu.findChildren(QtWidgets.QMenu):
                     if w.title() == 'Style':
-                        style_menu = w
+                        self.style_menu = w
                         break
-                if style_menu is None:
-                    style_menu = analysis_menu.addMenu('Style')
+                if self.style_menu is None:
+                    self.style_menu = analysis_menu.addMenu('Style')
 
                 # Exclusive action group
                 self._style_group = QtGui.QActionGroup(self)
@@ -2269,12 +2327,13 @@ class Main(QtWidgets.QMainWindow):
                     act.setChecked(key == self.analysis_style)
                     act.triggered.connect(lambda checked, k=key: self._set_analysis_style(k))
                     self._style_group.addAction(act)
-                    style_menu.addAction(act)
+                    self.style_menu.addAction(act)
                     self._style_actions[key] = act
 
                 if self.analysis_style not in self._style_actions:
                     self.analysis_style = 'rock_pop'
                     self._style_actions['rock_pop'].setChecked(True)
+                self._on_backend_changed(self.chord_backend)
             except Exception:
                 pass
         except Exception:
@@ -2406,6 +2465,24 @@ class Main(QtWidgets.QMainWindow):
         self.loop_poll.timeout.connect(self._auto_loop_tick)
         self.loop_poll.start()
 
+    def _on_backend_changed(self, backend: str):
+        """Update chosen backend and show/hide Style menu accordingly."""
+        self.chord_backend = backend
+        # Update checkmarks if the actions exist
+        try:
+            if getattr(self, "act_backend_internal", None):
+                self.act_backend_internal.setChecked(backend == "internal")
+            if getattr(self, "act_backend_chordino", None):
+                self.act_backend_chordino.setChecked(backend == "chordino")
+        except Exception:
+            pass
+        # Hide Style menu for chordino, show for internal
+        try:
+            if getattr(self, "style_menu", None):
+                self.style_menu.menuAction().setVisible(backend != "chordino")
+        except Exception:
+            pass
+
     def _toggle_always_recompute(self, checked: bool):
         try:
             s = QSettings("musicpractice", "musicpractice")
@@ -2421,7 +2498,7 @@ class Main(QtWidgets.QMainWindow):
                 return
             self._clear_cached_analysis(keep_stems=False)
             self._clear_stem_rows()
-            self.start_chord_analysis(path)  # runs Demucs + waits + chords
+            self.start_chord_analysis(path, force=True)  # runs Demucs + waits + chords
         except Exception:
             pass
 
@@ -2789,12 +2866,56 @@ class Main(QtWidgets.QMainWindow):
         except Exception:
             pass
 
+    def _set_backend(self, name: str):
+        """Set chord detection backend and keep menu checks in sync."""
+        try:
+            name = (name or "internal").lower()
+        except Exception:
+            name = "internal"
+        self.backend = "chordino" if name == "chordino" else "internal"
+        try:
+            if hasattr(self, "act_backend_internal"):
+                self.act_backend_internal.setChecked(self.backend == "internal")
+            if hasattr(self, "act_backend_chordino"):
+                self.act_backend_chordino.setChecked(self.backend == "chordino")
+        except Exception:
+            pass
+        try:
+            self._update_style_menu_visibility()
+        except Exception:
+            pass
+        try:
+            self.statusBar().showMessage(f"Chord backend: {self.backend}", 1500)
+        except Exception:
+            pass
+
     def _set_analysis_style(self, style_key: str):
         self.analysis_style = style_key
         try:
             self.statusBar().showMessage(f"Analysis style: {style_key}", 1500)
         except Exception:
             pass
+
+    def _update_style_menu_visibility(self):
+        """
+        Hide the chord style chooser when using Chordino (unused there),
+        show it for internal detectors.
+        """
+        active = getattr(self, "backend", getattr(self, "chord_backend", "internal"))
+        use_style = (active != "chordino")
+
+        # If you keep a reference to the style menu, update that (adjust attr name if needed)
+        for attr in ("menu_style", "style_menu", "menuStyle", "styleMenu"):
+            m = getattr(self, attr, None)
+            if isinstance(m, QtWidgets.QMenu):
+                m.menuAction().setVisible(use_style)
+
+        # Fallback: hide/show individual actions if you don't have the menu object
+        for attr in ("act_style_rock_pop", "act_style_jazz",
+                    "act_style_blues", "act_style_reggae", "act_style_default"):
+            a = getattr(self, attr, None)
+            if isinstance(a, QtGui.QAction):
+                a.setVisible(use_style)
 
     def populate_key_async(self, path: str):
         if getattr(self, 'key_worker', None) and self.key_worker.isRunning():
@@ -2815,7 +2936,7 @@ class Main(QtWidgets.QMainWindow):
         self.statusBar().showMessage(f"Key: {label}", 1500)
         if getattr(self, "_pending_chords_waiting_for_key", False) and getattr(self, "current_path", None):
             self._pending_chords_waiting_for_key = False
-            self.start_chord_analysis(self.current_path)
+            self.start_chord_analysis(self.current_path, force=False)
 
     def _normalize_chords_for_view(self, segments: list[dict]) -> list[dict]:
         """Normalize raw chord segments for display without writing the session.
@@ -3627,7 +3748,7 @@ class Main(QtWidgets.QMainWindow):
             pass
 
         # Kick the integrated pipeline: ChordWorker will do beats → Demucs (wait) → chords
-        self.start_chord_analysis(self.current_path)
+        self.start_chord_analysis(self.current_path, force=False)
 
         # Clear any active loop visuals when opening a file
         if hasattr(self, "wave") and self.wave:
@@ -3675,7 +3796,7 @@ class Main(QtWidgets.QMainWindow):
         if not self.last_beats:
             self.populate_beats_async(self.current_path)
         if not self.last_chords:
-            self.populate_chords_async(self.current_path)
+            self.populate_chords_async(self.current_path, force=False)
         if not (self.last_key and self.last_key.get("pretty")):
             self.populate_key_async(self.current_path)
 
@@ -3686,17 +3807,47 @@ class Main(QtWidgets.QMainWindow):
         # Focus waveform for immediate key control
         self.wave.setFocus()
 
-    def populate_chords_async(self, path: str):
-        # Delegate to the unified chord analysis entrypoint which runs Demucs
-        # with live logs and waits for stems before estimating chords.
-        return self.start_chord_analysis(path)
+    def populate_chords_async(self, path: str, force: bool = False):
+        """
+        Start (or skip) chord analysis. If we already have chords loaded from the
+        session and `force` is False, do nothing. Use `force=True` for explicit
+        recomputation from the UI.
+        """
+        try:
+            have_cached = bool(self.last_chords) and len(self.last_chords) > 0
+        except Exception:
+            have_cached = False
 
-    def start_chord_analysis(self, path: str):
-        # Stop any existing chord worker
+        if have_cached and not force:
+            try:
+                self.wave.set_chords(self.last_chords or [])
+                self.statusBar().showMessage(f"Chords (cached): {len(self.last_chords)} segments")
+                QtCore.QTimer.singleShot(1200, lambda: self.statusBar().clearMessage())
+            except Exception:
+                pass
+            return
+
+        return self.start_chord_analysis(path, force=force)
+
+    def start_chord_analysis(self, path: str, force: bool = False):
+        # Skip if a worker is already running
         if hasattr(self, "chord_worker") and self.chord_worker and self.chord_worker.isRunning():
-            self.chord_worker.requestInterruption()
-            self.chord_worker.quit()
-            self.chord_worker.wait()
+            return
+
+        # If we already have chords and not forcing, do not recompute
+        try:
+            have_cached = bool(self.last_chords) and len(self.last_chords) > 0
+        except Exception:
+            have_cached = False
+
+        if have_cached and not force:
+            try:
+                self.wave.set_chords(self.last_chords or [])
+                self.statusBar().showMessage(f"Chords (cached): {len(self.last_chords)} segments")
+                QtCore.QTimer.singleShot(1200, lambda: self.statusBar().clearMessage())
+            except Exception:
+                pass
+            return
 
         if not getattr(self, "last_key", None):
             self._pending_chords_waiting_for_key = True
@@ -3706,7 +3857,7 @@ class Main(QtWidgets.QMainWindow):
 
         cw = ChordWorker(path, style=getattr(self, "analysis_style", "rock_pop"))
         try:
-            cw.backend = getattr(self, 'chord_backend', 'internal')
+            cw.backend = getattr(self, 'backend', 'internal')
         except Exception:
             cw.backend = 'internal'
         cw.key_hint = dict(getattr(self, "last_key", {}) or {})
@@ -3849,7 +4000,7 @@ class Main(QtWidgets.QMainWindow):
         if not self.last_beats:
             self.populate_beats_async(self.current_path)
         if not self.last_chords:
-            self.populate_chords_async(self.current_path)
+            self.populate_chords_async(self.current_path, force=False)
         if not (self.last_key and self.last_key.get('pretty')):
             self.populate_key_async(self.current_path)
         total_s = self.player.n / self.player.sr
