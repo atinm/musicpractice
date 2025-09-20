@@ -30,6 +30,18 @@ from pathlib import Path
 import tempfile
 
 class WaveformView(QtWidgets.QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # Waveform drawing cache
+        self._waveform_cache = {}  # (stem_name, start_s, end_s, width) -> (mins, maxs, x0, x1)
+        self._cache_max_entries = 1000
+        self._last_paint_time = 0
+        self._paint_throttle_ms = 16  # ~60fps max
+
+        # Multi-resolution pyramid cache for ultra-fast scrolling
+        self._pyramid_cache = {}  # stem_name -> {level: (mins_array, maxs_array, total_samples)}
+        self._pyramid_levels = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]  # Downsampling factors
+
     def _coalesce_adjacent_same_label(self, segments: list[dict], eps: float = 1e-6) -> list[dict]:
         """Merge adjacent segments with the same label when end≈start.
         Keeps time order; does not cross bar boundaries (assumes caller split by bars first).
@@ -540,6 +552,153 @@ class WaveformView(QtWidgets.QWidget):
                 return bool(state[low])
         return False
 
+    def _slice_minmax_for_array_cached(self, stem_name: str, y: np.ndarray, start_s: float, end_s: float, width: int, sr: int):
+        """Cached version of _slice_minmax_for_array to avoid recomputation on scroll/zoom."""
+        # Initialize cache if it doesn't exist (for existing instances)
+        if not hasattr(self, '_waveform_cache'):
+            self._waveform_cache = {}
+        if not hasattr(self, '_cache_max_entries'):
+            self._cache_max_entries = 10000  # Large cache for ultra-fine precision scrolling
+
+        # Create cache key with very fine time precision for smooth scrolling
+        # Use 0.001 second precision (1ms) for ultra-smooth scrolling
+        cache_key = (stem_name, round(start_s, 3), round(end_s, 3), width)
+
+        # Check cache first
+        if cache_key in self._waveform_cache:
+            return self._waveform_cache[cache_key]
+
+        # Compute result
+        result = self._slice_minmax_for_array(y, start_s, end_s, width, sr)
+
+        # Cache the result (with size limit)
+        if len(self._waveform_cache) >= self._cache_max_entries:
+            # Remove oldest entries (simple FIFO) - remove fewer entries to reduce churn
+            oldest_keys = list(self._waveform_cache.keys())[:100]
+            for key in oldest_keys:
+                del self._waveform_cache[key]
+
+        self._waveform_cache[cache_key] = result
+        return result
+
+    def clear_waveform_cache(self):
+        """Clear the waveform cache. Call this when stems change or audio is reloaded."""
+        if not hasattr(self, '_waveform_cache'):
+            self._waveform_cache = {}
+        self._waveform_cache.clear()
+
+        # Also clear pyramid cache
+        if not hasattr(self, '_pyramid_cache'):
+            self._pyramid_cache = {}
+        self._pyramid_cache.clear()
+
+    def _build_pyramid_for_stem(self, stem_name: str, arr: np.ndarray, sr: int):
+        """Build multi-resolution pyramid for a stem. Expensive operation done once per stem."""
+        if not hasattr(self, '_pyramid_cache'):
+            self._pyramid_cache = {}
+        if not hasattr(self, '_pyramid_levels'):
+            self._pyramid_levels = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+
+        # Convert to mono if needed
+        y = np.asarray(arr)
+        if y.ndim == 2:
+            y = y.mean(axis=1)
+        y = np.asarray(y, dtype=np.float32, order='C')
+
+        N_total = int(y.shape[0])
+        if N_total <= 1:
+            return
+
+        # Build pyramid at multiple resolution levels
+        pyramid = {}
+        for level in self._pyramid_levels:
+            if level > N_total:
+                break
+
+            # Downsample by this factor
+            step = level
+            trimmed_len = (N_total // step) * step
+            if trimmed_len <= 0:
+                continue
+
+            seg = np.ascontiguousarray(y[:trimmed_len])
+            reshaped = seg.reshape(-1, step)
+            mins_array = reshaped.min(axis=1)
+            maxs_array = reshaped.max(axis=1)
+
+            pyramid[level] = (mins_array, maxs_array, N_total)
+
+        self._pyramid_cache[stem_name] = pyramid
+
+    def _get_pyramid_slice(self, stem_name: str, start_s: float, end_s: float, width: int, sr: int):
+        """Get waveform slice from pyramid - ultra-fast indexing operation."""
+        if stem_name not in self._pyramid_cache:
+            return None, None, 0, 0
+
+        pyramid = self._pyramid_cache[stem_name]
+        if not pyramid:
+            return None, None, 0, 0
+
+        # Choose appropriate pyramid level based on target resolution
+        target_samples = width * 2  # Aim for 2x display width for good quality
+        best_level = 1
+        for level in self._pyramid_levels:
+            if level <= target_samples:
+                best_level = level
+            else:
+                break
+
+        if best_level not in pyramid:
+            return None, None, 0, 0
+
+        mins_array, maxs_array, N_total = pyramid[best_level]
+
+        # Calculate time range
+        total_s = N_total / float(sr)
+        ov_start = max(0.0, float(start_s))
+        ov_end = min(float(end_s), total_s)
+
+        if ov_end <= ov_start:
+            return np.zeros(0, dtype=np.float32), np.zeros(0, dtype=np.float32), 0, 0
+
+        # Map to pyramid array indices
+        span = float(end_s - start_s) if float(end_s - start_s) != 0.0 else 1.0
+        x0 = int((ov_start - start_s) / span * width)
+        x1 = int((ov_end - start_s) / span * width)
+        x0 = max(0, min(width, x0))
+        x1 = max(x0 + 1, min(width, x1))
+
+        # Calculate which pyramid samples to use
+        a = max(0, min(N_total, int(ov_start * sr)))
+        b = max(a + 1, min(N_total, int(ov_end * sr)))
+
+        # Map to pyramid array indices
+        start_idx = a // best_level
+        end_idx = min(len(mins_array), (b + best_level - 1) // best_level)
+
+        if start_idx >= end_idx or start_idx >= len(mins_array):
+            return np.zeros(0, dtype=np.float32), np.zeros(0, dtype=np.float32), x0, x0
+
+        # Extract the slice - this is just array indexing, very fast!
+        mins_slice = mins_array[start_idx:end_idx]
+        maxs_slice = maxs_array[start_idx:end_idx]
+
+        # Ensure we have enough samples to fill the display width
+        # If we have fewer samples than needed, we need to stretch/interpolate
+        target_length = x1 - x0
+        if len(mins_slice) < target_length and len(mins_slice) > 0:
+            # Simple linear interpolation to fill the gap
+            indices = np.linspace(0, len(mins_slice) - 1, target_length)
+            mins_slice = np.interp(indices, np.arange(len(mins_slice)), mins_slice)
+            maxs_slice = np.interp(indices, np.arange(len(maxs_slice)), maxs_slice)
+        elif len(mins_slice) > target_length:
+            # Downsample if we have too many samples
+            indices = np.linspace(0, len(mins_slice) - 1, target_length)
+            mins_slice = np.interp(indices, np.arange(len(mins_slice)), mins_slice)
+            maxs_slice = np.interp(indices, np.arange(len(maxs_slice)), maxs_slice)
+
+        return mins_slice, maxs_slice, x0, x1
+
     def _slice_minmax_for_array(self, y: np.ndarray, start_s: float, end_s: float, width: int, sr: int):
         try:
             if width <= 2 or y is None or sr is None:
@@ -1021,8 +1180,30 @@ class WaveformView(QtWidgets.QWidget):
         return sorted(uniq.values(), key=lambda x: (x['start'], x['end']))
 
     def paintEvent(self, e: QtGui.QPaintEvent):
+        # Initialize attributes if they don't exist (for existing instances)
+        if not hasattr(self, '_last_paint_time'):
+            self._last_paint_time = 0
+        if not hasattr(self, '_paint_throttle_ms'):
+            self._paint_throttle_ms = 4  # Reduce to ~240fps for very smooth scrolling
+        if not hasattr(self, '_waveform_cache'):
+            self._waveform_cache = {}
+        if not hasattr(self, '_cache_max_entries'):
+            self._cache_max_entries = 10000  # Large cache for ultra-fine precision scrolling
+        if not hasattr(self, '_pyramid_cache'):
+            self._pyramid_cache = {}
+        if not hasattr(self, '_pyramid_levels'):
+            self._pyramid_levels = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+
+        # Disable paint throttling for maximum smoothness
+        # import time
+        # current_time = time.time() * 1000  # Convert to milliseconds
+        # if current_time - self._last_paint_time < self._paint_throttle_ms:
+        #     return
+        # self._last_paint_time = current_time
+
         p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.Antialiasing, False)
+        p.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, False)  # Disable for better performance
         w = self.width()
         h = self.height()
         if w < 10 or h < 10:
@@ -1049,6 +1230,14 @@ class WaveformView(QtWidgets.QWidget):
             short_len = min(6, wf_h)
 
             stems = self._get_stems_for_display() if getattr(self, "show_stems", True) else []
+
+            # Build pyramids for stems if not already built
+            sr = getattr(self.player, 'sr', None)
+            if stems and sr is not None:
+                for stem_name, arr in stems:
+                    if stem_name not in self._pyramid_cache:
+                        self._build_pyramid_for_stem(stem_name, arr, sr)
+
             if stems:
                 # Divide body area into rows for each stem
                 rows = len(stems)
@@ -1063,25 +1252,52 @@ class WaveformView(QtWidgets.QWidget):
                     # Border
                     p.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0)))
                     p.drawRect(0, y_cursor, max(1, w-1), max(1, row_h-1))
-                    # Envelope
+                    # Envelope - use pyramid for ultra-fast rendering
                     sr = getattr(self.player, 'sr', None)
-                    mins, maxs, x0_seg, x1_seg = self._slice_minmax_for_array(arr, t0, t1, w, sr)
+                    if (hasattr(self, '_pyramid_cache') and
+                        stem_name in self._pyramid_cache and
+                        self._pyramid_cache[stem_name]):
+                        # Use pyramid for ultra-fast scrolling
+                        mins, maxs, x0_seg, x1_seg = self._get_pyramid_slice(stem_name, t0, t1, w, sr)
+                        # Fallback to cached computation if pyramid fails
+                        if mins is None or len(mins) == 0:
+                            mins, maxs, x0_seg, x1_seg = self._slice_minmax_for_array_cached(stem_name, arr, t0, t1, w, sr)
+                    else:
+                        # Fallback to cached computation
+                        mins, maxs, x0_seg, x1_seg = self._slice_minmax_for_array_cached(stem_name, arr, t0, t1, w, sr)
                     if mins is not None and maxs is not None:
                         mid = y_cursor + row_h // 2
                         amp = max(1, int(row_h * 0.45))
                         # Envelope color: lighter when muted
                         if muted:
-                            p.setPen(QtGui.QPen(QtGui.QColor(170, 190, 210)))  # light grey-blue for muted
+                            color = QtGui.QColor(170, 190, 210)  # light grey-blue for muted
                         else:
-                            p.setPen(QtGui.QPen(QtGui.QColor(0, 180, 255)))   # bright cyan for active
+                            color = QtGui.QColor(0, 180, 255)   # bright cyan for active
+
                         L = min(len(mins), max(0, x1_seg - x0_seg), w - x0_seg)
-                        for i in range(L):
-                            x = x0_seg + i
-                            y1 = mid - int(maxs[i] * amp)
-                            y2 = mid - int(mins[i] * amp)
-                            if y1 > y2:
-                                y1, y2 = y2, y1
-                            p.drawLine(x, y1, x, y2)
+                        if L > 0:
+                            # Create filled polygon for smooth waveform display
+                            points = []
+                            # Top envelope (maxs)
+                            for i in range(L):
+                                x = x0_seg + i
+                                y = mid - int(maxs[i] * amp)
+                                points.append(QtCore.QPoint(x, y))
+                            # Bottom envelope (mins) in reverse
+                            for i in range(L-1, -1, -1):
+                                x = x0_seg + i
+                                y = mid - int(mins[i] * amp)
+                                points.append(QtCore.QPoint(x, y))
+
+                            if len(points) > 2:
+                                # Set brush and pen for this specific stem
+                                p.setBrush(QtGui.QBrush(color))
+                                p.setPen(QtGui.QPen(color))
+                                polygon = QtGui.QPolygon(points)
+                                p.drawPolygon(polygon)  # This will now be filled due to the brush
+
+                                # Reset brush to transparent to avoid affecting other drawing
+                                p.setBrush(QtGui.QBrush(QtCore.Qt.NoBrush))
                     # Stem label at top-left inside the row
                     p.setPen(QtGui.QPen(QtGui.QColor(210, 220, 230)))
                     fm = p.fontMetrics()
@@ -2009,9 +2225,10 @@ class Main(QtWidgets.QMainWindow):
                     setattr(self.player, 'stems_arrays', arrays)
                 except Exception:
                     pass
-        # Nudge the view to repaint using stems
+        # Clear waveform cache and nudge the view to repaint using stems
         try:
             if hasattr(self, 'wave') and self.wave is not None:
+                self.wave.clear_waveform_cache()
                 self.wave.update()
         except Exception:
             pass
@@ -2543,6 +2760,9 @@ class Main(QtWidgets.QMainWindow):
                     self.player.set_stems_arrays({})
                 setattr(self.player, 'stems_arrays', {})
                 setattr(self.player, 'stem_mute', {})
+            # Clear waveform cache when stems are cleared
+            if hasattr(self, 'wave') and self.wave is not None:
+                self.wave.clear_waveform_cache()
         except Exception:
             pass
         try:
