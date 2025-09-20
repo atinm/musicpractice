@@ -1,15 +1,22 @@
 import sys
 import json
 import shutil
+import os
 from pathlib import Path
+
+# Ensure the Vamp plugin path is visible even when launched from IDE / different shells
+os.environ.setdefault(
+    "VAMP_PATH",
+    f"{Path.home()}/Library/Audio/Plug-Ins/Vamp:/Library/Audio/Plug-Ins/Vamp"
+)
 from PySide6 import QtWidgets, QtCore, QtGui
 from PySide6.QtCore import Qt, QThread, Signal, QSettings
-from PySide6.QtGui import QAction, QKeySequence, QShortcut
+from PySide6.QtGui import QAction, QKeySequence, QShortcut, QActionGroup
 import numpy as np
 import traceback
 import logging
 from audio_engine import LoopPlayer
-from chords import estimate_chords_stem_aware as _stem_aware, estimate_chords as _fast_est, estimate_key, estimate_beats
+from chords import estimate_chords_stem_aware as _stem_aware, estimate_chords as _fast_est, estimate_chords_chordino_vamp as _chordino, estimate_key, estimate_beats
 try:
     from timestretch import render_time_stretch
     HAS_STRETCH = True
@@ -831,14 +838,96 @@ class WaveformView(QtWidgets.QWidget):
             if e <= s:
                 continue
             # find bar at/before start
-            bs = max((b for b in bars_sorted if b <= s), default=s)
+            less_eq = [b for b in bars_sorted if b <= s]
+            bs = max(less_eq) if less_eq else bars_sorted[0]
             # find bar at/after end
-            be = min((b for b in bars_sorted if b >= e), default=e)
+            great_eq = [b for b in bars_sorted if b >= e]
+            be = min(great_eq) if great_eq else bars_sorted[-1]
             # ensure strictly increasing
             if be <= bs:
                 # if collapsed due to missing bars, keep original
                 bs, be = s, e
             out.append({'start': bs, 'end': be, 'label': lab})
+        return out
+
+    def _snap_and_split_to_bars(self, chords, beats, downbeats):
+        """
+        chords: list of {start, end, label}
+        beats: list[float] beat times (ascending)
+        downbeats: list[float] bar-start times (subset of beats)
+
+        Returns list of {start, end, label}:
+        - starts/ends snapped to nearest beat
+        - segments split at every bar boundary
+        - keeps multiple blocks if chords change within a bar
+        """
+        import numpy as np
+        if not chords:
+            return []
+        # De-duplicate & sort grids
+        bt = np.asarray(sorted(set(float(x) for x in (beats or []))), dtype=float)
+        db = np.asarray(sorted(set(float(x) for x in (downbeats or []))), dtype=float)
+
+        def _snap(t):
+            if bt.size == 0:
+                return float(t)
+            j = int(np.clip(np.argmin(np.abs(bt - t)), 0, bt.size - 1))
+            return float(bt[j])
+
+        # 1) snap to beats
+        snapped = []
+        for d in chords:
+            try:
+                a_raw = float(d["start"]); b_raw = float(d["end"]); lab = d.get("label")
+            except Exception:
+                continue
+            a = _snap(a_raw); b = _snap(b_raw)
+            if bt.size > 1 and b <= a:
+                # minimal nonzero span = one beat
+                b = a + float(bt[1] - bt[0])
+            if b > a:
+                snapped.append({"start": a, "end": b, "label": lab})
+
+        if not snapped:
+            return []
+
+        if db.size == 0:
+            return snapped
+
+        # 2) split at every bar boundary
+        out = []
+        for seg in snapped:
+            a, b, lab = float(seg["start"]), float(seg["end"]), seg.get("label")
+            # bar cuts strictly inside [a, b)
+            cuts = [float(t) for t in db if a < float(t) < b]
+            pts = [a] + cuts + [b]
+            for u, v in zip(pts[:-1], pts[1:]):
+                if (v - u) > 1e-6:
+                    out.append({"start": u, "end": v, "label": lab})
+        # Stable by time
+        out.sort(key=lambda s: (s["start"], s["end"]))
+        return out
+
+    def _unique_by_span_no_crossbar(self, segs, bars):
+        """Merge only truly identical neighbors inside the SAME bar."""
+        if not segs:
+            return []
+        import bisect
+        # Sort bars once (float) for stable bar index computations
+        bars_sorted = sorted(float(b) for b in (bars or []))
+        def bar_idx(t):
+            return max(0, bisect.bisect_right(bars_sorted, float(t)) - 1) if bars_sorted else 0
+
+        out = [dict(segs[0])]
+        for s in segs[1:]:
+            prev = out[-1]
+            same_label = (s.get("label") == prev.get("label"))
+            same_bar   = (bar_idx(s.get("start")) == bar_idx(prev.get("end", 0.0) - 1e-6))
+            contiguous = abs(float(s.get("start", 0.0)) - float(prev.get("end", 0.0))) < 1e-6
+            if same_label and same_bar and contiguous:
+                prev["end"] = float(s.get("end", prev["end"]))
+            else:
+                out.append(dict(s))
         return out
 
     def _split_segments_at_bars(self, segments: list[dict], bars: list[float]) -> list[dict]:
@@ -867,7 +956,13 @@ class WaveformView(QtWidgets.QWidget):
                 continue
             t0 = start
             # collect internal bar cuts strictly inside (start, end)
-            cuts = [b for b in bars_sorted if start < b < end]
+            cuts = []
+            last_cut = None
+            for b in bars_sorted:
+                if start < b < end:
+                    if last_cut is None or abs(b - last_cut) > 1e-9:
+                        cuts.append(b)
+                        last_cut = b
             prev = t0
             for cut in cuts:
                 out.append({'start': prev, 'end': cut, 'label': label})
@@ -1293,12 +1388,30 @@ class WaveformView(QtWidgets.QWidget):
                 x1 = int((b_rel - rel_t0) / (rel_t1 - rel_t0) * w)
                 rect = QtCore.QRect(x0, wf_h, max(1, x1 - x0), ch_h)
                 p.fillRect(rect, QtGui.QColor(50, 80, 110))
-                # Brighter outline for the chord box, with increased width
+                # Brighter rounded outline for the chord box, with increased width
                 bright_pen = QtGui.QPen(QtGui.QColor(0, 0, 0))
                 bright_pen.setWidth(2)
                 p.setPen(bright_pen)
-                p.drawRect(rect)
-                # Chord label
+                p.drawRoundedRect(rect, 6, 6)
+                # Draw a dashed beat grid inside the chord box if beats are available
+                if self.beats:
+                    try:
+                        # Only draw lines for beats strictly within [a, b]
+                        beat_arr = [float(bt) for bt in self.beats]
+                        for beat in beat_arr:
+                            if a < beat < b:
+                                # Map beat time to x in current rect
+                                beat_rel = beat - self.origin
+                                x_beat = int((beat_rel - rel_t0) / (rel_t1 - rel_t0) * w)
+                                # Clamp to inside the chord rect
+                                if x0 < x_beat < x1:
+                                    pen_beat = QtGui.QPen(QtGui.QColor(200, 200, 200, 120))
+                                    pen_beat.setStyle(QtCore.Qt.DashLine)
+                                    p.setPen(pen_beat)
+                                    p.drawLine(x_beat, wf_h, x_beat, wf_h + ch_h)
+                    except Exception:
+                        pass
+                # Chord label (drawn last, overlays above grid)
                 p.setPen(QtGui.QPen(QtGui.QColor(230, 230, 230)))
                 p.drawText(rect.adjusted(4, 0, -4, 0), Qt.AlignVCenter | Qt.AlignLeft, seg['label'])
 
@@ -1314,6 +1427,7 @@ class ChordWorker(QThread):
         self.path = path
         self.style = style
         self.key_hint = None
+        self.backend = 'internal'
 
     def _log(self, msg: str):
         s = str(msg)
@@ -1506,6 +1620,15 @@ class ChordWorker(QThread):
         down_kw = kwargs.get("downbeats")
         bs_kw = kwargs.get("beat_strengths")
         stems_kw = kwargs.get("stems")
+        backend = getattr(self,'backend','internal')
+        self._log(f"Chord backend: {backend}")
+        if isinstance(backend, str) and backend.lower() == "chordino":
+            return _chordino(
+                audio_path,
+                beats=kwargs.get("beats"),
+                downbeats=kwargs.get("downbeats"),
+            )
+
         if stems_kw and beats_kw:
             self._log("Using stem-aware chord detector")
             return _stem_aware(audio_path, sr=sr, hop=hop,
@@ -2081,6 +2204,20 @@ class Main(QtWidgets.QMainWindow):
                     break
             if analysis_menu is None:
                 analysis_menu = self.menuBar().addMenu("Analysis")
+            backend_menu = analysis_menu.addMenu("Chord Backend")
+            ag = QActionGroup(self); ag.setExclusive(True)
+
+            act_int = QAction("Internal", self, checkable=True)
+            act_aut = QAction("Chordino", self, checkable=True)
+            act_int.setChecked(True)
+
+            for a in (act_int, act_aut):
+                ag.addAction(a)
+                backend_menu.addAction(a)
+
+            self.chord_backend = 'internal'
+            act_int.triggered.connect(lambda: setattr(self, 'chord_backend', 'internal'))
+            act_aut.triggered.connect(lambda: setattr(self, 'chord_backend', 'chordino'))
 
             self.actReextractStems = QAction("Re-extract Stems", self)
             self.actReextractStems.setStatusTip("Run Demucs again and refresh stems before chord detection")
@@ -2680,6 +2817,22 @@ class Main(QtWidgets.QMainWindow):
             self._pending_chords_waiting_for_key = False
             self.start_chord_analysis(self.current_path)
 
+    def _normalize_chords_for_view(self, segments: list[dict]) -> list[dict]:
+        """Normalize raw chord segments for display without writing the session.
+        Pipeline: snap to bars → split at bars → ensure leading bar → unique-by-span.
+        Falls back to the input on error.
+        """
+        try:
+            bars = list(self.last_bars or [])
+            snapped = self.wave._snap_segments_to_bars(segments or [], bars)
+            split = self.wave._split_segments_at_bars(snapped, bars)
+            filled = self.wave._ensure_leading_bar(split, bars)
+            dedup = self.wave._unique_by_span(filled)
+            return dedup
+        except Exception as ex:
+            logging.error(f"_normalize_chords_for_view failed: {ex}")
+            return list(segments or [])
+
     def load_session(self):
         # Use current file’s sidecar if a song is loaded; else prompt for JSON
         if self.current_path:
@@ -2744,13 +2897,12 @@ class Main(QtWidgets.QMainWindow):
         self.last_chords = list(data.get("chords", []))
         if self.last_chords:
             try:
-                snapped = self.wave._snap_segments_to_bars(self.last_chords, self.last_bars or [])
-                split = self.wave._split_segments_at_bars(snapped, self.last_bars or [])
-                filled = self.wave._ensure_leading_bar(split, self.last_bars or [])
-                self.last_chords = self.wave._unique_by_span(filled)
-            except Exception:
-                pass
-            self.wave.set_chords(self.last_chords)
+                normalized = self._normalize_chords_for_view(self.last_chords)
+                self.last_chords = list(normalized)
+                self.wave.set_chords(self.last_chords)
+            except Exception as ex:
+                logging.error(f"load_session normalize failed: {ex}")
+                self.wave.set_chords(list(self.last_chords or []))
         # Rate
         if "rate" in data:
             try:
@@ -3553,6 +3705,10 @@ class Main(QtWidgets.QMainWindow):
             return
 
         cw = ChordWorker(path, style=getattr(self, "analysis_style", "rock_pop"))
+        try:
+            cw.backend = getattr(self, 'chord_backend', 'internal')
+        except Exception:
+            cw.backend = 'internal'
         cw.key_hint = dict(getattr(self, "last_key", {}) or {})
         cw.setParent(self)
         # Ensure Demucs logs are visible and wire stem loading
@@ -3573,21 +3729,26 @@ class Main(QtWidgets.QMainWindow):
         cw.start()
 
     def _chords_ready(self, segments: list[dict]):
-        # Normalize chords to bar-aligned & split form before persisting
+        """Normalize chord segments, then persist + paint."""
         try:
-            snapped = self.wave._snap_segments_to_bars(segments or [], self.last_bars or [])
-            split = self.wave._split_segments_at_bars(snapped, self.last_bars or [])
-            filled = self.wave._ensure_leading_bar(split, self.last_bars or [])
-            dedup = self.wave._unique_by_span(filled)
-            segments = dedup
+            segments = self._normalize_chords_for_view(segments)
+        except Exception as ex:
+            logging.error(f"_chords_ready normalize failed: {ex}")
+
+        self.last_chords = list(segments)
+        if hasattr(self, "wave") and self.wave is not None:
+            self.wave.set_chords(self.last_chords)
+
+        # best-effort session save & status
+        try:
+            self.save_session()
         except Exception:
             pass
-        self.last_chords = list(segments or [])
-        self.wave.set_chords(self.last_chords)
-        self.save_session()
-        # Clear the waiting message after a short delay
-        self.statusBar().showMessage(f"Chords: {len(self.last_chords)} segments")
-        QtCore.QTimer.singleShot(1500, lambda: self.statusBar().clearMessage())
+        try:
+            self.statusBar().showMessage(f"Chords: {len(self.last_chords)} segments")
+            QtCore.QTimer.singleShot(1500, lambda: self.statusBar().clearMessage())
+        except Exception:
+            pass
 
     def toggle_play(self):
         if not self.player:

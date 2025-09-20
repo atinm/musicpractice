@@ -1,6 +1,8 @@
 # chords.py
 import numpy as np
 import librosa
+import soundfile as sf
+import vamp  # from vamphost
 
 # Enharmonic naming: choose sharps or flats later based on key context
 SHARP_NAMES = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
@@ -1383,6 +1385,61 @@ def estimate_chords_stem_aware(
     if beats:
         segments = [dict(s, beat_sync=True) for s in segments]
     return segments
+
+def estimate_chords_chordino_vamp(audio_path: str, beats=None, downbeats=None, **kwargs):
+    """
+    Use Vamp host to run nnls-chroma:chordino → segments [{start,end,label}].
+    If beats are provided, snap to beats; split at downbeats if provided.
+    """
+    import numpy as np
+
+    y, sr = sf.read(audio_path, dtype='float32', always_2d=False)
+    if y.ndim > 1:
+        y = y.mean(axis=1)  # mono
+
+    # Collect simple chord labels (time-stamped)
+    res = vamp.collect(y, sr, "nnls-chroma:chordino", output="simplechord")
+    evs = res.get("list", [])
+    if not evs:
+        return []
+
+    # Convert events → segments (end = next start; last gets small tail)
+    segs = []
+    for i, ev in enumerate(evs):
+        t0 = float(ev["timestamp"])
+        t1 = float(evs[i+1]["timestamp"]) if i+1 < len(evs) else (t0 + 1.0)
+        lab = str(ev["label"])
+        if t1 > t0:
+            segs.append({"start": t0, "end": t1, "label": lab})
+
+    # Optional: snap to closest beats
+    if beats:
+        bt = np.asarray(beats, dtype=float)
+        def _snap(t):
+            j = int(np.clip(np.argmin(np.abs(bt - t)), 0, len(bt)-1))
+            return float(bt[j])
+        for s in segs:
+            s["start"], s["end"] = _snap(s["start"]), _snap(s["end"])
+            if s["end"] <= s["start"] and len(bt) > 1:
+                s["end"] = s["start"] + (bt[1]-bt[0])
+
+    # Optional: split at bar boundaries (downbeats)
+    if downbeats and beats:
+        split = []
+        for s in segs:
+            a, b, lab = float(s["start"]), float(s["end"]), s["label"]
+            cuts = [x for x in downbeats if (x > a) and (x < b)]
+            if not cuts:
+                split.append(s)
+            else:
+                pts = [a] + list(cuts) + [b]
+                for u, v in zip(pts[:-1], pts[1:]):
+                    if v - u > 1e-3:
+                        split.append({"start": float(u), "end": float(v), "label": lab})
+        segs = split
+
+    # Filter zero-length
+    return [s for s in segs if (s["end"] - s["start"]) > 1e-3]
 
 def estimate_chords(
     audio_path: str,
