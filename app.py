@@ -40,6 +40,9 @@ class WaveformView(QtWidgets.QWidget):
 
         # Multi-resolution pyramid cache for ultra-fast scrolling
         self._pyramid_cache = {}  # stem_name -> {level: (mins_array, maxs_array, total_samples)}
+
+        # Solo state
+        self.soloed_stem = None  # name of soloed stem, or None
         self._pyramid_levels = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]  # Downsampling factors
 
     def _coalesce_adjacent_same_label(self, segments: list[dict], eps: float = 1e-6) -> list[dict]:
@@ -242,6 +245,11 @@ class WaveformView(QtWidgets.QWidget):
 
     def set_show_stems(self, show: bool):
         self.show_stems = bool(show)
+        self.update()
+
+    def set_soloed_stem(self, stem_name: str | None):
+        """Set which stem is soloed for display. None means no solo."""
+        self.soloed_stem = stem_name
         self.update()
 
     def set_chords(self, segments: list[dict]):
@@ -1229,7 +1237,53 @@ class WaveformView(QtWidgets.QWidget):
             long_len = min(12, wf_h)
             short_len = min(6, wf_h)
 
-            stems = self._get_stems_for_display() if getattr(self, "show_stems", True) else []
+            # Check if we should show solo mode
+            soloed_stem = getattr(self, 'soloed_stem', None)
+            in_solo_mode = False
+            if soloed_stem:
+                # Solo mode: show only the soloed stem as a full-width waveform
+                stems = self._get_stems_for_display()
+                solo_stem_data = None
+                for stem_name, arr in stems:
+                    if stem_name == soloed_stem:
+                        solo_stem_data = (stem_name, arr)
+                        break
+
+                if solo_stem_data:
+                    in_solo_mode = True
+                    # Draw soloed stem as full-width waveform (like combined waveform)
+                    stem_name, arr = solo_stem_data
+                    sr = getattr(self.player, 'sr', None)
+                    if sr is not None:
+                        if stem_name not in self._pyramid_cache:
+                            self._build_pyramid_for_stem(stem_name, arr, sr)
+
+                        # Use pyramid for ultra-fast rendering
+                        if (hasattr(self, '_pyramid_cache') and
+                            stem_name in self._pyramid_cache and
+                            self._pyramid_cache[stem_name]):
+                            mins, maxs, x0_seg, x1_seg = self._get_pyramid_slice(stem_name, t0, t1, w, sr)
+                            if mins is None or len(mins) == 0:
+                                mins, maxs, x0_seg, x1_seg = self._slice_minmax_for_array_cached(stem_name, arr, t0, t1, w, sr)
+                        else:
+                            mins, maxs, x0_seg, x1_seg = self._slice_minmax_for_array_cached(stem_name, arr, t0, t1, w, sr)
+
+                        if mins is not None and maxs is not None:
+                            mid = body_top + body_h // 2
+                            amp = max(1, int(body_h * 0.45))
+                            # Draw as filled waveform like combined view
+                            p.setPen(QtGui.QPen(QtGui.QColor(100, 150, 255)))
+                            for i in range(len(mins)):
+                                x = x0_seg + i
+                                if 0 <= x < w:
+                                    y1 = mid - int(mins[i] * amp)
+                                    y2 = mid - int(maxs[i] * amp)
+                                    p.drawLine(x, y1, x, y2)
+                # Skip the rest of the waveform drawing logic in solo mode
+                stems = []
+            else:
+                # Normal mode: show stems or combined waveform
+                stems = self._get_stems_for_display() if getattr(self, "show_stems", True) else []
 
             # Build pyramids for stems if not already built
             sr = getattr(self.player, 'sr', None)
@@ -1304,7 +1358,7 @@ class WaveformView(QtWidgets.QWidget):
                     text_y = y_cursor + fm.ascent() + 2  # small top padding
                     p.drawText(6, text_y, str(stem_name))
                     y_cursor += row_h + row_gap
-            else:
+            elif not in_solo_mode:
                 # Fallback: single mixed waveform from the player's audio buffer
                 mins, maxs = self._mono_slice_minmax(t0, t1, w)
                 if mins is not None:
@@ -3437,7 +3491,7 @@ class Main(QtWidgets.QMainWindow):
         vlay.setContentsMargins(6, 4, 6, 6)
         vlay.setSpacing(4)
 
-        # --- Top line: Label (left) + Mute (right) ---
+        # --- Top line: Label (left) + Solo + Mute (right) ---
         top = QtWidgets.QHBoxLayout()
         top.setContentsMargins(0, 0, 0, 0)
         top.setSpacing(8)
@@ -3448,6 +3502,11 @@ class Main(QtWidgets.QMainWindow):
         lbl.setFont(f)
         top.addWidget(lbl, 0, Qt.AlignVCenter | Qt.AlignLeft)
         top.addStretch(1)
+
+        # Solo radio button
+        solo_btn = QtWidgets.QRadioButton("Solo", row)
+        solo_btn.setChecked(False)
+        top.addWidget(solo_btn, 0, Qt.AlignVCenter | Qt.AlignRight)
 
         chk = QtWidgets.QCheckBox("Mute", row)
         chk.setChecked(False)
@@ -3504,6 +3563,50 @@ class Main(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
+        def _apply_solo(soloed: bool):
+            soloed = bool(soloed)
+
+            # Check if this was the currently soloed stem BEFORE updating the engine
+            was_soloed_stem = False
+            try:
+                if self.player and hasattr(self.player, 'get_soloed_stem'):
+                    current_solo = self.player.get_soloed_stem()
+                    was_soloed_stem = (current_solo == stem_key)
+            except Exception:
+                pass
+
+            # Update engine
+            try:
+                if self.player and hasattr(self.player, 'set_stem_solo'):
+                    self.player.set_stem_solo(stem_key, soloed)
+            except Exception:
+                pass
+
+            # Update waveform view to show solo mode
+            try:
+                if hasattr(self, 'wave') and self.wave is not None:
+                    if soloed:
+                        # Solo mode: show only this stem
+                        self.wave.set_soloed_stem(stem_key)
+                    else:
+                        # Unsolo: if this was the soloed stem, return to current view mode
+                        if was_soloed_stem:
+                            self.wave.set_soloed_stem(None)
+                    self.wave.update()
+                    QtCore.QTimer.singleShot(0, self.wave.update)
+            except Exception:
+                pass
+
+            # Update all other solo buttons to be unchecked
+            if soloed:
+                try:
+                    # Find all other solo buttons and uncheck them
+                    for widget in self.stems_layout.parent().findChildren(QtWidgets.QRadioButton):
+                        if widget != solo_btn and widget.text() == "Solo":
+                            widget.setChecked(False)
+                except Exception:
+                    pass
+
         def _apply_gain(val: int):
             g = float(val) / 100.0
             try:
@@ -3513,6 +3616,7 @@ class Main(QtWidgets.QMainWindow):
                 pass
 
         chk.toggled.connect(_apply_mute)
+        solo_btn.toggled.connect(_apply_solo)
         sld.valueChanged.connect(_apply_gain)
 
         # Init visual/engine state

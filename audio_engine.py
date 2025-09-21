@@ -170,6 +170,8 @@ class LoopPlayer:
         self._stems_play = {}     # name -> np.ndarray (N, C) stretched/output domain
         self._stem_gains = {}     # name -> float in [0.0, 1.0]
         self._stem_mute = {}      # name -> bool
+        self._stem_solo = {}      # name -> bool
+        self._soloed_stem = None  # name of currently soloed stem, or None
         self._use_stems_only = True  # if True and stems exist, ignore full mix and play stems sum
         self._load(path)
         # === Time‑stretch / playback state ===
@@ -207,6 +209,8 @@ class LoopPlayer:
         self._stems_play = {}
         self._stem_gains = {}
         self._stem_mute = {}
+        self._stem_solo = {}
+        self._soloed_stem = None
 
     def reload(self, path: str):
         was_playing = self._playing
@@ -270,6 +274,8 @@ class LoopPlayer:
         self._stems_play = {}
         self._stem_gains = {}
         self._stem_mute = {}
+        self._stem_solo = {}
+        self._soloed_stem = None
         if not stems:
             return
         for name, arr in stems.items():
@@ -282,6 +288,7 @@ class LoopPlayer:
             self._stems_base[str(name)] = a
             self._stem_gains[str(name)] = 1.0
             self._stem_mute[str(name)] = False
+            self._stem_solo[str(name)] = False
         self._rebuild_stems_for_rate()
 
     def clear_stems(self):
@@ -289,12 +296,41 @@ class LoopPlayer:
         self._stems_play.clear()
         self._stem_gains.clear()
         self._stem_mute.clear()
+        self._stem_solo.clear()
+        self._soloed_stem = None
 
     def set_stem_gain(self, name: str, gain01: float):
         self._stem_gains[str(name)] = float(max(0.0, min(1.0, gain01)))
 
     def set_stem_mute(self, name: str, muted: bool):
         self._stem_mute[str(name)] = bool(muted)
+
+    def set_stem_solo(self, name: str, soloed: bool):
+        """Set solo state for a stem. When soloed, all other stems are muted."""
+        name = str(name)
+        self._stem_solo[name] = bool(soloed)
+
+        if soloed:
+            # Solo this stem: mute all others, unmute this one
+            self._soloed_stem = name
+            for stem_name in self._stem_solo.keys():
+                if stem_name != name:
+                    self._stem_mute[stem_name] = True
+                    self._stem_solo[stem_name] = False  # Clear other solo states
+                else:
+                    self._stem_mute[stem_name] = False
+        else:
+            # Unsolo this stem: if it was the soloed one, clear solo state
+            if self._soloed_stem == name:
+                self._soloed_stem = None
+                # Unmute all stems and clear all solo states
+                for stem_name in self._stem_solo.keys():
+                    self._stem_mute[stem_name] = False
+                    self._stem_solo[stem_name] = False
+
+    def get_soloed_stem(self) -> str | None:
+        """Get the name of the currently soloed stem, or None if none."""
+        return self._soloed_stem
 
     def use_stems_only(self, enabled: bool):
         self._use_stems_only = bool(enabled)
