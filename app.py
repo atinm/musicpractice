@@ -29,6 +29,10 @@ import os
 from pathlib import Path
 import tempfile
 
+# Import piano widget and note detection
+from piano_widget import PianoRollWidget
+from note_detection import compute_note_confidence
+
 class WaveformView(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -44,6 +48,12 @@ class WaveformView(QtWidgets.QWidget):
         # Solo state
         self.soloed_stem = None  # name of soloed stem, or None
         self._pyramid_levels = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]  # Downsampling factors
+
+        # Spectrum band for solo mode
+        self.spectrum_data = None  # Current spectrum data at playhead
+        self.spectrum_band_height = 80  # Height of spectrum band in pixels
+        self.piano_roll_widget = PianoRollWidget(self)
+        self.piano_roll_widget.hide()
 
     def _coalesce_adjacent_same_label(self, segments: list[dict], eps: float = 1e-6) -> list[dict]:
         """Merge adjacent segments with the same label when end≈start.
@@ -226,6 +236,13 @@ class WaveformView(QtWidgets.QWidget):
         # Context menu suppression flag for right-click handling (unused now; we rely on contextMenuEvent only)
         self._suppress_next_ctx = False  # (unused now; we rely on contextMenuEvent only)
         self.clear_loop_visual()
+        # Ensure embedded piano roll widget exists (used in solo mode)
+        try:
+            _ = self.piano_roll_widget
+        except AttributeError:
+            from piano_widget import PianoRollWidget
+            self.piano_roll_widget = PianoRollWidget(self)
+            self.piano_roll_widget.hide()
 
     def set_beats(self, beats: list | None, bars: list | None):
         self.beats = beats or []
@@ -250,7 +267,143 @@ class WaveformView(QtWidgets.QWidget):
     def set_soloed_stem(self, stem_name: str | None):
         """Set which stem is soloed for display. None means no solo."""
         self.soloed_stem = stem_name
+
+        # Show/hide piano roll widget based on solo mode
+        if stem_name is None:
+            # Not in solo mode - hide piano widget
+            if self.piano_roll_widget is not None:
+                self.piano_roll_widget.hide()
+        else:
+            # In solo mode - ensure piano widget is created and shown
+            if self.piano_roll_widget is None:
+                # Create piano widget if it doesn't exist
+                self.piano_roll_widget = PianoRollWidget(self)
+                print("Created piano roll widget for solo mode")
+
+            # Always show the piano widget in solo mode
+            self.piano_roll_widget.show()
+            self.piano_roll_widget.raise_()
+
         self.update()
+
+    def _compute_spectrum_at_playhead(self):
+        """Compute frequency spectrum at current playhead position for soloed stem using librosa CQT."""
+        if not getattr(self, 'soloed_stem', None) or not self.player:
+            self.spectrum_data = None
+            return
+
+        try:
+            # Get current playhead position (prefer explicit seconds method)
+            playhead_time = None
+            try:
+                if hasattr(self.player, 'position_seconds') and callable(self.player.position_seconds):
+                    playhead_time = float(self.player.position_seconds())
+                else:
+                    playhead_time = float(getattr(self.player, 'position', 0.0))
+            except Exception:
+                playhead_time = 0.0
+            # Allow t=0.0; only bail if playhead_time is negative
+            if playhead_time is None or playhead_time < 0.0:
+                self.spectrum_data = None
+                return
+
+            # Get the soloed stem data
+            stems = self._get_stems_for_display()
+            solo_stem_data = None
+            for stem_name, arr in stems:
+                if stem_name == self.soloed_stem:
+                    solo_stem_data = arr
+                    break
+
+            if solo_stem_data is None:
+                self.spectrum_data = None
+                return
+
+            # Get sample rate
+            sr = getattr(self.player, 'sr', 22050)
+            hop_length = 512
+
+            # Convert time to sample index
+            sample_idx = int(playhead_time * sr)
+            if sample_idx >= len(solo_stem_data):
+                self.spectrum_data = None
+                return
+
+            # Extract a larger window for better CQT analysis (e.g., 4096 samples)
+            window_size = 4096
+            start_idx = max(0, sample_idx - window_size // 2)
+            end_idx = min(len(solo_stem_data), start_idx + window_size)
+
+            if end_idx - start_idx < window_size // 2:
+                self.spectrum_data = None
+                return
+
+            # Get the audio window
+            audio_window = solo_stem_data[start_idx:end_idx]
+
+            # --- Silence gate: if the window is very quiet, treat as no notes ---
+            try:
+                import numpy as _np
+                aw = _np.asarray(audio_window, dtype=_np.float32)
+                # short-circuit if empty
+                if aw.size == 0:
+                    self.spectrum_data = None
+                    return
+                # Root-mean-square and dBFS
+                rms = float(_np.sqrt(_np.mean(aw * aw)) + 1e-12)
+                rms_db = 20.0 * _np.log10(rms)
+            except Exception:
+                rms_db = -120.0
+
+            SILENCE_DB = -60.0  # gate threshold; tweak if needed
+            if rms_db <= SILENCE_DB:
+                # Produce a flat zero-confidence vector so UI shows a flat baseline
+                zero_vec = np.zeros((1, 88), dtype=np.float32)
+                zero_full = np.zeros((max(1, (end_idx - start_idx) // hop_length), 88), dtype=np.float32)
+                self.spectrum_data = {
+                    'note_conf': zero_vec,
+                    'time': playhead_time,
+                    'sample_pos': sample_idx,
+                    'window_start_idx': start_idx,
+                    'local_sample_pos': sample_idx - start_idx,
+                    'hop_length': hop_length,
+                    'full_note_conf': zero_full,
+                    'rms_db': rms_db,
+                    'silent': True,
+                }
+                return
+
+            # Use librosa CQT for better note detection
+            note_conf = compute_note_confidence(
+                audio_window,
+                sr=sr,
+                hop_length=hop_length,
+                bins_per_octave=36,
+                n_octaves=8,
+                fmin=27.5,  # A0
+                ema_alpha=0.4,
+                medfilt_width=3
+            )
+
+            # Get the frame corresponding to the playhead position within the window
+            frame_idx = min(note_conf.shape[0] - 1, (sample_idx - start_idx) // hop_length)
+            current_frame = note_conf[frame_idx:frame_idx+1]  # Shape (1, 88)
+
+            self.spectrum_data = {
+                'note_conf': current_frame,           # shape (1, 88) snapshot
+                'time': playhead_time,                 # seconds
+                'sample_pos': sample_idx,              # absolute sample at playhead
+                'window_start_idx': start_idx,         # absolute sample index where the CQT window starts
+                'local_sample_pos': sample_idx - start_idx,  # sample offset into the local window
+                'hop_length': hop_length,              # hop used for CQT/note_conf
+                'full_note_conf': note_conf,           # (frames, 88) for interpolation
+                'rms_db': rms_db,
+                'silent': False,
+            }
+
+        except Exception as e:
+            print(f"Error computing spectrum: {e}")
+            self.spectrum_data = None
 
     def set_chords(self, segments: list[dict]):
         """Replace chord segments and trigger a repaint."""
@@ -296,14 +449,24 @@ class WaveformView(QtWidgets.QWidget):
         h = self.height()
         CHORD_LANE_H = 32
         ch_h = CHORD_LANE_H
-        wf_h = max(10, h - ch_h)
+
+        # In solo mode, reserve space for spectrum band
+        if getattr(self, 'soloed_stem', None):
+            spectrum_h = getattr(self, 'spectrum_band_height', 80)
+            wf_h = max(10, h - ch_h - spectrum_h)
+        else:
+            wf_h = max(10, h - ch_h)
         return wf_h, ch_h
 
     def _time_in_chord_lane(self, pos: QtCore.QPoint, t0: float, t1: float, w: int, wf_h: int):
         """Return absolute time if pos is in the chord lane; else None."""
         x = int(pos.x()); y = int(pos.y())
         lane_top = wf_h
-        lane_bottom = wf_h + 32
+        # Account for spectrum band in solo mode
+        if getattr(self, 'soloed_stem', None):
+            spectrum_h = getattr(self, 'spectrum_band_height', 80)
+            lane_top = wf_h + spectrum_h
+        lane_bottom = lane_top + 32
         in_lane = not (y < (lane_top - 4) or y >= (lane_bottom + 4))
         if not in_lane:
             return None
@@ -1223,7 +1386,48 @@ class WaveformView(QtWidgets.QWidget):
         rel_t1 = t1 - self.origin
 
         p.fillRect(0, 0, w, wf_h, QtGui.QColor(20, 20, 20))
-        p.fillRect(0, wf_h, w, ch_h, QtGui.QColor(28, 28, 28))
+
+        # Draw piano roll in solo mode (in its own dedicated space)
+        if getattr(self, 'soloed_stem', None):
+            # Refresh spectrum/note data right before drawing
+            try:
+                self._compute_spectrum_at_playhead()
+            except Exception:
+                logging.exception("_compute_spectrum_at_playhead failed")
+            spectrum_h = getattr(self, 'spectrum_band_height', 80)
+            # Ensure child exists even if constructed in a different init path
+            if not hasattr(self, 'piano_roll_widget') or self.piano_roll_widget is None:
+                from piano_widget import PianoRollWidget
+                self.piano_roll_widget = PianoRollWidget(self)
+                self.piano_roll_widget.hide()
+            # Position and show the child widget
+            self.piano_roll_widget.setGeometry(0, wf_h, w, spectrum_h)
+            self.piano_roll_widget.show()
+
+            sd = getattr(self, 'spectrum_data', None)
+            if sd and 'full_note_conf' in sd and 'sample_pos' in sd:
+                note = sd['full_note_conf']
+                hop = int(sd.get('hop_length', 512))
+                sr = getattr(self.player, 'sr', 44100)
+                self.piano_roll_widget.set_data(note, hop, sr)
+                local_pos = int(sd.get('local_sample_pos', sd['sample_pos'] - sd.get('window_start_idx', 0)))
+                self.piano_roll_widget.update_playhead(local_pos)
+            elif sd and 'note_conf' in sd:
+                self.piano_roll_widget.set_data(sd['note_conf'], 1, getattr(self.player, 'sr', 44100))
+                self.piano_roll_widget.update_playhead(0)
+            else:
+                self.piano_roll_widget.clear_data()
+        else:
+            if hasattr(self, 'piano_roll_widget') and self.piano_roll_widget is not None:
+                self.piano_roll_widget.hide()
+
+        # Fill chord area background, accounting for spectrum band in solo mode
+        chord_top = wf_h
+        if getattr(self, 'soloed_stem', None):
+            spectrum_h = getattr(self, 'spectrum_band_height', 80)
+            chord_top = wf_h + spectrum_h
+        p.fillRect(0, chord_top, w, ch_h, QtGui.QColor(28, 28, 28))
+
         # Constrain subsequent waveform drawings (grid, beats, flags, loop fills, waveform, playhead)
         p.save()
         p.setClipRect(0, 0, w, wf_h)
@@ -1281,6 +1485,12 @@ class WaveformView(QtWidgets.QWidget):
                                     p.drawLine(x, y1, x, y2)
                 # Skip the rest of the waveform drawing logic in solo mode
                 stems = []
+
+                # Draw spectrum band in solo mode (moved to after chord background)
+                if in_solo_mode:
+                    self._compute_spectrum_at_playhead()
+                    spectrum_h = getattr(self, 'spectrum_band_height', 80)
+                    # Note: piano roll will be drawn later after chord background
             else:
                 # Normal mode: show stems or combined waveform
                 stems = self._get_stems_for_display() if getattr(self, "show_stems", True) else []
@@ -1656,7 +1866,12 @@ class WaveformView(QtWidgets.QWidget):
                 b_rel = b - self.origin
                 x0 = int((a_rel - rel_t0) / (rel_t1 - rel_t0) * w)
                 x1 = int((b_rel - rel_t0) / (rel_t1 - rel_t0) * w)
-                rect = QtCore.QRect(x0, wf_h, max(1, x1 - x0), ch_h)
+                # Position chord rectangles below spectrum band in solo mode
+                chord_top = wf_h
+                if getattr(self, 'soloed_stem', None):
+                    spectrum_h = getattr(self, 'spectrum_band_height', 80)
+                    chord_top = wf_h + spectrum_h
+                rect = QtCore.QRect(x0, chord_top, max(1, x1 - x0), ch_h)
                 p.setBrush(QtGui.QColor(50, 80, 110))   # fill color
                 p.setPen(QtGui.QPen(QtGui.QColor(20, 20, 20)))  # outline
                 p.drawRoundedRect(rect, 6, 6)
@@ -1675,7 +1890,7 @@ class WaveformView(QtWidgets.QWidget):
                                     pen_beat = QtGui.QPen(QtGui.QColor(200, 200, 200, 120))
                                     pen_beat.setStyle(QtCore.Qt.DashLine)
                                     p.setPen(pen_beat)
-                                    p.drawLine(x_beat, wf_h, x_beat, wf_h + ch_h)
+                                    p.drawLine(x_beat, chord_top, x_beat, chord_top + ch_h)
                     except Exception:
                         pass
                 # Chord label (drawn last, overlays above grid)
