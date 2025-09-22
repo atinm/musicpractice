@@ -2238,8 +2238,15 @@ class LogDock(QtWidgets.QDockWidget):
         w.setLayout(v)
         self.setWidget(w)
 
+        # Track whether we have content to determine visibility
+        self._has_content = False
+        # Start hidden - will show when content is added
+        self.hide()
+
     def clear(self):
         self.view.clear()
+        self._has_content = False
+        self.hide()
 
     def write(self, msg: str):
         # Coerce to string
@@ -2257,6 +2264,11 @@ class LogDock(QtWidgets.QDockWidget):
             line, self._buffer = self._buffer.split("\n", 1)
             if not line:
                 continue
+            # Show the dock when we have content to display
+            if not self._has_content:
+                self._has_content = True
+                self.show()
+                self.raise_()
             QtCore.QMetaObject.invokeMethod(
                 self.view,
                 "appendPlainText",
@@ -2268,6 +2280,11 @@ class LogDock(QtWidgets.QDockWidget):
         if getattr(self, "_buffer", ""):
             line = self._buffer
             self._buffer = ""
+            # Show the dock when we have content to display
+            if not self._has_content:
+                self._has_content = True
+                self.show()
+                self.raise_()
             QtCore.QMetaObject.invokeMethod(
                 self.view,
                 "appendPlainText",
@@ -2365,7 +2382,7 @@ class Main(QtWidgets.QMainWindow):
                 self.log_dock = LogDock(parent=self)
                 self.addDockWidget(Qt.BottomDockWidgetArea, self.log_dock)
             self.log_dock.setWindowTitle('Demucs Log')
-            self.log_dock.show(); self.log_dock.raise_(); self.log_dock.clear()
+            self.log_dock.clear()  # clear() will hide the dock if empty
         except Exception:
             pass
         # Clear previous analysis; force fresh beats+key+chords and stems reload
@@ -4282,7 +4299,7 @@ class Main(QtWidgets.QMainWindow):
                 self.log_dock = LogDock(parent=self)
                 self.addDockWidget(Qt.BottomDockWidgetArea, self.log_dock)
             self.log_dock.setWindowTitle('Demucs Log')
-            self.log_dock.show(); self.log_dock.raise_(); self.log_dock.clear()
+            self.log_dock.clear()  # clear() will hide the dock if empty
         except Exception:
             pass
 
