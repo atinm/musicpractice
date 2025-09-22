@@ -1624,10 +1624,22 @@ def estimate_chords_chordino_vamp(audio_path: str, beats=None, downbeats=None, *
     If beats are provided, snap to beats; split at downbeats if provided.
     """
     import numpy as np
+    import vamp
 
-    y, sr = sf.read(audio_path, dtype='float32', always_2d=False)
-    if y.ndim > 1:
-        y = y.mean(axis=1)  # mono
+    # Robust loader: supports m4a via ffmpeg/audioread
+    try:
+        from audio_engine import _load_audio_any
+        y_stereo, sr = _load_audio_any(audio_path)
+        if y_stereo is None:
+            raise RuntimeError("_load_audio_any returned None")
+        y = y_stereo.mean(axis=1).astype(np.float32) if y_stereo.ndim == 2 else y_stereo.astype(np.float32)
+    except Exception:
+        # Fallback to librosa
+        import librosa as _lb
+        try:
+            y, sr = _lb.load(audio_path, sr=None, mono=True)
+        except Exception:
+            return []
 
     # Collect simple chord labels (time-stamped)
     res = vamp.collect(y, sr, "nnls-chroma:chordino", output="simplechord")
@@ -1650,10 +1662,27 @@ def estimate_chords_chordino_vamp(audio_path: str, beats=None, downbeats=None, *
         def _snap(t):
             j = int(np.clip(np.argmin(np.abs(bt - t)), 0, len(bt)-1))
             return float(bt[j])
+
+        # Use a minimal width of ~1/8 of a beat (fallback 80ms)
+        if len(bt) > 1:
+            beat_dur = float(np.median(np.diff(bt)))
+        else:
+            beat_dur = 0.0
+        min_w = max(0.080, 0.125 * beat_dur) if beat_dur > 0 else 0.080
+
         for s in segs:
-            s["start"], s["end"] = _snap(s["start"]), _snap(s["end"])
-            if s["end"] <= s["start"] and len(bt) > 1:
-                s["end"] = s["start"] + (bt[1]-bt[0])
+            a = _snap(float(s["start"]))
+            b = _snap(float(s["end"]))
+            if b <= a:
+                # try nudging to the next beat if possible
+                j = int(np.clip(np.argmin(np.abs(bt - a)), 0, len(bt)-1))
+                if j + 1 < len(bt):
+                    b = float(bt[j+1])
+                else:
+                    b = a + min_w
+            elif (b - a) < min_w:
+                b = a + min_w
+            s["start"], s["end"] = a, b
 
     # Optional: split at bar boundaries (downbeats)
     if downbeats and beats:
