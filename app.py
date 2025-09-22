@@ -54,6 +54,11 @@ class WaveformView(QtWidgets.QWidget):
         self.spectrum_band_height = 80  # Height of spectrum band in pixels
         self.piano_roll_widget = PianoRollWidget(self)
         self.piano_roll_widget.hide()
+        # Ensure child widgets are placed correctly on construct
+        try:
+            self._layout_children()
+        except Exception:
+            pass
 
     def _coalesce_adjacent_same_label(self, segments: list[dict], eps: float = 1e-6) -> list[dict]:
         """Merge adjacent segments with the same label when end≈start.
@@ -243,6 +248,10 @@ class WaveformView(QtWidgets.QWidget):
             from piano_widget import PianoRollWidget
             self.piano_roll_widget = PianoRollWidget(self)
             self.piano_roll_widget.hide()
+        try:
+            self._layout_children()
+        except Exception:
+            pass
 
     def set_beats(self, beats: list | None, bars: list | None):
         self.beats = beats or []
@@ -284,6 +293,11 @@ class WaveformView(QtWidgets.QWidget):
             self.piano_roll_widget.show()
             self.piano_roll_widget.raise_()
 
+        # Re-layout child widgets when solo state changes
+        try:
+            self._layout_children()
+        except Exception:
+            pass
         self.update()
 
     def _compute_spectrum_at_playhead(self):
@@ -486,6 +500,32 @@ class WaveformView(QtWidgets.QWidget):
             wf_h = max(10, h - ch_h)
         return wf_h, ch_h
 
+    def _layout_children(self):
+        """Place child widgets (e.g., piano_roll_widget) based on current size/state.
+        Never call this from paintEvent to avoid re-entrant paints.
+        """
+        try:
+            if getattr(self, 'piano_roll_widget', None) is None:
+                return
+            h = self.height()
+            CHORD_LANE_H = 32
+            spectrum_h = self.spectrum_band_height if getattr(self, 'soloed_stem', None) else 0
+            wf_h = max(10, h - CHORD_LANE_H - spectrum_h)
+            # In solo mode, the piano roll occupies the spectrum band area below the waveform
+            if getattr(self, 'soloed_stem', None):
+                from PySide6.QtCore import QRect
+                new_rect = QRect(0, wf_h, self.width(), spectrum_h)
+                if self.piano_roll_widget.geometry() != new_rect:
+                    self.piano_roll_widget.setGeometry(new_rect)
+                if not self.piano_roll_widget.isVisible():
+                    self.piano_roll_widget.show()
+            else:
+                if self.piano_roll_widget.isVisible():
+                    self.piano_roll_widget.hide()
+        except Exception:
+            # Never let layout crash painting/rendering
+            pass
+
     def _time_in_chord_lane(self, pos: QtCore.QPoint, t0: float, t1: float, w: int, wf_h: int):
         """Return absolute time if pos is in the chord lane; else None."""
         x = int(pos.x()); y = int(pos.y())
@@ -617,6 +657,13 @@ class WaveformView(QtWidgets.QWidget):
         self._manual_t0 = None
         self._manual_t1 = None
         self.update()
+
+    def resizeEvent(self, ev):
+        try:
+            self._layout_children()
+        except Exception:
+            pass
+        super().resizeEvent(ev)
 
     def _current_window(self):
         # If frozen (after a click seek), hold the captured window
@@ -1428,9 +1475,11 @@ class WaveformView(QtWidgets.QWidget):
                 from piano_widget import PianoRollWidget
                 self.piano_roll_widget = PianoRollWidget(self)
                 self.piano_roll_widget.hide()
-            # Position and show the child widget
-            self.piano_roll_widget.setGeometry(0, wf_h, w, spectrum_h)
-            self.piano_roll_widget.show()
+            # Defer child geometry to the layout pass (never mutate geometry in paint)
+            try:
+                self._layout_children()
+            except Exception:
+                pass
 
             sd = getattr(self, 'spectrum_data', None)
             if sd and 'full_note_conf' in sd and 'sample_pos' in sd:
@@ -1446,8 +1495,11 @@ class WaveformView(QtWidgets.QWidget):
             else:
                 self.piano_roll_widget.clear_data()
         else:
-            if hasattr(self, 'piano_roll_widget') and self.piano_roll_widget is not None:
-                self.piano_roll_widget.hide()
+            # Let the layout pass hide/show; do not change visibility in paint
+            try:
+                self._layout_children()
+            except Exception:
+                pass
 
         # Fill chord area background, accounting for spectrum band in solo mode
         chord_top = wf_h
