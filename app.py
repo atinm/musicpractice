@@ -417,6 +417,34 @@ class WaveformView(QtWidgets.QWidget):
                 self._chords_viz_cache = None
         self.update()
 
+    def export_chords(self) -> list[dict]:
+        """Return a plain list of chord segments suitable for JSON serialization."""
+        try:
+            return [
+                {"start": float(s.get("start", 0.0)),
+                "end": float(s.get("end", 0.0)),
+                "label": str(s.get("label", ""))}
+                for s in (self.chords or [])
+                if ("start" in s and "end" in s)
+            ]
+        except Exception:
+            return []
+
+    def import_chords(self, segments: list[dict] | None):
+        """Load chord segments from JSON and trigger redraw."""
+        if not segments:
+            return
+        try:
+            self.set_chords([
+                {"start": float(s.get("start", 0.0)),
+                "end": float(s.get("end", 0.0)),
+                "label": str(s.get("label", ""))}
+                for s in segments if ("start" in s and "end" in s)
+            ])
+        except Exception:
+            # be defensive; ignore malformed entries
+            pass
+
     def set_origin_offset(self, seconds: float):
         self.origin = float(max(0.0, seconds))
         self.update()
@@ -2385,6 +2413,8 @@ class Main(QtWidgets.QMainWindow):
             self.log_dock.clear()  # clear() will hide the dock if empty
         except Exception:
             pass
+        # Explicit recompute: unlock chords so auto analysis can overwrite
+        self.chords_locked = False
         # Clear previous analysis; force fresh beats+key+chords and stems reload
         self._clear_cached_analysis(keep_stems=False)
         self.statusBar().showMessage("Recomputing: beats + key + chords…")
@@ -2392,6 +2422,7 @@ class Main(QtWidgets.QMainWindow):
         try:
             self.populate_beats_async(self.current_path)
             self.populate_key_async(self.current_path)
+            self.populate_chords_async(self.current_path, force=True)
         except Exception:
             pass
         # Kick the integrated pipeline (ChordWorker waits for stems, then estimates chords)
@@ -2413,6 +2444,8 @@ class Main(QtWidgets.QMainWindow):
             self._force_stems_recompute = False
         except Exception:
             pass
+        # Explicit recompute: unlock chords so auto analysis can overwrite
+        self.chords_locked = False
         # Clear previous analysis but keep current stems
         self._clear_cached_analysis(keep_stems=True)
         self.statusBar().showMessage("Recomputing: beats + key + chords…")
@@ -2631,6 +2664,7 @@ class Main(QtWidgets.QMainWindow):
         self.last_bars: list[float] = []
         self.last_key: dict | None = None
         self.last_chords: list[dict] = []
+        self.chords_locked: bool = False
         self.A = None  # no active loop by default
         self.B = None
         # Saved loops model
@@ -3480,6 +3514,7 @@ class Main(QtWidgets.QMainWindow):
         except Exception as e:
             self.statusBar().showMessage(f"Load failed: {e}")
             return
+        self.chords_locked = bool(data.get("chords_locked", False))
 
         # View / snap
         self.wave.set_origin_offset(float(data.get("origin", 0.0)))
@@ -3524,11 +3559,16 @@ class Main(QtWidgets.QMainWindow):
         self.last_chords = list(data.get("chords", []))
         if self.last_chords:
             try:
-                normalized = self._normalize_chords_for_view(self.last_chords)
-                self.last_chords = list(normalized)
-                self.wave.set_chords(self.last_chords)
+                if getattr(self, "chords_locked", False):
+                    # Preserve exactly as saved
+                    self.wave.set_chords(list(self.last_chords))
+                else:
+                    # Only normalize when not locked
+                    normalized = self._normalize_chords_for_view(self.last_chords)
+                    self.last_chords = list(normalized)
+                    self.wave.set_chords(self.last_chords)
             except Exception as ex:
-                logging.error(f"load_session normalize failed: {ex}")
+                logging.error(f"load_session chords apply failed: {ex}")
                 self.wave.set_chords(list(self.last_chords or []))
         # Rate
         if "rate" in data:
@@ -3556,6 +3596,7 @@ class Main(QtWidgets.QMainWindow):
             "bars": list(self.last_bars or []),
             "key": self.last_key or {},
             "chords": list(self.last_chords or []),
+            "chords_locked": bool(getattr(self, "chords_locked", False)),
             "rate": float(self.rate_spin.value()),
         }
         try:
@@ -3621,6 +3662,7 @@ class Main(QtWidgets.QMainWindow):
             self.wave.update(); self.wave.repaint()
         except Exception:
             pass
+        self.chords_locked = True
         self.save_session()
         self.statusBar().showMessage(f"Chord updated → {text}", 1500)
 
@@ -3686,6 +3728,7 @@ class Main(QtWidgets.QMainWindow):
 
         # Update UI and persist
         self.wave.set_chords(self.last_chords)
+        self.chords_locked = True
         self.save_session()
         self.statusBar().showMessage(f"Chord split at {split_t:.2f}s", 1200)
 
@@ -3715,6 +3758,7 @@ class Main(QtWidgets.QMainWindow):
         }
         self.last_chords = self.last_chords[:idx] + [merged] + self.last_chords[idx+2:]
         self.wave.set_chords(self.last_chords)
+        self.chords_locked = True
         self.save_session()
 
     def _add_stem_row(self, name: str, array: np.ndarray):
@@ -4388,6 +4432,13 @@ class Main(QtWidgets.QMainWindow):
     def start_chord_analysis(self, path: str, force: bool = False):
         # Skip if a worker is already running
         if hasattr(self, "chord_worker") and self.chord_worker and self.chord_worker.isRunning():
+            return
+
+        if getattr(self, "chords_locked", False) and not force:
+            try:
+                self.statusBar().showMessage("Chords locked — skipping auto analysis", 1500)
+            except Exception:
+                pass
             return
 
         # If we already have chords and not forcing, do not recompute
