@@ -51,7 +51,7 @@ class WaveformView(QtWidgets.QWidget):
 
         # Spectrum band for solo mode
         self.spectrum_data = None  # Current spectrum data at playhead
-        self.spectrum_band_height = 80  # Height of spectrum band in pixels
+        self.spectrum_band_height = 60  # Height of spectrum band in pixels
         self.piano_roll_widget = PianoRollWidget(self)
         self.piano_roll_widget.hide()
         # Ensure child widgets are placed correctly on construct
@@ -287,11 +287,14 @@ class WaveformView(QtWidgets.QWidget):
             if self.piano_roll_widget is None:
                 # Create piano widget if it doesn't exist
                 self.piano_roll_widget = PianoRollWidget(self)
-                print("Created piano roll widget for solo mode")
 
-            # Always show the piano widget in solo mode
+            # Always show the piano widget in solo mode; geometry handled by layout pass
             self.piano_roll_widget.show()
             self.piano_roll_widget.raise_()
+            try:
+                self._layout_children()
+            except Exception:
+                pass
 
         # Re-layout child widgets when solo state changes
         try:
@@ -299,6 +302,20 @@ class WaveformView(QtWidgets.QWidget):
         except Exception:
             pass
         self.update()
+
+    def showEvent(self, ev):
+        try:
+            self._layout_children()
+        except Exception:
+            pass
+        super().showEvent(ev)
+
+    def resizeEvent(self, ev):
+        try:
+            self._layout_children()
+        except Exception:
+            pass
+        super().resizeEvent(ev)
 
     def _compute_spectrum_at_playhead(self):
         """Compute frequency spectrum at current playhead position for soloed stem using librosa CQT."""
@@ -494,8 +511,15 @@ class WaveformView(QtWidgets.QWidget):
 
         # In solo mode, reserve space for spectrum band
         if getattr(self, 'soloed_stem', None):
-            spectrum_h = getattr(self, 'spectrum_band_height', 80)
-            wf_h = max(10, h - ch_h - spectrum_h)
+            ph = 0
+            try:
+                if hasattr(self, 'piano_roll_widget') and self.piano_roll_widget is not None and self.piano_roll_widget.isVisible():
+                    ph = int(self.piano_roll_widget.height())
+            except Exception:
+                ph = 0
+            if ph <= 0:
+                ph = int(getattr(self, 'spectrum_band_height', 60))
+            wf_h = max(10, h - ch_h - ph)
         else:
             wf_h = max(10, h - ch_h)
         return wf_h, ch_h
@@ -507,18 +531,27 @@ class WaveformView(QtWidgets.QWidget):
         try:
             if getattr(self, 'piano_roll_widget', None) is None:
                 return
-            h = self.height()
-            CHORD_LANE_H = 32
-            spectrum_h = self.spectrum_band_height if getattr(self, 'soloed_stem', None) else 0
-            wf_h = max(10, h - CHORD_LANE_H - spectrum_h)
-            # In solo mode, the piano roll occupies the spectrum band area below the waveform
-            if getattr(self, 'soloed_stem', None):
+
+            # Use same layout math as paintEvent
+            wf_h, ch_h = self._wf_geom()
+            # Pick a practical height: use configured height or minHeight, whichever is larger
+            desired_h = getattr(self, "spectrum_band_height", 90)
+            min_h = int(self.piano_roll_widget.minimumHeight()) if hasattr(self.piano_roll_widget, "minimumHeight") else 0
+            spectrum_h = max(int(desired_h), int(min_h)) if getattr(self, "soloed_stem", None) else 0
+
+            if getattr(self, "soloed_stem", None):
                 from PySide6.QtCore import QRect
                 new_rect = QRect(0, wf_h, self.width(), spectrum_h)
                 if self.piano_roll_widget.geometry() != new_rect:
                     self.piano_roll_widget.setGeometry(new_rect)
+                    # Keep spectrum_band_height in sync with the real child height
+                    try:
+                        self.spectrum_band_height = int(self.piano_roll_widget.height())
+                    except Exception:
+                        pass
                 if not self.piano_roll_widget.isVisible():
                     self.piano_roll_widget.show()
+                self.piano_roll_widget.raise_()
             else:
                 if self.piano_roll_widget.isVisible():
                     self.piano_roll_widget.hide()
@@ -528,13 +561,19 @@ class WaveformView(QtWidgets.QWidget):
 
     def _time_in_chord_lane(self, pos: QtCore.QPoint, t0: float, t1: float, w: int, wf_h: int):
         """Return absolute time if pos is in the chord lane; else None."""
-        x = int(pos.x()); y = int(pos.y())
+        x = int(pos.x())
+        y = int(pos.y())
         lane_top = wf_h
         # Account for spectrum band in solo mode
         if getattr(self, 'soloed_stem', None):
-            spectrum_h = getattr(self, 'spectrum_band_height', 80)
-            lane_top = wf_h + spectrum_h
-        lane_bottom = lane_top + 32
+            try:
+                ph = int(self.piano_roll_widget.height()) if hasattr(self, 'piano_roll_widget') and self.piano_roll_widget.isVisible() else int(getattr(self, 'spectrum_band_height', 60))
+            except Exception:
+                ph = int(getattr(self, 'spectrum_band_height', 60))
+            lane_top = wf_h + ph
+        # Chord lane is a fixed 32 px tall; set bottom regardless of solo state
+        CHORD_LANE_H = 32
+        lane_bottom = lane_top + CHORD_LANE_H
         in_lane = not (y < (lane_top - 4) or y >= (lane_bottom + 4))
         if not in_lane:
             return None
@@ -657,13 +696,6 @@ class WaveformView(QtWidgets.QWidget):
         self._manual_t0 = None
         self._manual_t1 = None
         self.update()
-
-    def resizeEvent(self, ev):
-        try:
-            self._layout_children()
-        except Exception:
-            pass
-        super().resizeEvent(ev)
 
     def _current_window(self):
         # If frozen (after a click seek), hold the captured window
@@ -1469,7 +1501,6 @@ class WaveformView(QtWidgets.QWidget):
                 self._compute_spectrum_at_playhead()
             except Exception:
                 logging.exception("_compute_spectrum_at_playhead failed")
-            spectrum_h = getattr(self, 'spectrum_band_height', 80)
             # Ensure child exists even if constructed in a different init path
             if not hasattr(self, 'piano_roll_widget') or self.piano_roll_widget is None:
                 from piano_widget import PianoRollWidget
@@ -1501,11 +1532,18 @@ class WaveformView(QtWidgets.QWidget):
             except Exception:
                 pass
 
-        # Fill chord area background, accounting for spectrum band in solo mode
+        # Fill chord area background, accounting for spectrum band in solo mode (use real child height)
         chord_top = wf_h
         if getattr(self, 'soloed_stem', None):
-            spectrum_h = getattr(self, 'spectrum_band_height', 80)
-            chord_top = wf_h + spectrum_h
+            ph = 0
+            try:
+                if hasattr(self, 'piano_roll_widget') and self.piano_roll_widget is not None and self.piano_roll_widget.isVisible():
+                    ph = int(self.piano_roll_widget.height())
+            except Exception:
+                ph = 0
+            if ph <= 0:
+                ph = int(getattr(self, 'spectrum_band_height', 60))
+            chord_top = wf_h + ph
         p.fillRect(0, chord_top, w, ch_h, QtGui.QColor(28, 28, 28))
 
         # Constrain subsequent waveform drawings (grid, beats, flags, loop fills, waveform, playhead)
@@ -1946,11 +1984,18 @@ class WaveformView(QtWidgets.QWidget):
                 b_rel = b - self.origin
                 x0 = int((a_rel - rel_t0) / (rel_t1 - rel_t0) * w)
                 x1 = int((b_rel - rel_t0) / (rel_t1 - rel_t0) * w)
-                # Position chord rectangles below spectrum band in solo mode
+                # Position chord rectangles below spectrum band in solo mode (use real child height)
                 chord_top = wf_h
                 if getattr(self, 'soloed_stem', None):
-                    spectrum_h = getattr(self, 'spectrum_band_height', 80)
-                    chord_top = wf_h + spectrum_h
+                    ph = 0
+                    try:
+                        if hasattr(self, 'piano_roll_widget') and self.piano_roll_widget is not None and self.piano_roll_widget.isVisible():
+                            ph = int(self.piano_roll_widget.height())
+                    except Exception:
+                        ph = 0
+                    if ph <= 0:
+                        ph = int(getattr(self, 'spectrum_band_height', 60))
+                    chord_top = wf_h + ph
                 rect = QtCore.QRect(x0, chord_top, max(1, x1 - x0), ch_h)
                 p.setBrush(QtGui.QColor(50, 80, 110))   # fill color
                 p.setPen(QtGui.QPen(QtGui.QColor(20, 20, 20)))  # outline

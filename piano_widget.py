@@ -4,6 +4,9 @@ GLOBAL_MIDI_MIN = 21   # A0
 GLOBAL_MIDI_MAX = 108  # C8
 DEFAULT_VISIBLE_MIN = 24  # C1
 VISIBLE_SPAN = 72         # C1..B6 (6 octaves)
+
+# Debug: print keyboard rects being drawn (throttled)
+DEBUG_PIANO_RECTS = True
 """
 Piano roll widget for displaying note confidence with 88-key piano visualization.
 """
@@ -17,7 +20,14 @@ from PySide6.QtWidgets import QWidget
 # Piano roll constants
 WHITE_KEYS = [0,2,4,5,7,9,11]  # within octave
 BLACK_KEYS = [1,3,6,8,10]
+
 KEY_ORDER = [0,1,2,3,4,5,6,7,8,9,10,11]
+# Visual proportions
+BLACK_KEY_HEIGHT_RATIO = 0.6  # black keys are ~60% the height of white keys
+# Visual proportions
+BLACK_KEY_WIDTH_RATIO = 0.6   # black keys are ~60% the width of a white key
+WHITE_DIVIDER_COLOR = QColor(190, 190, 190)
+TOP_BORDER_COLOR = QColor(150, 150, 150)
 
 def is_white(midi_pc):  # pitch class 0..11
     return midi_pc in WHITE_KEYS
@@ -40,6 +50,9 @@ class PianoRollWidget(QWidget):
         # Start hidden; parent view controls show/hide
         self.setVisible(False)
         self.update()
+
+        # Debug throttle timestamp (epoch seconds)
+        self._debug_last_print = 0.0
 
         # Rendering style: 'line' or 'bars'
         self.render_style = 'line'
@@ -176,12 +189,17 @@ class PianoRollWidget(QWidget):
             painter.end()
             return
 
-        kb_h = int(h * 0.5)          # keyboard height
+        kb_h = int(h * 0.25)         # keys take ~25% of widget height; graph gets ~75%
         # Reserve a few pixels at the top so the line stroke doesn't clip
         stroke_px = 2  # matches the pen width below
         top_pad = max(5, stroke_px + 3)   # extra headroom
         bar_h = max(1, h - kb_h - top_pad)  # bar region above keys
         base_y = h - kb_h                    # baseline at top of keyboard
+
+        # --- Debug capture containers ---
+        dbg_white_rects = []
+        dbg_black_rects = []
+        dbg_info = {"kb_h": kb_h, "base_y": base_y}
 
         # layout: 72 keys across width (6 octaves)
         key_w = w / float(VISIBLE_SPAN)
@@ -244,29 +262,106 @@ class PianoRollWidget(QWidget):
                 vis_min = max(GLOBAL_MIDI_MIN, min(vis_min - off, max_start))
                 vis_max = vis_min + VISIBLE_SPAN - 1
 
-                # --- draw keyboard (white first, then black) for finalized window ---
+                # --- draw keyboard with continuous white base, then black keys, then white-only dividers ---
+                # 1) Continuous white base across full keyboard area
+                painter.fillRect(QtCore.QRectF(0, base_y, w, kb_h), QColor(240, 240, 240))
+                dbg_white_rects.append((-1, 0.0, float(base_y), float(w), float(kb_h)))
+
+                black_h = max(1.0, kb_h * BLACK_KEY_HEIGHT_RATIO)
+
+                # Build equal-width WHITE layout using a running cursor anchored at x=0
+                whites_idx = [i for i in range(VISIBLE_SPAN) if is_white((vis_min + i) % 12)]
+                n_whites = len(whites_idx)
+                ww = w / float(max(1, n_whites))
+                # left edges of whites in *order* (length n_whites)
+                white_edges = []
+                x_cursor = 0.0
+                for _ in range(n_whites):
+                    white_edges.append(x_cursor)
+                    x_cursor += ww
+                # maps between semitone index ↔ white-order
+                i_to_order = {i: k for k, i in enumerate(whites_idx)}
+                order_to_i = {k: i for k, i in enumerate(whites_idx)}
+
+                # 2) Draw black keys (shorter + narrower), centered between adjacent equal-width whites
                 for i in range(VISIBLE_SPAN):
                     midi = vis_min + i
                     pc = midi % 12
-                    x = i * key_w
-                    rect = QRectF(x, base_y, key_w, kb_h)
                     if is_white(pc):
-                        painter.fillRect(rect, QColor(240, 240, 240))
-                        painter.setPen(QPen(QColor(200,200,200)))
-                        painter.drawRect(rect)
-                for i in range(VISIBLE_SPAN):
-                    midi = vis_min + i
-                    pc = midi % 12
-                    if not is_white(pc):
-                        x = i * key_w + key_w * 0.1
-                        top_offset = kb_h * 0.06
-                        bottom_gap = kb_h * 0.12
-                        black_h = max(1.0, kb_h - (top_offset + bottom_gap))
-                        yk = base_y + top_offset
-                        rect = QRectF(x, yk, key_w * 0.8, black_h)
-                        painter.fillRect(rect, QColor(30,30,30))
-                        painter.setPen(QPen(QColor(10,10,10)))
-                        painter.drawRect(rect)
+                        continue
+                    # find preceding white in semitone space and its order position
+                    prev_i = i - 1
+                    while prev_i >= 0 and not is_white((vis_min + prev_i) % 12):
+                        prev_i -= 1
+                    # if we don't find both neighbors, skip
+                    if prev_i < 0 or (prev_i not in i_to_order) or (i_to_order[prev_i] + 1 >= n_whites):
+                        continue
+                    left_ord = i_to_order[prev_i]
+                    right_ord = left_ord + 1
+                    # centers between these two white keys
+                    x_left_white  = white_edges[left_ord]
+                    x_right_white = white_edges[right_ord]
+                    # center between the two *full-width* whites
+                    cx = 0.5 * ((x_left_white + ww) + x_right_white)
+                    bw = ww * BLACK_KEY_WIDTH_RATIO
+                    xk = cx - (bw * 0.5)
+                    rect = QtCore.QRectF(xk, float(base_y), bw, float(black_h))
+                    painter.fillRect(rect, QColor(30, 30, 30))
+                    painter.setPen(QPen(QColor(10, 10, 10)))
+                    painter.drawRect(rect)
+                    dbg_black_rects.append((i, float(rect.x()), float(rect.y()), float(rect.width()), float(rect.height())))
+                    dbg_info["black_h"] = float(black_h)
+
+                # 3) Subtle top border separating graph from keys
+                painter.setPen(QPen(TOP_BORDER_COLOR))
+                painter.drawLine(0, int(base_y), int(w), int(base_y))
+
+                # 4) Tail region: ensure the area under the black keys is white, then draw **white-only** dividers
+                tail_y = base_y + black_h
+                tail_h = max(0.0, kb_h - black_h)
+                if tail_h > 0.0:
+                    painter.fillRect(QtCore.QRectF(0, tail_y, w, tail_h), QColor(240, 240, 240))
+
+                    painter.setPen(QPen(WHITE_DIVIDER_COLOR))
+                    bottom_y = int(base_y + kb_h)
+                    # full-height dividers at B–C and E–F; short dividers elsewhere
+                    for ord_idx in range(1, n_whites):
+                        # semitone index of the *right* white in this boundary
+                        i_right = whites_idx[ord_idx]
+                        pc_right = (vis_min + i_right) % 12
+                        x_div = white_edges[ord_idx]
+                        if pc_right in (0, 5):  # C or F (boundary after B or E)
+                            painter.drawLine(x_div, int(base_y), x_div, bottom_y)
+                        else:
+                            painter.drawLine(x_div, int(tail_y), x_div, bottom_y)
+                    # Bottom edge
+                    painter.drawLine(0, bottom_y, int(w), bottom_y)
+
+                # --- Debug print throttled ---
+                import time as _time
+                if DEBUG_PIANO_RECTS:
+                    now = _time.time()
+                    # Print at most ~4 times per second
+                    if (now - getattr(self, "_debug_last_print", 0.0)) > 0.25:
+                        self._debug_last_print = now
+                        # Limit how many rects we print to keep output readable
+                        WMAX = 24
+                        BMAX = 24
+                        def _fmt(items, maxn):
+                            s = []
+                            for (idx, x, y, w_, h_) in items[:maxn]:
+                                s.append(f"[i={idx:02d} x={x:.1f} y={y:.1f} w={w_:.1f} h={h_:.1f}]")
+                            more = len(items) - maxn
+                            if more > 0:
+                                s.append(f"... (+{more} more)")
+                            return " ".join(s)
+                        print(
+                            "PIANO-RECTS",
+                            f"kb_h={dbg_info.get('kb_h')} base_y={dbg_info.get('base_y')} black_h={dbg_info.get('black_h', 'n/a')}",
+                            "\n  whites:", _fmt(dbg_white_rects, WMAX),
+                            "\n  blacks:", _fmt(dbg_black_rects, BMAX),
+                            f"\n  vis_min={vis_min} vis_max={vis_max} key_w={key_w:.2f}"
+                        )
 
                 # Slice the confidence vector EXACTLY to the visible MIDI window [vis_min..vis_max]
                 start_idx = int(max(0, vis_min - GLOBAL_MIDI_MIN))
@@ -301,8 +396,24 @@ class PianoRollWidget(QWidget):
                 if not _np.isfinite(conf_draw.max()) or float(conf_draw.max()) <= 1e-4:
                     pass  # leave baseline only
                 else:
-                    # X centers per visible key; index 0 corresponds to MIDI = vis_min
-                    xs = _np.arange(VISIBLE_SPAN) * key_w + (key_w * 0.5)
+                    # X centers per visible *semitone* using equal-width white-key layout
+                    xs_list = []
+                    for i in range(VISIBLE_SPAN):
+                        if i in i_to_order:
+                            # white key center
+                            xs_list.append((i_to_order[i] + 0.5) * ww)
+                        else:
+                            # black key: center between adjacent whites
+                            prev_i = i - 1
+                            while prev_i >= 0 and not is_white((vis_min + prev_i) % 12):
+                                prev_i -= 1
+                            if prev_i < 0 or (prev_i not in i_to_order) or (i_to_order[prev_i] + 1 >= n_whites):
+                                # fallback: keep previous spacing if edge-case
+                                xs_list.append((i * key_w) + (key_w * 0.5))
+                            else:
+                                left_ord = i_to_order[prev_i]
+                                xs_list.append((left_ord + 1.0) * ww)  # midpoint of the two neighboring whites
+                    xs = _np.asarray(xs_list, dtype=float)
                     ys = base_y - (bar_h * (conf_draw ** 0.9))
                     # Clamp to avoid clipping at the very top/bottom of the graph region
                     ys = _np.clip(ys, base_y - bar_h + stroke_px + 1, base_y - 1)
@@ -364,7 +475,7 @@ class PianoRollWidget(QWidget):
                             midi = vis_min + int(vi)
                             pc = midi % 12
                             label = (NAMES_FLAT if self.prefer_flats else NAMES_SHARP)[pc]
-                            x = vi * key_w + key_w * 0.5
+                            x = float(xs[vi])
                             tw = fm2.horizontalAdvance(label)
                             painter.setPen(Qt.NoPen)
                             painter.setBrush(QBrush(QColor(10, 10, 10, 160)))
@@ -384,17 +495,19 @@ class PianoRollWidget(QWidget):
                             c = float(conf_vis[i])
                             if c <= thr:
                                 continue
-                            height = bar_h * (c ** 0.85)
-                            x = i * key_w + key_w * 0.2
-                            bw = key_w * 0.6
-                            rect = QRectF(x, base_y - height, bw, height)
-                            painter.fillRect(rect, QColor(100, 180, 255, 220))
+                        height = bar_h * (c ** 0.85)
+                        x_center = float(xs[i])
+                        bw = ww * 0.6
+                        rect = QRectF(x_center - bw/2.0, base_y - height, bw, height)
+                        painter.fillRect(rect, QColor(100, 180, 255, 220))
         except Exception as e:
             print(f"Error drawing confidence line: {e}")
 
-        # playhead line (center)
-        painter.setPen(QPen(QColor(255, 255, 255, 160), 1))
-        painter.drawLine(int(w/2), 0, int(w/2), h)
+        # playhead line (center) — restrict to the graph area (above keys)
+        graph_top = max(0, int(base_y - bar_h))
+        graph_bottom = int(base_y)
+        painter.setPen(QPen(QColor(255, 255, 255, 120), 1))
+        painter.drawLine(int(w/2), graph_top, int(w/2), graph_bottom)
 
         # label C keys for orientation (smaller font), follow the visible window
         painter.setPen(QPen(QColor(60, 60, 60)))
@@ -416,36 +529,111 @@ class PianoRollWidget(QWidget):
 
     def _draw_basic_piano(self, painter, w, h):
         """Draw a basic piano when no data is available."""
-        kb_h = int(h * 0.5)
+        kb_h = int(h * 0.25)
         key_w = w / float(VISIBLE_SPAN)
         base_y = h - kb_h
         vis_min = DEFAULT_VISIBLE_MIN
 
-        # Draw white keys
-        for i in range(VISIBLE_SPAN):
-            midi = vis_min + i
-            pc = midi % 12
-            x = i * key_w
-            rect = QRectF(x, base_y, key_w, kb_h)
-            if is_white(pc):
-                painter.fillRect(rect, QColor(240, 240, 240))
-                painter.setPen(QPen(QColor(200,200,200)))
-                painter.drawRect(rect)
+        black_h = max(1.0, kb_h * BLACK_KEY_HEIGHT_RATIO)
 
-        # Draw black keys (shorter)
+        dbg_white_rects = []
+        dbg_black_rects = []
+        dbg_info = {"kb_h": kb_h, "base_y": base_y}
+
+        # --- draw keyboard with continuous white base, then black keys, then white-only dividers ---
+        # 1) Continuous white base across full keyboard area
+        painter.fillRect(QtCore.QRectF(0, base_y, w, kb_h), QColor(240, 240, 240))
+        dbg_white_rects.append((-1, 0.0, float(base_y), float(w), float(kb_h)))
+
+        # Build equal-width WHITE layout using a running cursor anchored at x=0
+        whites_idx = [i for i in range(VISIBLE_SPAN) if is_white((vis_min + i) % 12)]
+        n_whites = len(whites_idx)
+        ww = w / float(max(1, n_whites))
+        white_edges = []
+        x_cursor = 0.0
+        for _ in range(n_whites):
+            white_edges.append(x_cursor)
+            x_cursor += ww
+        i_to_order = {i: k for k, i in enumerate(whites_idx)}
+        order_to_i = {k: i for k, i in enumerate(whites_idx)}
+
+        # 2) Draw black keys (shorter + narrower), centered between adjacent equal-width whites
         for i in range(VISIBLE_SPAN):
             midi = vis_min + i
             pc = midi % 12
-            if not is_white(pc):
-                x = i * key_w + key_w * 0.1
-                top_offset = kb_h * 0.06
-                bottom_gap = kb_h * 0.12
-                black_h = max(1.0, kb_h - (top_offset + bottom_gap))
-                y = base_y + top_offset
-                rect = QRectF(x, y, key_w * 0.8, black_h)
-                painter.fillRect(rect, QColor(30,30,30))
-                painter.setPen(QPen(QColor(10,10,10)))
-                painter.drawRect(rect)
+            if is_white(pc):
+                continue
+            # find preceding white in semitone space and its order position
+            prev_i = i - 1
+            while prev_i >= 0 and not is_white((vis_min + prev_i) % 12):
+                prev_i -= 1
+            # if we don't find both neighbors, skip
+            if prev_i < 0 or (prev_i not in i_to_order) or (i_to_order[prev_i] + 1 >= n_whites):
+                continue
+            left_ord = i_to_order[prev_i]
+            right_ord = left_ord + 1
+            # centers between these two white keys
+            x_left_white  = white_edges[left_ord]
+            x_right_white = white_edges[right_ord]
+            cx = 0.5 * ((x_left_white + ww) + x_right_white)
+            bw = ww * BLACK_KEY_WIDTH_RATIO
+            xk = cx - (bw * 0.5)
+            rect = QtCore.QRectF(xk, float(base_y), bw, float(black_h))
+            painter.fillRect(rect, QColor(30, 30, 30))
+            painter.setPen(QPen(QColor(10, 10, 10)))
+            painter.drawRect(rect)
+            dbg_black_rects.append((i, float(rect.x()), float(rect.y()), float(rect.width()), float(rect.height())))
+            dbg_info["black_h"] = float(black_h)
+
+        # 3) Subtle top border at the start of the keys
+        painter.setPen(QPen(TOP_BORDER_COLOR))
+        painter.drawLine(0, int(base_y), int(w), int(base_y))
+
+        # 4) Tail region: ensure the area under the black keys is white, then draw **white-only** dividers
+        tail_y = base_y + black_h
+        tail_h = max(0.0, kb_h - black_h)
+        if tail_h > 0.0:
+            painter.fillRect(QtCore.QRectF(0, tail_y, w, tail_h), QColor(240, 240, 240))
+
+            painter.setPen(QPen(WHITE_DIVIDER_COLOR))
+            bottom_y = int(base_y + kb_h)
+            # full-height dividers at B–C and E–F; short dividers elsewhere
+            for ord_idx in range(1, n_whites):
+                # semitone index of the *right* white in this boundary
+                i_right = whites_idx[ord_idx]
+                pc_right = (vis_min + i_right) % 12
+                x_div = white_edges[ord_idx]
+                if pc_right in (0, 5):  # C or F (boundary after B or E)
+                    painter.drawLine(x_div, int(base_y), x_div, bottom_y)
+                else:
+                    painter.drawLine(x_div, int(tail_y), x_div, bottom_y)
+            # Bottom edge
+            painter.drawLine(0, bottom_y, int(w), bottom_y)
+
+        # --- Debug print throttled ---
+        import time as _time
+        if DEBUG_PIANO_RECTS:
+            now = _time.time()
+            # Print at most ~4 times per second
+            if (now - getattr(self, "_debug_last_print", 0.0)) > 0.25:
+                self._debug_last_print = now
+                WMAX = 24
+                BMAX = 24
+                def _fmt(items, maxn):
+                    s = []
+                    for (idx, x, y, w_, h_) in items[:maxn]:
+                        s.append(f"[i={idx:02d} x={x:.1f} y={y:.1f} w={w_:.1f} h={h_:.1f}]")
+                    more = len(items) - maxn
+                    if more > 0:
+                        s.append(f"... (+{more} more)")
+                    return " ".join(s)
+                print(
+                    "PIANO-RECTS",
+                    f"kb_h={dbg_info.get('kb_h')} base_y={dbg_info.get('base_y')} black_h={dbg_info.get('black_h', 'n/a')}",
+                    "\n  whites:", _fmt(dbg_white_rects, WMAX),
+                    "\n  blacks:", _fmt(dbg_black_rects, BMAX),
+                    f"\n  vis_min={vis_min} vis_max={vis_min + VISIBLE_SPAN - 1} key_w={key_w:.2f}"
+                )
 
         # Label C keys following the default window (C1..B6)
         painter.setPen(QPen(QColor(60, 60, 60)))
