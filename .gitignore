@@ -27,10 +27,6 @@ venv/
 ENV/
 env/
 
-# PyInstaller
-*.spec
-build/
-dist/
 
 # macOS
 .DS_Store

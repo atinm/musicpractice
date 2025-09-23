@@ -51,79 +51,15 @@ sudo apt-get update && sudo apt-get install -y python3-pip python3-venv portaudi
 
 ## Usage
 
-### Running from Source
+### Running the Application
+
+Simply run the main application file:
 
 ```bash
 python app.py
 ```
 
-### Quick Launch (Recommended)
-
-The project includes ready-to-use launchers:
-
-#### **Command Line Launcher:**
-
-```bash
-./MusicPractice.sh
-```
-
-#### **macOS App Bundle:**
-
-```bash
-open dist/MusicPractice.app
-```
-
-Both launchers automatically activate your virtual environment and use all installed dependencies.
-
-### Creating Standalone Application
-
-To create a standalone application bundle that includes all dependencies:
-
-#### 1. Install Build Dependencies
-
-```bash
-pip install -r requirements-build.txt
-```
-
-#### 2. Convert Icons (Optional)
-
-If you need platform-specific icon formats:
-
-```bash
-python convert_icons.py
-```
-
-_Note: The project already includes icons in the `icons/` directory._
-
-#### 3. Build Application
-
-**Standard Build (Cross-Platform):**
-
-```bash
-python build_app.py
-```
-
-**macOS App Bundle:**
-
-```bash
-python build_app.py --macos
-```
-
-The built application will be in the `dist/` directory:
-
-- **Windows**: `dist/MusicPractice.exe`
-- **macOS**: `dist/MusicPractice.app` (if using --macos flag)
-- **Linux**: `dist/MusicPractice`
-
-#### 4. Distribution
-
-The standalone application includes all Python dependencies and can be distributed without requiring users to install Python or any dependencies.
-
-**Important: Vamp Plugins Highly Recommended**: While the bundled app works without Vamp plugins, **we strongly encourage installing them** for significantly improved accuracy. The built-in algorithms provide basic functionality, but Vamp plugins (Chordino, qm-vamp-plugins) offer professional-grade analysis quality that makes a substantial difference in practice sessions.
-
-### Bundled App Behavior
-
-The standalone application includes:
+The application will start with all features available, including:
 
 ✅ **Core Features** (always available):
 
