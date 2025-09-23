@@ -5,8 +5,6 @@ GLOBAL_MIDI_MAX = 108  # C8
 DEFAULT_VISIBLE_MIN = 24  # C1
 VISIBLE_SPAN = 72         # C1..B6 (6 octaves)
 
-# Debug: print keyboard rects being drawn (throttled)
-DEBUG_PIANO_RECTS = True
 """
 Piano roll widget for displaying note confidence with 88-key piano visualization.
 """
@@ -337,32 +335,6 @@ class PianoRollWidget(QWidget):
                     # Bottom edge
                     painter.drawLine(0, bottom_y, int(w), bottom_y)
 
-                # --- Debug print throttled ---
-                import time as _time
-                if DEBUG_PIANO_RECTS:
-                    now = _time.time()
-                    # Print at most ~4 times per second
-                    if (now - getattr(self, "_debug_last_print", 0.0)) > 0.25:
-                        self._debug_last_print = now
-                        # Limit how many rects we print to keep output readable
-                        WMAX = 24
-                        BMAX = 24
-                        def _fmt(items, maxn):
-                            s = []
-                            for (idx, x, y, w_, h_) in items[:maxn]:
-                                s.append(f"[i={idx:02d} x={x:.1f} y={y:.1f} w={w_:.1f} h={h_:.1f}]")
-                            more = len(items) - maxn
-                            if more > 0:
-                                s.append(f"... (+{more} more)")
-                            return " ".join(s)
-                        print(
-                            "PIANO-RECTS",
-                            f"kb_h={dbg_info.get('kb_h')} base_y={dbg_info.get('base_y')} black_h={dbg_info.get('black_h', 'n/a')}",
-                            "\n  whites:", _fmt(dbg_white_rects, WMAX),
-                            "\n  blacks:", _fmt(dbg_black_rects, BMAX),
-                            f"\n  vis_min={vis_min} vis_max={vis_max} key_w={key_w:.2f}"
-                        )
-
                 # Slice the confidence vector EXACTLY to the visible MIDI window [vis_min..vis_max]
                 start_idx = int(max(0, vis_min - GLOBAL_MIDI_MIN))
                 end_idx   = int(max(0, vis_max  - GLOBAL_MIDI_MIN + 1))  # inclusive vis_max → +1 for slice end
@@ -609,31 +581,6 @@ class PianoRollWidget(QWidget):
                     painter.drawLine(x_div, int(tail_y), x_div, bottom_y)
             # Bottom edge
             painter.drawLine(0, bottom_y, int(w), bottom_y)
-
-        # --- Debug print throttled ---
-        import time as _time
-        if DEBUG_PIANO_RECTS:
-            now = _time.time()
-            # Print at most ~4 times per second
-            if (now - getattr(self, "_debug_last_print", 0.0)) > 0.25:
-                self._debug_last_print = now
-                WMAX = 24
-                BMAX = 24
-                def _fmt(items, maxn):
-                    s = []
-                    for (idx, x, y, w_, h_) in items[:maxn]:
-                        s.append(f"[i={idx:02d} x={x:.1f} y={y:.1f} w={w_:.1f} h={h_:.1f}]")
-                    more = len(items) - maxn
-                    if more > 0:
-                        s.append(f"... (+{more} more)")
-                    return " ".join(s)
-                print(
-                    "PIANO-RECTS",
-                    f"kb_h={dbg_info.get('kb_h')} base_y={dbg_info.get('base_y')} black_h={dbg_info.get('black_h', 'n/a')}",
-                    "\n  whites:", _fmt(dbg_white_rects, WMAX),
-                    "\n  blacks:", _fmt(dbg_black_rects, BMAX),
-                    f"\n  vis_min={vis_min} vis_max={vis_min + VISIBLE_SPAN - 1} key_w={key_w:.2f}"
-                )
 
         # Label C keys following the default window (C1..B6)
         painter.setPen(QPen(QColor(60, 60, 60)))

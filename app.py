@@ -34,27 +34,93 @@ from piano_widget import PianoRollWidget
 from note_detection import compute_note_confidence
 
 class WaveformView(QtWidgets.QWidget):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, window_s: float = 15.0):
         super().__init__(parent)
-        # Waveform drawing cache
-        self._waveform_cache = {}  # (stem_name, start_s, end_s, width) -> (mins, maxs, x0, x1)
+
+        # ---- UI basics ----
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setMinimumHeight(160)
+        self.setContextMenuPolicy(Qt.DefaultContextMenu)
+
+        # Visual time window (seconds)
+        self.window_s = float(window_s)
+
+        # ---- Caches / performance ----
+        self._waveform_cache = {}            # (stem, t0, t1, w) -> (mins, maxs, x0, x1)
         self._cache_max_entries = 1000
         self._last_paint_time = 0
-        self._paint_throttle_ms = 16  # ~60fps max
+        self._paint_throttle_ms = 16         # ~60fps cap
 
-        # Multi-resolution pyramid cache for ultra-fast scrolling
-        self._pyramid_cache = {}  # stem_name -> {level: (mins_array, maxs_array, total_samples)}
+        # Multi-resolution pyramid for ultra-fast scrolling
+        self._pyramid_cache = {}             # stem_name -> {level: (mins, maxs, N_total)}
+        self._pyramid_levels = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
 
-        # Solo state
-        self.soloed_stem = None  # name of soloed stem, or None
-        self._pyramid_levels = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]  # Downsampling factors
+        # ---- Player & analysis state ----
+        self.player = None                   # type: LoopPlayer | None
+        self.chords = []                     # list[{start,end,label}]
+        self.beats = []                      # beat times (s)
+        self.bars = []                       # downbeat times (s)
+        self.origin = 0.0                    # visual zero aligned to music start
+        self.content_end = None              # last non-silent sample time (s)
 
-        # Spectrum band for solo mode
-        self.spectrum_data = None  # Current spectrum data at playhead
-        self.spectrum_band_height = 60  # Height of spectrum band in pixels
+        # ---- Loop state ----
+        self.loopA = None
+        self.loopB = None
+
+        # ---- View mode ----
+        self.show_stems = True               # stacked stems vs mixed view
+
+        # ---- Solo / Focus (visual vs audio) ----
+        self.soloed_stem = None              # audio solo target (or None)
+        self.focus_stem = None               # VISUAL-ONLY focus (solo-style visuals without soloing audio)
+
+        # ---- Spectrum / Piano band for focus/solo visuals ----
+        self.spectrum_data = None
+        self.spectrum_band_height = 60
+        from piano_widget import PianoRollWidget
         self.piano_roll_widget = PianoRollWidget(self)
         self.piano_roll_widget.hide()
-        # Ensure child widgets are placed correctly on construct
+
+        # ---- Interaction / dragging ----
+        self._drag_mode = None               # 'set' | 'resizeA' | 'resizeB' | 'move' | None
+        self.snap_enabled = True             # snap loops to beats when dragging
+        self._press_t = None
+        self._press_loopA = None
+        self._press_loopB = None
+
+        # Loop flag geometry
+        self.HANDLE_PX = 6
+        self.FLAG_W = 10
+        self.FLAG_H = 10
+        self.FLAG_STRIP = 16                 # px reserved at the top for flags/labels
+
+        # Saved loops UI state
+        self.saved_loops = []                # optional: list of dicts {id,a,b,label}
+        self.selected_loop_id = None
+
+        # Mouse tracking state
+        self._press_kind = None              # 'new' | 'edgeA' | 'edgeB' | None
+        self._press_loop_id = None
+        self._press_dx = 0.0
+        self._press_x = None
+        self._drag_started = False
+        self._click_thresh_px = 4
+
+        # Smooth pan accumulator for wheel scrolling
+        self._pan_accum_s = 0.0
+
+        # Freeze window (after seek) support
+        self._freeze_window = False
+        self._manual_t0 = None
+        self._manual_t1 = None
+
+        # ---- Repaint timer ----
+        self.timer = QtCore.QTimer(self)
+        self.timer.setInterval(33)           # ~30 FPS
+        self.timer.timeout.connect(self.update)
+        self.timer.start()
+
+        # ---- Ensure child layout is correct on construct ----
         try:
             self._layout_children()
         except Exception:
@@ -194,64 +260,6 @@ class WaveformView(QtWidgets.QWidget):
                 self.selected_loop_id = None
         self.update()
 
-    def __init__(self, parent=None, window_s: float = 15.0):
-        super().__init__(parent)
-        self.setFocusPolicy(Qt.StrongFocus)
-        self.setMinimumHeight(160)
-        self.setContextMenuPolicy(Qt.DefaultContextMenu)
-        self.window_s = window_s
-        self.player = None  # type: LoopPlayer | None
-        self.chords = []    # list of {start, end, label}
-        self.beats = []   # list[float] in seconds (absolute timeline)
-        self.bars = []    # list[float] in seconds (absolute timeline)
-        self.origin = 0.0  # seconds; shift visual time so 0 = music start
-        self.content_end = None  # seconds; last non-silent audio
-        self.loopA = None  # visual loop start (seconds)
-        self.loopB = None  # visual loop end (seconds)
-        # Visual mode: stacked stems (True) vs single combined waveform (False)
-        self.show_stems = True
-        self._drag_mode = None  # 'set' | 'resizeA' | 'resizeB' | 'move' | None
-        self.snap_enabled = True  # whether to snap to beats when dragging loop
-        self._press_t = None
-        self._press_loopA = None
-        self._press_loopB = None
-        self.timer = QtCore.QTimer(self)
-        self.timer.setInterval(33)  # ~30 FPS
-        self.timer.timeout.connect(self.update)
-        self.timer.start()
-        # Interaction geometry & multi-loop scaffolding (safe if unused)
-        self.HANDLE_PX = 6
-        self.FLAG_W = 10
-        self.FLAG_H = 10
-        self.FLAG_STRIP = 16  # pixels reserved at the top of waveform for flags & loop names
-        self.saved_loops = []            # optional: list of dicts {id,a,b,label}
-        self.selected_loop_id = None
-        # drag state
-        self._press_kind = None          # 'new' | 'edgeA' | 'edgeB' | None
-        self._press_loop_id = None
-        self._press_dx = 0.0             # offset used when moving a loop via flag
-        # click vs drag tracking
-        self._press_x = None             # x at mouse press (px)
-        self._drag_started = False       # becomes True once threshold passed
-        self._click_thresh_px = 4        # pixels before treating as drag
-        self._pan_accum_s = 0.0  # accumulate fractional seconds for smooth horizontal wheel pan
-        self._freeze_window = False
-        self._manual_t0 = None
-        self._manual_t1 = None
-        # Context menu suppression flag for right-click handling (unused now; we rely on contextMenuEvent only)
-        self._suppress_next_ctx = False  # (unused now; we rely on contextMenuEvent only)
-        self.clear_loop_visual()
-        # Ensure embedded piano roll widget exists (used in solo mode)
-        try:
-            _ = self.piano_roll_widget
-        except AttributeError:
-            from piano_widget import PianoRollWidget
-            self.piano_roll_widget = PianoRollWidget(self)
-            self.piano_roll_widget.hide()
-        try:
-            self._layout_children()
-        except Exception:
-            pass
 
     def set_beats(self, beats: list | None, bars: list | None):
         self.beats = beats or []
@@ -303,6 +311,41 @@ class WaveformView(QtWidgets.QWidget):
             pass
         self.update()
 
+    def _visual_focus_stem(self) -> str | None:
+        """
+        Decide which stem (if any) should drive solo-style VISUALS.
+        Preference order: explicit Focus (visual-only) → Solo (audio).
+        """
+        return getattr(self, 'focus_stem', None) or getattr(self, 'soloed_stem', None)
+
+    def get_focus_stem(self) -> str | None:
+        return self._visual_focus_stem()
+
+    def set_focus_stem(self, stem_name: str | None):
+        """
+        Set/clear a VISUAL-ONLY focus stem. Does not change audio routing/mutes.
+        When set, the UI shows single wide waveform + piano keyboard for this stem.
+        """
+        self.focus_stem = stem_name or None
+        vis_focus = self._visual_focus_stem()
+
+        # Manage embedded piano widget like in solo visuals
+        if vis_focus is None:
+            if getattr(self, 'piano_roll_widget', None) is not None:
+                self.piano_roll_widget.hide()
+        else:
+            if getattr(self, 'piano_roll_widget', None) is None:
+                from piano_widget import PianoRollWidget
+                self.piano_roll_widget = PianoRollWidget(self)
+            self.piano_roll_widget.show()
+            self.piano_roll_widget.raise_()
+
+        try:
+            self._layout_children()
+        except Exception:
+            pass
+        self.update()
+
     def showEvent(self, ev):
         try:
             self._layout_children()
@@ -319,7 +362,7 @@ class WaveformView(QtWidgets.QWidget):
 
     def _compute_spectrum_at_playhead(self):
         """Compute frequency spectrum at current playhead position for soloed stem using librosa CQT."""
-        if not getattr(self, 'soloed_stem', None) or not self.player:
+        if not self._visual_focus_stem() or not self.player:
             self.spectrum_data = None
             return
 
@@ -341,8 +384,9 @@ class WaveformView(QtWidgets.QWidget):
             # Get the soloed stem data
             stems = self._get_stems_for_display()
             solo_stem_data = None
+            focus_name = self._visual_focus_stem()
             for stem_name, arr in stems:
-                if stem_name == self.soloed_stem:
+                if stem_name == focus_name:
                     solo_stem_data = arr
                     break
 
@@ -509,8 +553,8 @@ class WaveformView(QtWidgets.QWidget):
         CHORD_LANE_H = 32
         ch_h = CHORD_LANE_H
 
-        # In solo mode, reserve space for spectrum band
-        if getattr(self, 'soloed_stem', None):
+        # In visual focus (Focus or Solo), reserve space for spectrum/piano band
+        if self._visual_focus_stem():
             ph = 0
             try:
                 if hasattr(self, 'piano_roll_widget') and self.piano_roll_widget is not None and self.piano_roll_widget.isVisible():
@@ -537,9 +581,9 @@ class WaveformView(QtWidgets.QWidget):
             # Pick a practical height: use configured height or minHeight, whichever is larger
             desired_h = getattr(self, "spectrum_band_height", 90)
             min_h = int(self.piano_roll_widget.minimumHeight()) if hasattr(self.piano_roll_widget, "minimumHeight") else 0
-            spectrum_h = max(int(desired_h), int(min_h)) if getattr(self, "soloed_stem", None) else 0
+            spectrum_h = max(int(desired_h), int(min_h)) if self._visual_focus_stem() else 0
 
-            if getattr(self, "soloed_stem", None):
+            if self._visual_focus_stem():
                 from PySide6.QtCore import QRect
                 new_rect = QRect(0, wf_h, self.width(), spectrum_h)
                 if self.piano_roll_widget.geometry() != new_rect:
@@ -564,8 +608,8 @@ class WaveformView(QtWidgets.QWidget):
         x = int(pos.x())
         y = int(pos.y())
         lane_top = wf_h
-        # Account for spectrum band in solo mode
-        if getattr(self, 'soloed_stem', None):
+        # Account for spectrum band in focus mode
+        if self._visual_focus_stem():
             try:
                 ph = int(self.piano_roll_widget.height()) if hasattr(self, 'piano_roll_widget') and self.piano_roll_widget.isVisible() else int(getattr(self, 'spectrum_band_height', 60))
             except Exception:
@@ -1494,8 +1538,8 @@ class WaveformView(QtWidgets.QWidget):
 
         p.fillRect(0, 0, w, wf_h, QtGui.QColor(20, 20, 20))
 
-        # Draw piano roll in solo mode (in its own dedicated space)
-        if getattr(self, 'soloed_stem', None):
+        # Draw piano roll in focus mode (in its own dedicated space)
+        if self._visual_focus_stem():
             # Refresh spectrum/note data right before drawing
             try:
                 self._compute_spectrum_at_playhead()
@@ -1560,14 +1604,14 @@ class WaveformView(QtWidgets.QWidget):
             short_len = min(6, wf_h)
 
             # Check if we should show solo mode
-            soloed_stem = getattr(self, 'soloed_stem', None)
+            focus_name = self._visual_focus_stem()
             in_solo_mode = False
-            if soloed_stem:
+            if focus_name:
                 # Solo mode: show only the soloed stem as a full-width waveform
                 stems = self._get_stems_for_display()
                 solo_stem_data = None
                 for stem_name, arr in stems:
-                    if stem_name == soloed_stem:
+                    if stem_name == focus_name:
                         solo_stem_data = (stem_name, arr)
                         break
 
@@ -1936,38 +1980,6 @@ class WaveformView(QtWidgets.QWidget):
             segs_to_draw = self._ensure_leading_bar(split_bars, self.bars)
             segs_to_draw = self._unique_by_span(segs_to_draw)
 
-            # DEBUG: confirm what we will draw
-            try:
-                first_lab = segs_to_draw[0].get('label') if segs_to_draw else None
-                # Determine first *visible* segment in the current window
-                segs_visible = []
-                for s in segs_to_draw:
-                    try:
-                        sa = float(s.get('start')); sb = float(s.get('end'))
-                    except Exception:
-                        continue
-                    if sb <= t0 or sa >= t1:
-                        continue
-                    segs_visible.append(s)
-                vis_lab = segs_visible[0].get('label') if segs_visible else None
-                vis_a = segs_visible[0].get('start') if segs_visible else None
-                vis_b = segs_visible[0].get('end') if segs_visible else None
-            except Exception:
-                pass
-
-            # Ensure segs_visible exists even if DEBUG block above failed
-            if 'segs_visible' not in locals():
-                segs_visible = []
-                for s in segs_to_draw:
-                    try:
-                        sa = float(s.get('start')); sb = float(s.get('end'))
-                    except Exception:
-                        continue
-                    if sb <= t0 or sa >= t1:
-                        continue
-                    segs_visible.append(s)
-                segs_visible.sort(key=lambda s: float(s.get('start', 0.0)))
-
             font = p.font()
             font.setPointSizeF(max(9.0, self.font().pointSizeF()))
             p.setFont(font)
@@ -1986,7 +1998,7 @@ class WaveformView(QtWidgets.QWidget):
                 x1 = int((b_rel - rel_t0) / (rel_t1 - rel_t0) * w)
                 # Position chord rectangles below spectrum band in solo mode (use real child height)
                 chord_top = wf_h
-                if getattr(self, 'soloed_stem', None):
+                if self._visual_focus_stem():
                     ph = 0
                     try:
                         if hasattr(self, 'piano_roll_widget') and self.piano_roll_widget is not None and self.piano_roll_widget.isVisible():
@@ -2905,7 +2917,6 @@ class Main(QtWidgets.QMainWindow):
             self._set_chord_backend = _set_chord_backend  # bind for reuse
 
             have = _have_chordino()
-            print(f"have_chordino: {have} (default backend → {'chordino' if have else 'internal'})")
             self._set_chord_backend('chordino' if have else 'internal')
 
             self.act_backend_internal.triggered.connect(lambda _=False: self._on_backend_changed("internal"))
@@ -3864,7 +3875,7 @@ class Main(QtWidgets.QMainWindow):
         vlay.setContentsMargins(6, 4, 6, 6)
         vlay.setSpacing(4)
 
-        # --- Top line: Label (left) + Solo + Mute (right) ---
+        # --- Top line: Label (left) + Focus + Solo + Mute (right) ---
         top = QtWidgets.QHBoxLayout()
         top.setContentsMargins(0, 0, 0, 0)
         top.setSpacing(8)
@@ -3875,6 +3886,11 @@ class Main(QtWidgets.QMainWindow):
         lbl.setFont(f)
         top.addWidget(lbl, 0, Qt.AlignVCenter | Qt.AlignLeft)
         top.addStretch(1)
+
+        # Visual-only Focus (solo-style visuals without soloing audio)
+        focus_btn = QtWidgets.QCheckBox("Focus", row)
+        focus_btn.setChecked(False)
+        top.addWidget(focus_btn, 0, Qt.AlignVCenter | Qt.AlignRight)
 
         # Solo radio button
         solo_btn = QtWidgets.QRadioButton("Solo", row)
@@ -3936,6 +3952,54 @@ class Main(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
+        def _apply_focus(on: bool):
+            on = bool(on)
+            try:
+                # Prefer a visual-focus API if WaveformView provides it
+                wave = getattr(self, 'wave', None)
+                if wave is None:
+                    return
+
+                # Determine current focused stem (if API exists)
+                current_focus = None
+                if hasattr(wave, 'get_focus_stem') and callable(wave.get_focus_stem):
+                    current_focus = wave.get_focus_stem()
+                elif hasattr(wave, 'focus_stem'):
+                    current_focus = getattr(wave, 'focus_stem')
+
+                if on:
+                    # Set this stem as the visual focus
+                    if hasattr(wave, 'set_focus_stem') and callable(wave.set_focus_stem):
+                        wave.set_focus_stem(stem_key)
+                    else:
+                        # Fallback: set attribute + update
+                        try:
+                            wave.focus_stem = stem_key
+                        except Exception:
+                            pass
+                        wave.update()
+
+                    # Uncheck other Focus checkboxes in the dock to make it exclusive
+                    try:
+                        for widget in self.stems_layout.parent().findChildren(QtWidgets.QCheckBox):
+                            if widget is not focus_btn and widget.text() == "Focus":
+                                widget.setChecked(False)
+                    except Exception:
+                        pass
+                else:
+                    # If this stem was focused, clear focus
+                    if current_focus == stem_key:
+                        if hasattr(wave, 'set_focus_stem') and callable(wave.set_focus_stem):
+                            wave.set_focus_stem(None)
+                        else:
+                            try:
+                                wave.focus_stem = None
+                            except Exception:
+                                pass
+                        wave.update()
+            except Exception:
+                pass
+
         def _apply_solo(soloed: bool):
             soloed = bool(soloed)
 
@@ -3989,6 +4053,7 @@ class Main(QtWidgets.QMainWindow):
                 pass
 
         chk.toggled.connect(_apply_mute)
+        focus_btn.toggled.connect(_apply_focus)
         solo_btn.toggled.connect(_apply_solo)
         sld.valueChanged.connect(_apply_gain)
 
