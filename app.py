@@ -285,18 +285,18 @@ class WaveformView(QtWidgets.QWidget):
         """Set which stem is soloed for display. None means no solo."""
         self.soloed_stem = stem_name
 
-        # Show/hide piano roll widget based on solo mode
+        # Show/hide piano roll widget based on focus mode
         if stem_name is None:
-            # Not in solo mode - hide piano widget
+            # Not in focus mode - hide piano widget
             if self.piano_roll_widget is not None:
                 self.piano_roll_widget.hide()
         else:
-            # In solo mode - ensure piano widget is created and shown
+            # In focus mode - ensure piano widget is created and shown
             if self.piano_roll_widget is None:
                 # Create piano widget if it doesn't exist
                 self.piano_roll_widget = PianoRollWidget(self)
 
-            # Always show the piano widget in solo mode; geometry handled by layout pass
+            # Always show the piano widget in focus mode; geometry handled by layout pass
             self.piano_roll_widget.show()
             self.piano_roll_widget.raise_()
             try:
@@ -1576,9 +1576,9 @@ class WaveformView(QtWidgets.QWidget):
             except Exception:
                 pass
 
-        # Fill chord area background, accounting for spectrum band in solo mode (use real child height)
+        # Fill chord area background, accounting for spectrum band in focus mode (use real child height)
         chord_top = wf_h
-        if getattr(self, 'soloed_stem', None):
+        if self._visual_focus_stem():
             ph = 0
             try:
                 if hasattr(self, 'piano_roll_widget') and self.piano_roll_widget is not None and self.piano_roll_widget.isVisible():
@@ -1603,9 +1603,8 @@ class WaveformView(QtWidgets.QWidget):
             long_len = min(12, wf_h)
             short_len = min(6, wf_h)
 
-            # Check if we should show solo mode
             focus_name = self._visual_focus_stem()
-            in_solo_mode = False
+            in_focus_mode = False
             if focus_name:
                 # Solo mode: show only the soloed stem as a full-width waveform
                 stems = self._get_stems_for_display()
@@ -1616,7 +1615,7 @@ class WaveformView(QtWidgets.QWidget):
                         break
 
                 if solo_stem_data:
-                    in_solo_mode = True
+                    in_focus_mode = True
                     # Draw soloed stem as full-width waveform (like combined waveform)
                     stem_name, arr = solo_stem_data
                     sr = getattr(self.player, 'sr', None)
@@ -1645,11 +1644,13 @@ class WaveformView(QtWidgets.QWidget):
                                     y1 = mid - int(mins[i] * amp)
                                     y2 = mid - int(maxs[i] * amp)
                                     p.drawLine(x, y1, x, y2)
-                # Skip the rest of the waveform drawing logic in solo mode
-                stems = []
+                    # Skip the rest of the waveform drawing logic in focus mode
+                    stems = []
+                else:
+                    stems = self._get_stems_for_display() if getattr(self, "show_stems", True) else []
 
-                # Draw spectrum band in solo mode (moved to after chord background)
-                if in_solo_mode:
+                # Draw spectrum band in focus mode (moved to after chord background)
+                if in_focus_mode:
                     self._compute_spectrum_at_playhead()
                     spectrum_h = getattr(self, 'spectrum_band_height', 80)
                     # Note: piano roll will be drawn later after chord background
@@ -1730,7 +1731,7 @@ class WaveformView(QtWidgets.QWidget):
                     text_y = y_cursor + fm.ascent() + 2  # small top padding
                     p.drawText(6, text_y, str(stem_name))
                     y_cursor += row_h + row_gap
-            elif not in_solo_mode:
+            elif not in_focus_mode:
                 # Fallback: single mixed waveform from the player's audio buffer
                 mins, maxs = self._mono_slice_minmax(t0, t1, w)
                 if mins is not None:
@@ -1996,7 +1997,7 @@ class WaveformView(QtWidgets.QWidget):
                 b_rel = b - self.origin
                 x0 = int((a_rel - rel_t0) / (rel_t1 - rel_t0) * w)
                 x1 = int((b_rel - rel_t0) / (rel_t1 - rel_t0) * w)
-                # Position chord rectangles below spectrum band in solo mode (use real child height)
+                # Position chord rectangles below spectrum band in focus mode (use real child height)
                 chord_top = wf_h
                 if self._visual_focus_stem():
                     ph = 0
@@ -4019,7 +4020,7 @@ class Main(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
-            # Update waveform view to show solo mode
+            # Update waveform view to show focus mode
             try:
                 if hasattr(self, 'wave') and self.wave is not None:
                     if soloed:
