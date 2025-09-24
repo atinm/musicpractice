@@ -1501,8 +1501,8 @@ class WaveformView(QtWidgets.QWidget):
         # stable order by time
         return sorted(uniq.values(), key=lambda x: (x['start'], x['end']))
 
-    def paintEvent(self, e: QtGui.QPaintEvent):
-        # Initialize attributes if they don't exist (for existing instances)
+    def _initialize_paint_attributes(self):
+        """Initialize paint-related attributes if they don't exist."""
         if not hasattr(self, '_last_paint_time'):
             self._last_paint_time = 0
         if not hasattr(self, '_paint_throttle_ms'):
@@ -1516,29 +1516,8 @@ class WaveformView(QtWidgets.QWidget):
         if not hasattr(self, '_pyramid_levels'):
             self._pyramid_levels = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
 
-        # Disable paint throttling for maximum smoothness
-        # import time
-        # current_time = time.time() * 1000  # Convert to milliseconds
-        # if current_time - self._last_paint_time < self._paint_throttle_ms:
-        #     return
-        # self._last_paint_time = current_time
-
-        p = QtGui.QPainter(self)
-        p.setRenderHint(QtGui.QPainter.Antialiasing, False)
-        p.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, False)  # Disable for better performance
-        w = self.width()
-        h = self.height()
-        if w < 10 or h < 10:
-            return
-        wf_h, ch_h = self._wf_geom()
-        t0, t1 = self._current_window()
-        # Visual times relative to the music start (origin)
-        rel_t0 = t0 - self.origin
-        rel_t1 = t1 - self.origin
-
-        p.fillRect(0, 0, w, wf_h, QtGui.QColor(20, 20, 20))
-
-        # Draw piano roll in focus mode (in its own dedicated space)
+    def _handle_piano_roll_widget(self):
+        """Handle piano roll widget creation and data updates in focus mode."""
         if self._visual_focus_stem():
             # Refresh spectrum/note data right before drawing
             try:
@@ -1576,7 +1555,8 @@ class WaveformView(QtWidgets.QWidget):
             except Exception:
                 pass
 
-        # Fill chord area background, accounting for spectrum band in focus mode (use real child height)
+    def _get_chord_area_top(self, wf_h: int) -> int:
+        """Calculate the top position of the chord area, accounting for spectrum band in focus mode."""
         chord_top = wf_h
         if self._visual_focus_stem():
             ph = 0
@@ -1588,8 +1568,10 @@ class WaveformView(QtWidgets.QWidget):
             if ph <= 0:
                 ph = int(getattr(self, 'spectrum_band_height', 60))
             chord_top = wf_h + ph
-        p.fillRect(0, chord_top, w, ch_h, QtGui.QColor(28, 28, 28))
+        return chord_top
 
+    def _draw_waveforms(self, p: QtGui.QPainter, w: int, wf_h: int, t0: float, t1: float, rel_t0: float, rel_t1: float):
+        """Draw waveforms, grids, loops, and playhead in the waveform area."""
         # Constrain subsequent waveform drawings (grid, beats, flags, loop fills, waveform, playhead)
         p.save()
         p.setClipRect(0, 0, w, wf_h)
@@ -1666,177 +1648,205 @@ class WaveformView(QtWidgets.QWidget):
                         self._build_pyramid_for_stem(stem_name, arr, sr)
 
             if stems:
-                # Divide body area into rows for each stem
-                rows = len(stems)
-                row_gap = 2
-                row_h = max(14, int((body_h - (rows-1)*row_gap) / max(1, rows)))
-                y_cursor = body_top
-                for (stem_name, arr) in stems:
-                    # Background (dim if muted)
-                    muted = self._is_stem_muted(stem_name)
-                    bg = QtGui.QColor(40, 40, 40) if muted else QtGui.QColor(28, 28, 28)
-                    p.fillRect(0, y_cursor, w, row_h, bg)
-                    # Border
-                    p.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0)))
-                    p.drawRect(0, y_cursor, max(1, w-1), max(1, row_h-1))
-                    # Envelope - use pyramid for ultra-fast rendering
-                    sr = getattr(self.player, 'sr', None)
-                    if (hasattr(self, '_pyramid_cache') and
-                        stem_name in self._pyramid_cache and
-                        self._pyramid_cache[stem_name]):
-                        # Use pyramid for ultra-fast scrolling
-                        mins, maxs, x0_seg, x1_seg = self._get_pyramid_slice(stem_name, t0, t1, w, sr)
-                        # Fallback to cached computation if pyramid fails
-                        if mins is None or len(mins) == 0:
-                            mins, maxs, x0_seg, x1_seg = self._slice_minmax_for_array_cached(stem_name, arr, t0, t1, w, sr)
-                    else:
-                        # Fallback to cached computation
-                        mins, maxs, x0_seg, x1_seg = self._slice_minmax_for_array_cached(stem_name, arr, t0, t1, w, sr)
-                    if mins is not None and maxs is not None:
-                        mid = y_cursor + row_h // 2
-                        amp = max(1, int(row_h * 0.45))
-                        # Envelope color: lighter when muted
-                        if muted:
-                            color = QtGui.QColor(170, 190, 210)  # light grey-blue for muted
-                        else:
-                            color = QtGui.QColor(0, 180, 255)   # bright cyan for active
-
-                        L = min(len(mins), max(0, x1_seg - x0_seg), w - x0_seg)
-                        if L > 0:
-                            # Create filled polygon for smooth waveform display
-                            points = []
-                            # Top envelope (maxs)
-                            for i in range(L):
-                                x = x0_seg + i
-                                y = mid - int(maxs[i] * amp)
-                                points.append(QtCore.QPoint(x, y))
-                            # Bottom envelope (mins) in reverse
-                            for i in range(L-1, -1, -1):
-                                x = x0_seg + i
-                                y = mid - int(mins[i] * amp)
-                                points.append(QtCore.QPoint(x, y))
-
-                            if len(points) > 2:
-                                # Set brush and pen for this specific stem
-                                p.setBrush(QtGui.QBrush(color))
-                                p.setPen(QtGui.QPen(color))
-                                polygon = QtGui.QPolygon(points)
-                                p.drawPolygon(polygon)  # This will now be filled due to the brush
-
-                                # Reset brush to transparent to avoid affecting other drawing
-                                p.setBrush(QtGui.QBrush(QtCore.Qt.NoBrush))
-                    # Stem label at top-left inside the row
-                    p.setPen(QtGui.QPen(QtGui.QColor(210, 220, 230)))
-                    fm = p.fontMetrics()
-                    text_y = y_cursor + fm.ascent() + 2  # small top padding
-                    p.drawText(6, text_y, str(stem_name))
-                    y_cursor += row_h + row_gap
+                self._draw_stem_waveforms(p, stems, w, body_top, body_h, t0, t1, sr)
             elif not in_focus_mode:
-                # Fallback: single mixed waveform from the player's audio buffer
-                mins, maxs = self._mono_slice_minmax(t0, t1, w)
-                if mins is not None:
-                    mid = body_top + body_h // 2
-                    p.setPen(QtGui.QPen(QtGui.QColor(0, 180, 255)))
-                    for x, (mn, mx) in enumerate(zip(mins, maxs)):
-                        y1 = mid - int(mx * (body_h * 0.45))
-                        y2 = mid - int(mn * (body_h * 0.45))
-                        if y1 > y2:
-                            y1, y2 = y2, y1
-                        p.drawLine(x, y1, x, y2)
+                self._draw_combined_waveform(p, w, body_top, body_h, t0, t1)
 
-            # Draw dashed bar grid lines across the waveform area (moved after waveforms)
-            if have_bars and self.bars:
-                pen_bar = QtGui.QPen(QtGui.QColor(120, 130, 150, 110))  # light, subtle
-                pen_bar.setWidth(1)
-                pen_bar.setStyle(QtCore.Qt.DashLine)
-                p.setPen(pen_bar)
-                for bar_t in self.bars:
-                    bt = float(bar_t)
-                    if bt < t0 or bt > t1:
-                        continue
-                    x = int((bt - t0) / (t1 - t0) * w)
-                    p.drawLine(x, 0, x, wf_h)  # full height of waveform area
-                # Also draw a dashed line at the origin as bar 0
-                try:
-                    x0 = int(((float(self.origin or 0.0)) - t0) / (t1 - t0) * w)
-                    if 0 <= x0 <= w - 1:
-                        p.drawLine(x0, 0, x0, wf_h)
-                except Exception:
-                    pass
+            # Draw grids, loops, and other overlays
+            self._draw_waveform_overlays(p, w, wf_h, t0, t1, have_bars, have_beats, long_len, short_len, rel_t0, rel_t1)
 
-            # loop overlay (if available), now after grid/waveforms
-            if self.loopA is not None and self.loopB is not None:
-                a = max(t0, min(t1, float(self.loopA)))
-                b = max(t0, min(t1, float(self.loopB)))
-                if b < a:
-                    a, b = b, a
-                x0 = int((a - t0) / (t1 - t0) * w)
-                x1 = int((b - t0) / (t1 - t0) * w)
-                # Overlay: greenish-blue fill, clipped to waveform area, more opacity
-                p.fillRect(QtCore.QRect(x0, 0, max(1, x1 - x0), wf_h), QtGui.QColor(0, 200, 180, 48))
-                p.setPen(QtGui.QPen(QtGui.QColor(210, 210, 210)))
-                p.drawLine(x0, 0, x0, wf_h)
-                p.drawLine(x1, 0, x1, wf_h)
-                # flags at top strip for the active loop
-                tip_y = 2
-                base_y = min(self.FLAG_STRIP - 2, tip_y + self.FLAG_H)
-                flag_poly_a = QtGui.QPolygon([
+            # Draw playhead
+            self._draw_playhead(p, w, wf_h, t0, t1)
+
+        except Exception:
+            pass
+
+        # End waveform layer; ensure no brush/pen bleed into chord lane
+        p.restore()
+        p.setBrush(QtCore.Qt.NoBrush)
+        p.setPen(QtGui.QPen(QtGui.QColor(220, 220, 220)))
+
+    def _draw_stem_waveforms(self, p: QtGui.QPainter, stems: list, w: int, body_top: int, body_h: int, t0: float, t1: float, sr: int):
+        """Draw individual stem waveforms in rows."""
+        # Divide body area into rows for each stem
+        rows = len(stems)
+        row_gap = 2
+        row_h = max(14, int((body_h - (rows-1)*row_gap) / max(1, rows)))
+        y_cursor = body_top
+        for (stem_name, arr) in stems:
+            # Background (dim if muted)
+            muted = self._is_stem_muted(stem_name)
+            bg = QtGui.QColor(40, 40, 40) if muted else QtGui.QColor(28, 28, 28)
+            p.fillRect(0, y_cursor, w, row_h, bg)
+            # Border
+            p.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0)))
+            p.drawRect(0, y_cursor, max(1, w-1), max(1, row_h-1))
+            # Envelope - use pyramid for ultra-fast rendering
+            if (hasattr(self, '_pyramid_cache') and
+                stem_name in self._pyramid_cache and
+                self._pyramid_cache[stem_name]):
+                # Use pyramid for ultra-fast scrolling
+                mins, maxs, x0_seg, x1_seg = self._get_pyramid_slice(stem_name, t0, t1, w, sr)
+                # Fallback to cached computation if pyramid fails
+                if mins is None or len(mins) == 0:
+                    mins, maxs, x0_seg, x1_seg = self._slice_minmax_for_array_cached(stem_name, arr, t0, t1, w, sr)
+            else:
+                # Fallback to cached computation
+                mins, maxs, x0_seg, x1_seg = self._slice_minmax_for_array_cached(stem_name, arr, t0, t1, w, sr)
+            if mins is not None and maxs is not None:
+                mid = y_cursor + row_h // 2
+                amp = max(1, int(row_h * 0.45))
+                # Envelope color: lighter when muted
+                if muted:
+                    color = QtGui.QColor(170, 190, 210)  # light grey-blue for muted
+                else:
+                    color = QtGui.QColor(0, 180, 255)   # bright cyan for active
+
+                L = min(len(mins), max(0, x1_seg - x0_seg), w - x0_seg)
+                if L > 0:
+                    # Create filled polygon for smooth waveform display
+                    points = []
+                    # Top envelope (maxs)
+                    for i in range(L):
+                        x = x0_seg + i
+                        y = mid - int(maxs[i] * amp)
+                        points.append(QtCore.QPoint(x, y))
+                    # Bottom envelope (mins) in reverse
+                    for i in range(L-1, -1, -1):
+                        x = x0_seg + i
+                        y = mid - int(mins[i] * amp)
+                        points.append(QtCore.QPoint(x, y))
+
+                    if len(points) > 2:
+                        # Set brush and pen for this specific stem
+                        p.setBrush(QtGui.QBrush(color))
+                        p.setPen(QtGui.QPen(color))
+                        polygon = QtGui.QPolygon(points)
+                        p.drawPolygon(polygon)  # This will now be filled due to the brush
+
+                        # Reset brush to transparent to avoid affecting other drawing
+                        p.setBrush(QtGui.QBrush(QtCore.Qt.NoBrush))
+            # Stem label at top-left inside the row
+            p.setPen(QtGui.QPen(QtGui.QColor(210, 220, 230)))
+            fm = p.fontMetrics()
+            text_y = y_cursor + fm.ascent() + 2  # small top padding
+            p.drawText(6, text_y, str(stem_name))
+            y_cursor += row_h + row_gap
+
+    def _draw_combined_waveform(self, p: QtGui.QPainter, w: int, body_top: int, body_h: int, t0: float, t1: float):
+        """Draw single mixed waveform from the player's audio buffer."""
+        mins, maxs = self._mono_slice_minmax(t0, t1, w)
+        if mins is not None:
+            mid = body_top + body_h // 2
+            p.setPen(QtGui.QPen(QtGui.QColor(0, 180, 255)))
+            for x, (mn, mx) in enumerate(zip(mins, maxs)):
+                y1 = mid - int(mx * (body_h * 0.45))
+                y2 = mid - int(mn * (body_h * 0.45))
+                if y1 > y2:
+                    y1, y2 = y2, y1
+                p.drawLine(x, y1, x, y2)
+
+    def _draw_waveform_overlays(self, p: QtGui.QPainter, w: int, wf_h: int, t0: float, t1: float,
+                               have_bars: bool, have_beats: bool, long_len: int, short_len: int,
+                               rel_t0: float, rel_t1: float):
+        """Draw grids, loops, and other overlays on the waveform."""
+        # Draw dashed bar grid lines across the waveform area
+        if have_bars and self.bars:
+            pen_bar = QtGui.QPen(QtGui.QColor(120, 130, 150, 110))  # light, subtle
+            pen_bar.setWidth(1)
+            pen_bar.setStyle(QtCore.Qt.DashLine)
+            p.setPen(pen_bar)
+            for bar_t in self.bars:
+                bt = float(bar_t)
+                if bt < t0 or bt > t1:
+                    continue
+                x = int((bt - t0) / (t1 - t0) * w)
+                p.drawLine(x, 0, x, wf_h)  # full height of waveform area
+            # Also draw a dashed line at the origin as bar 0
+            try:
+                x0 = int(((float(self.origin or 0.0)) - t0) / (t1 - t0) * w)
+                if 0 <= x0 <= w - 1:
+                    p.drawLine(x0, 0, x0, wf_h)
+            except Exception:
+                pass
+
+        # Loop overlay (if available)
+        if self.loopA is not None and self.loopB is not None:
+            a = max(t0, min(t1, float(self.loopA)))
+            b = max(t0, min(t1, float(self.loopB)))
+            if b < a:
+                a, b = b, a
+            x0 = int((a - t0) / (t1 - t0) * w)
+            x1 = int((b - t0) / (t1 - t0) * w)
+            # Overlay: greenish-blue fill, clipped to waveform area, more opacity
+            p.fillRect(QtCore.QRect(x0, 0, max(1, x1 - x0), wf_h), QtGui.QColor(0, 200, 180, 48))
+            p.setPen(QtGui.QPen(QtGui.QColor(210, 210, 210)))
+            p.drawLine(x0, 0, x0, wf_h)
+            p.drawLine(x1, 0, x1, wf_h)
+            # Flags at top strip for the active loop
+            tip_y = 2
+            base_y = min(self.FLAG_STRIP - 2, tip_y + self.FLAG_H)
+            flag_poly_a = QtGui.QPolygon([
+                QtCore.QPoint(x0, tip_y),
+                QtCore.QPoint(x0 - self.FLAG_W//2, base_y),
+                QtCore.QPoint(x0 + self.FLAG_W//2, base_y),
+            ])
+            flag_poly_b = QtGui.QPolygon([
+                QtCore.QPoint(x1, tip_y),
+                QtCore.QPoint(x1 - self.FLAG_W//2, base_y),
+                QtCore.QPoint(x1 + self.FLAG_W//2, base_y),
+            ])
+            # Yellow flags for active loop
+            p.setPen(QtGui.QPen(QtGui.QColor(255, 215, 0)))
+            p.setBrush(QtGui.QColor(255, 215, 0))  # yellow
+            p.drawPolygon(flag_poly_a)
+            p.drawPolygon(flag_poly_b)
+
+        # Draw saved loops' flags & labels in the top strip
+        if hasattr(self, 'saved_loops') and self.saved_loops:
+            tip_y = 2
+            base_y = min(self.FLAG_STRIP - 2, tip_y + self.FLAG_H)
+            # Yellow flags for saved loops
+            p.setPen(QtGui.QPen(QtGui.QColor(255, 215, 0)))
+            p.setBrush(QtGui.QColor(255, 215, 0))  # yellow
+            for L in self.saved_loops:
+                a = float(L['a']); b = float(L['b'])
+                x0 = self._x_from_time(a, t0, t1, w)
+                x1 = self._x_from_time(b, t0, t1, w)
+                # Start flag
+                flag_poly = QtGui.QPolygon([
                     QtCore.QPoint(x0, tip_y),
                     QtCore.QPoint(x0 - self.FLAG_W//2, base_y),
                     QtCore.QPoint(x0 + self.FLAG_W//2, base_y),
                 ])
+                p.drawPolygon(flag_poly)
+                # End flag
                 flag_poly_b = QtGui.QPolygon([
                     QtCore.QPoint(x1, tip_y),
                     QtCore.QPoint(x1 - self.FLAG_W//2, base_y),
                     QtCore.QPoint(x1 + self.FLAG_W//2, base_y),
                 ])
-                # Yellow flags for active loop
-                p.setPen(QtGui.QPen(QtGui.QColor(255, 215, 0)))
-                p.setBrush(QtGui.QColor(255, 215, 0))  # yellow
-                p.drawPolygon(flag_poly_a)
                 p.drawPolygon(flag_poly_b)
+                # Label (if any): near start flag; if start flag is offscreen but the loop overlaps, pin to left margin
+                label = str(L.get('label', '') or '')
+                if label:
+                    x_label = x0 + self.FLAG_W + 4
+                    # If start flag is left of view but the loop overlaps the window, pin to left margin
+                    if x0 < 0 and x1 > 0:
+                        x_label = 4
+                    # Only draw label if any part of the loop is visible
+                    if x0 <= w and x1 >= 0:
+                        p.setPen(QtGui.QPen(QtGui.QColor(210, 220, 230)))
+                        p.drawText(int(max(0, min(w - 40, x_label))), int(base_y - 2), label)
+                        p.setPen(QtGui.QPen(QtGui.QColor(220, 220, 220)))
 
-            # Draw saved loops' flags & labels in the top strip (now after overlays)
-            if hasattr(self, 'saved_loops') and self.saved_loops:
-                tip_y = 2
-                base_y = min(self.FLAG_STRIP - 2, tip_y + self.FLAG_H)
-                # Yellow flags for saved loops
-                p.setPen(QtGui.QPen(QtGui.QColor(255, 215, 0)))
-                p.setBrush(QtGui.QColor(255, 215, 0))  # yellow
-                for L in self.saved_loops:
-                    a = float(L['a']); b = float(L['b'])
-                    x0 = self._x_from_time(a, t0, t1, w)
-                    x1 = self._x_from_time(b, t0, t1, w)
-                    # start flag
-                    flag_poly = QtGui.QPolygon([
-                        QtCore.QPoint(x0, tip_y),
-                        QtCore.QPoint(x0 - self.FLAG_W//2, base_y),
-                        QtCore.QPoint(x0 + self.FLAG_W//2, base_y),
-                    ])
-                    p.drawPolygon(flag_poly)
-                    # end flag
-                    flag_poly_b = QtGui.QPolygon([
-                        QtCore.QPoint(x1, tip_y),
-                        QtCore.QPoint(x1 - self.FLAG_W//2, base_y),
-                        QtCore.QPoint(x1 + self.FLAG_W//2, base_y),
-                    ])
-                    p.drawPolygon(flag_poly_b)
-                    # label (if any): near start flag; if start flag is offscreen but the loop overlaps, pin to left margin
-                    label = str(L.get('label', '') or '')
-                    if label:
-                        x_label = x0 + self.FLAG_W + 4
-                        # If start flag is left of view but the loop overlaps the window, pin to left margin
-                        if x0 < 0 and x1 > 0:
-                            x_label = 4
-                        # Only draw label if any part of the loop is visible
-                        if x0 <= w and x1 >= 0:
-                            p.setPen(QtGui.QPen(QtGui.QColor(210, 220, 230)))
-                            p.drawText(int(max(0, min(w - 40, x_label))), int(base_y - 2), label)
-                            p.setPen(QtGui.QPen(QtGui.QColor(220, 220, 220)))
-        except Exception:
-            pass
+        # Draw top ruler (beats or time)
+        self._draw_top_ruler(p, w, wf_h, t0, t1, rel_t0, rel_t1, have_beats, have_bars, long_len, short_len)
 
-        # --- TOP RULER: Prefer BEAT ruler; back-fill beats prior to first downbeat. Fallback → time ruler.
+    def _draw_top_ruler(self, p: QtGui.QPainter, w: int, wf_h: int, t0: float, t1: float,
+                       rel_t0: float, rel_t1: float, have_beats: bool, have_bars: bool,
+                       long_len: int, short_len: int):
+        """Draw the top ruler (beats or time)."""
         if have_beats:
             beat_times = np.asarray(self.beats, dtype=float)
             # Estimate average beat period for back-fill if needed
@@ -1873,7 +1883,7 @@ class WaveformView(QtWidgets.QWidget):
             if beat_times.size:
                 first_bt = float(beat_times[0])
                 k = 1
-                # back-fill slightly beyond window to ensure coverage at left edge
+                # Back-fill slightly beyond window to ensure coverage at left edge
                 while period > 0 and (first_bt - k * period) > (t0 - 2 * period):
                     beats_full.append(first_bt - k * period)
                     k += 1
@@ -1944,8 +1954,8 @@ class WaveformView(QtWidgets.QWidget):
                     p.drawLine(xh, 0, xh, short_len)
                 hmark += 0.5
 
-
-        # playhead: center when following, absolute position when frozen (drawn last)
+    def _draw_playhead(self, p: QtGui.QPainter, w: int, wf_h: int, t0: float, t1: float):
+        """Draw the playhead."""
         p.setPen(QtGui.QPen(QtGui.QColor(255, 200, 0)))
         if self._freeze_window and self.player is not None:
             try:
@@ -1957,23 +1967,8 @@ class WaveformView(QtWidgets.QWidget):
             px = w // 2
         p.drawLine(px, min(wf_h, self.FLAG_STRIP), px, wf_h)
 
-        # playhead: center when following, absolute position when frozen
-        p.setPen(QtGui.QPen(QtGui.QColor(255, 200, 0)))
-        if self._freeze_window and self.player is not None:
-            try:
-                tpos = float(self.player.position_seconds())
-            except Exception:
-                tpos = (t0 + t1) * 0.5
-            px = int(max(0, min(w - 1, (tpos - t0) / (t1 - t0) * w)))
-        else:
-            px = w // 2
-        p.drawLine(px, min(wf_h, self.FLAG_STRIP), px, wf_h)
-        # End waveform layer; ensure no brush/pen bleed into chord lane
-        p.restore()
-        p.setBrush(QtCore.Qt.NoBrush)
-        p.setPen(QtGui.QPen(QtGui.QColor(220, 220, 220)))
-
-        # chord lane
+    def _draw_chord_lane(self, p: QtGui.QPainter, w: int, wf_h: int, ch_h: int, t0: float, t1: float, rel_t0: float, rel_t1: float):
+        """Draw the chord lane with chord rectangles and labels."""
         if self.chords:
             # Revert: only split at bar boundaries; no beat snapping in paint path.
             base = list(self.chords)
@@ -2034,6 +2029,40 @@ class WaveformView(QtWidgets.QWidget):
                 # Chord label (drawn last, overlays above grid)
                 p.setPen(QtGui.QPen(QtGui.QColor(230, 230, 230)))
                 p.drawText(rect.adjusted(4, 0, -4, 0), Qt.AlignVCenter | Qt.AlignLeft, seg['label'])
+
+    def paintEvent(self, e: QtGui.QPaintEvent):
+        """Main paint event handler - coordinates all drawing operations."""
+        self._initialize_paint_attributes()
+
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.Antialiasing, False)
+        p.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, False)  # Disable for better performance
+
+        w = self.width()
+        h = self.height()
+        if w < 10 or h < 10:
+            return
+
+        wf_h, ch_h = self._wf_geom()
+        t0, t1 = self._current_window()
+        rel_t0 = t0 - self.origin
+        rel_t1 = t1 - self.origin
+
+        # Fill background
+        p.fillRect(0, 0, w, wf_h, QtGui.QColor(20, 20, 20))
+
+        # Handle piano roll widget in focus mode
+        self._handle_piano_roll_widget()
+
+        # Fill chord area background
+        chord_top = self._get_chord_area_top(wf_h)
+        p.fillRect(0, chord_top, w, ch_h, QtGui.QColor(28, 28, 28))
+
+        # Draw waveforms and related elements
+        self._draw_waveforms(p, w, wf_h, t0, t1, rel_t0, rel_t1)
+
+        # Draw chord lane
+        self._draw_chord_lane(p, w, wf_h, ch_h, t0, t1, rel_t0, rel_t1)
 
 
 
