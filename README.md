@@ -14,6 +14,7 @@ A minimal music practice application for musicians to analyze, loop, and practic
 - **Interactive Waveform**: Visual waveform with chord annotations and beat markers
 - **Loop Management**: Create, save, and manage multiple loops with visual flags
 - **Time Stretching**: Pitch-preserving tempo adjustment (0.5x - 1.5x)
+- **Pitch Shifting**: Tempo-preserving pitch adjustment (±12 semitones) with automatic key and chord transposition
 - **Stem Separation**: AI-powered source separation using Demucs (vocals, drums, bass, etc.)
 - **Session Management**: Save and restore analysis data and loop configurations
 - **Cross-Platform**: Works on macOS, Windows, and Linux
@@ -98,6 +99,7 @@ The app automatically detects available plugins and uses them when present, fall
   - Mouse wheel to zoom in/out
   - Arrow keys to pan left/right
 - **Time Stretching**: Adjust rate slider (0.5x - 1.5x) for pitch-preserving tempo changes
+- **Pitch Shifting**: Use pitch spinner (±12 semitones) for tempo-preserving pitch changes with automatic key/chord transposition
 
 ### Keyboard Shortcuts
 
@@ -116,9 +118,12 @@ The app automatically detects available plugins and uses them when present, fall
 - View → Combined & Show Stems
 - Automatically separates audio into vocals, drums, bass, guitar, piano, and other
 - Individual volume and mute controls for each stem
+- **Focus Button**: Click the focus button next to any stem to solo it and display a piano roll visualization
 - Uses Demucs AI model for high-quality separation
 
 ![Stems View](StemsView.png)
+
+![Focus View](FocusView.png)
 
 #### Waveform View Modes
 
@@ -143,6 +148,16 @@ The app automatically detects available plugins and uses them when present, fall
 - Toggle "Snap" checkbox to snap loop edges to detected beats
 - Automatic beat and bar detection with visual markers
 
+#### Pitch Shifting
+
+- **Pitch Control**: Use the pitch spinner in the toolbar to adjust pitch by ±12 semitones
+- **Tempo Preservation**: Pitch changes do not affect playback speed
+- **Automatic Transposition**: Key labels and chord names are automatically transposed to match the new pitch
+- **Stem Processing**: All separated stems are pitch-shifted together for consistent playback
+- **Caching**: Pitch-shifted audio is cached for faster loading on subsequent sessions
+- **Reset Button**: Quickly return to original pitch (0 semitones) using the Reset button
+- **Session Persistence**: Pitch settings are saved and restored with session data
+
 ## Technical Details
 
 ### Audio Analysis
@@ -151,6 +166,7 @@ The app automatically detects available plugins and uses them when present, fall
 - **Key Detection**: Krumhansl-Schmuckler key profiles with enharmonic spelling, with optional qm-keydetector and Chordino plugin support for improved estimation
 - **Beat Tracking**: Librosa-based onset detection and tempo estimation, with optional qm-barbeattracker plugin support for improved accuracy
 - **Time Stretching**: Librosa phase vocoder implementation preserving pitch (0.5x - 1.5x range)
+- **Pitch Shifting**: Librosa pitch shifting with tempo preservation (±12 semitones range)
 
 ### Supported Formats
 
@@ -225,6 +241,7 @@ musicpractice/
 ## Notes
 
 - Time-stretch renders to temporary WAV files for playback (pitch preserved)
+- Pitch-shifted audio is cached in `pitch+N/` subdirectories for faster subsequent loading
 - Chord detection uses major/minor triads and 7th chords with Viterbi smoothing
 - Stem separation requires significant CPU/GPU resources and may take several minutes
 - Session files are saved as `.musicpractice.json` alongside audio files

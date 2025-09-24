@@ -2663,7 +2663,7 @@ class Main(QtWidgets.QMainWindow):
         if self.player:
             try:
                 if hasattr(self.player, 'set_stems_arrays'):
-                    self.player.set_stems_arrays(arrays)
+                    self.player.set_stems_arrays(arrays, stem_dir)
                 # Also expose a public attribute for the view to read
                 setattr(self.player, 'stems_arrays', arrays)
                 try:
@@ -2836,6 +2836,12 @@ class Main(QtWidgets.QMainWindow):
         self.pitch_spin.setToolTip("Pitch shift in semitones (-12 to +12)")
         self.pitch_spin.setMinimumWidth(80)
         self.pitch_label = QtWidgets.QLabel("Pitch:")
+
+        # Pitch reset button
+        self.pitch_reset_btn = QtWidgets.QPushButton("Reset")
+        self.pitch_reset_btn.setToolTip("Reset pitch to original (0 semitones)")
+        self.pitch_reset_btn.setMaximumWidth(60)
+        self.pitch_reset_btn.clicked.connect(self._reset_pitch)
 
         # Toolbar
         self.toolbar = QtWidgets.QToolBar("Main", self)
@@ -3079,6 +3085,7 @@ class Main(QtWidgets.QMainWindow):
         self.toolbar.addSeparator()
         self.toolbar.addWidget(self.pitch_label)
         self.toolbar.addWidget(self.pitch_spin)
+        self.toolbar.addWidget(self.pitch_reset_btn)
         self.toolbar.addSeparator()
         self.analysis_toolbar = getattr(self, 'analysis_toolbar', None)
         if self.analysis_toolbar is None:
@@ -3232,7 +3239,7 @@ class Main(QtWidgets.QMainWindow):
         try:
             if getattr(self, 'player', None):
                 if hasattr(self.player, 'set_stems_arrays'):
-                    self.player.set_stems_arrays({})
+                    self.player.set_stems_arrays({}, None)
                 setattr(self.player, 'stems_arrays', {})
                 setattr(self.player, 'stem_mute', {})
             # Clear waveform cache when stems are cleared
@@ -4592,6 +4599,10 @@ class Main(QtWidgets.QMainWindow):
             # Player doesn't support pitch shifting yet
             self.statusBar().showMessage("Pitch shifting not yet implemented in audio engine", 3000)
 
+    def _reset_pitch(self):
+        """Reset pitch to original (0 semitones)."""
+        self.pitch_spin.setValue(0)
+
     # --- Pitch/key/chord transposition helpers (display-only) ---
     NOTE_RING_SHARPS = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
     NOTE_RING_FLATS  = ["C","Db","D","Eb","E","F","Gb","G","Ab","A","Bb","B"]
@@ -4650,6 +4661,21 @@ class Main(QtWidgets.QMainWindow):
     def _update_transposed_display(self, semitones: int):
         """Update key label and chord display with transposed values."""
         try:
+            # If no pitch shift, show original key and chords
+            if abs(semitones) < 0.01:
+                # Show original key
+                if hasattr(self, 'last_key') and self.last_key:
+                    original_key_name = self.last_key.get('pretty') or self.last_key.get('name') or ""
+                    if original_key_name and hasattr(self, 'key_header_label') and self.key_header_label:
+                        self.key_header_label.setText(f"Key: {original_key_name}")
+
+                # Show original chords
+                if hasattr(self, 'last_chords') and self.last_chords:
+                    if hasattr(self, 'wave') and self.wave:
+                        # Use QTimer to delay the chord setting to ensure it happens after other operations
+                        QtCore.QTimer.singleShot(200, lambda: self._delayed_set_transposed_chords(self.last_chords))
+                return
+
             # Update key display using the comprehensive transposition function
             if hasattr(self, 'last_key') and self.last_key:
                 transposed_key_dict = self.transpose_key_dict(self.last_key, semitones)

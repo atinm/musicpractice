@@ -15,6 +15,7 @@ import shutil
 import tempfile
 import subprocess
 import os
+from pathlib import Path
 
 # --- Per-file decode serialization to avoid concurrent opens of the same file ---
 _DECODE_LOCKS: dict[str, threading.Lock] = {}
@@ -190,6 +191,7 @@ class LoopPlayer:
         self._pos_samples = 0
         self.last_rate_error = None
         self.last_pitch_error = None
+        self._stems_original_dir = None  # Will be set when original stems are loaded
         self.stream = sd.OutputStream(
             samplerate=self.sr,
             channels=self.y.shape[1],
@@ -271,7 +273,7 @@ class LoopPlayer:
         self._loop_frames_out = None
 
     # ====== Stems API ======
-    def set_stems_arrays(self, stems: dict):
+    def set_stems_arrays(self, stems: dict, source_dir: Path = None):
         """Provide stems as name -> array (N,) or (N, C). sr must match self.sr.
         Rebuilds stretched buffers for current rate and resets per‑stem gains to 1.0 (unmuted)."""
         self._stems_base = {}
@@ -280,6 +282,20 @@ class LoopPlayer:
         self._stem_mute = {}
         self._stem_solo = {}
         self._soloed_stem = None
+        # Store source directory for pitch caching
+        if source_dir:
+            self._stems_source_dir = source_dir
+            # Only store as original if we don't have one yet
+            if self._stems_original_dir is None:
+                # Try to find the original directory by walking up the tree
+                original_dir = self._find_original_stems_dir(source_dir)
+                if original_dir:
+                    self._stems_original_dir = original_dir
+                else:
+                    # Fallback: use current directory if it's not a pitch cache
+                    is_pitch_cache = any(f"pitch{sign}{i}" in str(source_dir) for sign in ["+", "-"] for i in range(1, 13))
+                    if not is_pitch_cache:
+                        self._stems_original_dir = source_dir
         if not stems:
             return
         for name, arr in stems.items():
@@ -368,21 +384,29 @@ class LoopPlayer:
                 # On any failure, fall back to base for this stem
                 self._stems_play[k] = a
 
-    def _rebuild_stems_for_pitch(self, progress_callback=None):
+    def _rebuild_stems_for_pitch(self, semitones: float, progress_callback=None):
         """Apply pitch shift to stems (uses librosa if available)."""
         self._stems_play = {}
         if not self._stems_base:
             return
 
-        # Get current pitch shift amount
-        pitch_semitones = getattr(self, '_pitch_semitones', 0.0)
-
+        # Use the semitones parameter passed to the method
+        pitch_semitones = float(semitones)
         if abs(pitch_semitones) < 0.01 or librosa is None:
             # No pitch shift needed or no librosa; use base stems
             for k, a in self._stems_base.items():
                 self._stems_play[k] = a
             return
 
+        # Check if we can load from cache first
+        cached_stems = self._load_cached_pitch_stems(pitch_semitones)
+        if cached_stems:
+            if progress_callback:
+                progress_callback(f"Loaded pitch-shifted stems from cache")
+            self._stems_play = cached_stems
+            return
+
+        # Process stems and save to cache
         stem_names = list(self._stems_base.keys())
         total_stems = len(stem_names)
 
@@ -415,6 +439,9 @@ class LoopPlayer:
             except Exception:
                 # On any failure, fall back to base for this stem
                 self._stems_play[k] = a
+
+        # Save processed stems to cache
+        self._save_cached_pitch_stems(pitch_semitones, self._stems_play)
 
         # Notify completion
         if progress_callback:
@@ -491,6 +518,8 @@ class LoopPlayer:
         if abs(semitones) < 0.01:
             self._y_play = self._y_base
             self._pitch_semitones = 0.0
+            # Also reset stems to original
+            self._rebuild_stems_for_pitch(0.0, progress_callback)
             return True
 
         # Check if librosa is available
@@ -539,7 +568,7 @@ class LoopPlayer:
             self._frames_out = int(t_orig * self.sr / max(self._rate, 1e-6))
 
             # Rebuild stems with pitch shift
-            self._rebuild_stems_for_pitch(progress_callback)
+            self._rebuild_stems_for_pitch(semitones, progress_callback)
 
         except Exception as e:
             self.last_pitch_error = f"pitch_shift failed: {type(e).__name__}: {e}"
@@ -551,12 +580,87 @@ class LoopPlayer:
 
         return True
 
+    def _get_pitch_cache_dir(self, pitch_semitones: float) -> Path:
+        """Get the cache directory for a specific pitch shift."""
+        # Use the original stems directory, not the current source directory
+        original_dir = getattr(self, '_stems_original_dir', None)
+        if not original_dir:
+            return None
+
+        # Create directory name like "pitch+1" or "pitch-2"
+        pitch_dir_name = f"pitch{int(pitch_semitones):+d}"
+        cache_dir = original_dir / pitch_dir_name
+        return cache_dir
+
+    def _find_original_stems_dir(self, current_dir: Path) -> Path:
+        """Find the original stems directory by walking up from current directory."""
+        # Walk up the directory tree to find the original stems directory
+        # (the one that doesn't contain pitch cache directories)
+        check_dir = current_dir
+        while check_dir.parent != check_dir:  # Not at root
+            # Check if this directory contains pitch cache subdirectories
+            has_pitch_caches = any(
+                (check_dir / f"pitch{sign}{i}").exists()
+                for sign in ["+", "-"] for i in range(1, 13)
+            )
+            if has_pitch_caches:
+                return check_dir
+            check_dir = check_dir.parent
+        return None
+
+    def _load_cached_pitch_stems(self, pitch_semitones: float) -> dict:
+        """Load pitch-shifted stems from cache if available."""
+        try:
+            cache_dir = self._get_pitch_cache_dir(pitch_semitones)
+            if not cache_dir or not cache_dir.exists():
+                return None
+
+            # Check if all expected stems exist in cache
+            expected_stems = set(self._stems_base.keys())
+            cached_stems = set()
+
+            for wav_file in cache_dir.glob("*.wav"):
+                stem_name = wav_file.stem.lower()
+                cached_stems.add(stem_name)
+
+            # Only use cache if we have all expected stems
+            if expected_stems == cached_stems:
+                from stems import load_stem_arrays
+                return load_stem_arrays(cache_dir)
+
+            return None
+        except Exception as e:
+            print(f"Error loading cached pitch stems: {e}")
+            return None
+
+    def _save_cached_pitch_stems(self, pitch_semitones: float, stems_arrays: dict):
+        """Save pitch-shifted stems to cache."""
+        try:
+            cache_dir = self._get_pitch_cache_dir(pitch_semitones)
+            if not cache_dir:
+                return
+
+            # Create cache directory
+            cache_dir.mkdir(parents=True, exist_ok=True)
+
+            # Save each stem as WAV file
+            import soundfile as sf
+            for stem_name, stem_array in stems_arrays.items():
+                wav_path = cache_dir / f"{stem_name}.wav"
+                sf.write(str(wav_path), stem_array, self.sr)
+
+            print(f"Saved pitch-shifted stems to cache: {cache_dir}")
+        except Exception as e:
+            print(f"Error saving cached pitch stems: {e}")
+
     def set_rate(self, rate: float) -> bool:
         """Set playback rate (0.5–1.5x), pitch‑preserving."""
         return bool(self._rebuild_rate(rate))
 
     def set_pitch_shift(self, semitones: float, progress_callback=None) -> bool:
         """Set pitch shift in semitones (-12 to +12), tempo-preserving."""
+        # Update the pitch semitones value immediately
+        self._pitch_semitones = float(semitones)
         return bool(self._rebuild_pitch_shift(semitones, progress_callback))
 
     def _cb(self, outdata, frames, time, status):
