@@ -29,6 +29,7 @@ import os
 from pathlib import Path
 import tempfile
 
+
 # Import piano widget and note detection
 from piano_widget import PianoRollWidget
 from note_detection import compute_note_confidence
@@ -2795,6 +2796,9 @@ class Main(QtWidgets.QMainWindow):
         self.setAcceptDrops(True)
         self.settings = QSettings("MusicPractice", "MusicPractice")
 
+        # Initialize note index for transposition
+        self.NOTE_INDEX.update({n:i for i,n in enumerate(self.NOTE_RING_FLATS)})
+
         self.player: LoopPlayer | None = None
         self.current_path: str | None = None
         # Saved analysis/session state
@@ -2823,6 +2827,15 @@ class Main(QtWidgets.QMainWindow):
         self.rate_spin.setSingleStep(0.05)
         self.rate_spin.setValue(1.0)
         self.rate_label = QtWidgets.QLabel("Rate: 1.00x")
+
+        # Pitch controls
+        self.pitch_spin = QtWidgets.QSpinBox()
+        self.pitch_spin.setRange(-12, 12)
+        self.pitch_spin.setValue(0)
+        self.pitch_spin.setSuffix(" st")
+        self.pitch_spin.setToolTip("Pitch shift in semitones (-12 to +12)")
+        self.pitch_spin.setMinimumWidth(80)
+        self.pitch_label = QtWidgets.QLabel("Pitch:")
 
         # Toolbar
         self.toolbar = QtWidgets.QToolBar("Main", self)
@@ -3064,6 +3077,9 @@ class Main(QtWidgets.QMainWindow):
         self.toolbar.addWidget(self.rate_spin)
         self.toolbar.addAction(self.act_render)
         self.toolbar.addSeparator()
+        self.toolbar.addWidget(self.pitch_label)
+        self.toolbar.addWidget(self.pitch_spin)
+        self.toolbar.addSeparator()
         self.analysis_toolbar = getattr(self, 'analysis_toolbar', None)
         if self.analysis_toolbar is None:
             self.analysis_toolbar = self.addToolBar("Analysis")
@@ -3127,6 +3143,7 @@ class Main(QtWidgets.QMainWindow):
 
         # Signals
         self.rate_spin.valueChanged.connect(self._rate_changed)
+        self.pitch_spin.valueChanged.connect(self._pitch_changed)
         self.snap_checkbox.toggled.connect(lambda on: self.wave.set_snap_enabled(bool(on)))
 
         self.space_shortcut = QShortcut(QKeySequence(Qt.Key_Space), self)
@@ -3695,19 +3712,18 @@ class Main(QtWidgets.QMainWindow):
 
         # Chords (normalize to bar-aligned & split form on load)
         self.last_chords = list(data.get("chords", []))
+        # Don't set chords on waveform yet - wait until after pitch is applied
         if self.last_chords:
             try:
                 if getattr(self, "chords_locked", False):
                     # Preserve exactly as saved
-                    self.wave.set_chords(list(self.last_chords))
+                    pass  # Will be set after pitch application
                 else:
                     # Only normalize when not locked
                     normalized = self._normalize_chords_for_view(self.last_chords)
                     self.last_chords = list(normalized)
-                    self.wave.set_chords(self.last_chords)
             except Exception as ex:
-                logging.error(f"load_session chords apply failed: {ex}")
-                self.wave.set_chords(list(self.last_chords or []))
+                logging.error(f"load_session chords normalize failed: {ex}")
         # Rate
         if "rate" in data:
             try:
@@ -3715,7 +3731,58 @@ class Main(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
+        # Pitch - apply after all other session data is loaded
+        if "pitch" in data:
+            try:
+                pitch_value = int(data.get("pitch", 0))
+                # Temporarily disconnect the signal to avoid triggering _pitch_changed during session load
+                self.pitch_spin.valueChanged.disconnect()
+                self.pitch_spin.setValue(pitch_value)
+                # Reconnect the signal
+                self.pitch_spin.valueChanged.connect(self._pitch_changed)
+                # Apply pitch shift to audio and update display after a short delay
+                # to ensure all session data is fully loaded
+                QtCore.QTimer.singleShot(50, lambda: self._apply_pitch_from_session(pitch_value))
+            except Exception as e:
+                print(f"Error loading pitch from session: {e}")
+                # Make sure to reconnect the signal even if there's an error
+                try:
+                    self.pitch_spin.valueChanged.connect(self._pitch_changed)
+                except Exception:
+                    pass
+
         self.statusBar().showMessage(f"Session loaded from {Path(sidecar).name}")
+
+    def _apply_pitch_from_session(self, semitones: int):
+        """Apply pitch shift from session load - updates audio, key, and chords."""
+        try:
+            # Apply to audio player if available
+            if getattr(self, 'player', None) and hasattr(self.player, 'set_pitch_shift'):
+                # Create progress callback for status bar updates
+                def progress_callback(message):
+                    # Force immediate update and use a longer timeout
+                    self.statusBar().showMessage(message, 5000)  # 5 seconds
+                    # Force the UI to update immediately
+                    QtCore.QCoreApplication.processEvents()
+
+                ok = self.player.set_pitch_shift(semitones, progress_callback)
+                if ok:
+                    print(f"Applied pitch shift {semitones:+d} semitones from session")
+                    self.statusBar().showMessage(f"Pitch shift {semitones:+d} semitones applied", 2000)
+                else:
+                    print(f"Failed to apply pitch shift {semitones:+d} semitones from session")
+                    self.statusBar().showMessage("Pitch shifting failed", 3000)
+
+            # Update key and chord display with transposed values
+            self._update_transposed_display(semitones)
+
+            # If no pitch shift, set the original chords on the waveform display
+            if abs(semitones) < 0.01 and hasattr(self, 'last_chords') and self.last_chords:
+                if hasattr(self, 'wave') and self.wave:
+                    self.wave.set_chords(self.last_chords)
+
+        except Exception as e:
+            print(f"Error applying pitch from session: {e}")
 
     def save_session(self):
         if not self.current_path:
@@ -3736,6 +3803,7 @@ class Main(QtWidgets.QMainWindow):
             "chords": list(self.last_chords or []),
             "chords_locked": bool(getattr(self, "chords_locked", False)),
             "rate": float(self.rate_spin.value()),
+            "pitch": int(self.pitch_spin.value()),
         }
         try:
             Path(sidecar).write_text(json.dumps(payload, indent=2))
@@ -4489,6 +4557,131 @@ class Main(QtWidgets.QMainWindow):
                 self.player.set_position_seconds(pos, within_loop=True)
             except Exception:
                 pass
+
+    def _pitch_changed(self, val: int):
+        """Update pitch shift on the player and transpose key/chords."""
+        try:
+            semitones = int(val)
+        except Exception:
+            semitones = 0
+        # Clamp to supported range
+        semitones = max(-12, min(12, semitones))
+
+        # Apply to player if it has pitch shifting capability
+        if getattr(self, 'player', None) and hasattr(self.player, 'set_pitch_shift'):
+            try:
+                # Create progress callback for status bar updates
+                def progress_callback(message):
+                    # Force immediate update and use a longer timeout
+                    self.statusBar().showMessage(message, 5000)  # 5 seconds
+                    # Force the UI to update immediately
+                    QtCore.QCoreApplication.processEvents()
+
+                ok = self.player.set_pitch_shift(semitones, progress_callback)
+                if ok:
+                    self.statusBar().showMessage(f"Pitch shifted by {semitones:+d} semitones", 2000)
+                    # Update key and chord display
+                    self._update_transposed_display(semitones)
+                    # Save session with new pitch value
+                    self.save_session()
+                else:
+                    self.statusBar().showMessage("Pitch shifting failed", 3000)
+            except Exception as e:
+                self.statusBar().showMessage(f"Pitch shifting error: {e}", 3000)
+        else:
+            # Player doesn't support pitch shifting yet
+            self.statusBar().showMessage("Pitch shifting not yet implemented in audio engine", 3000)
+
+    # --- Pitch/key/chord transposition helpers (display-only) ---
+    NOTE_RING_SHARPS = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
+    NOTE_RING_FLATS  = ["C","Db","D","Eb","E","F","Gb","G","Ab","A","Bb","B"]
+    NOTE_INDEX = {n:i for i,n in enumerate(NOTE_RING_SHARPS)}
+
+    def _parse_root(self, token: str) -> tuple[str, str]:
+        if not token: return "", ""
+        t = token.strip()
+        if len(t) >= 2 and t[1] in ("#", "b"): return t[:2], t[2:]
+        return t[:1], t[1:]
+
+    def _transpose_note_name(self, name: str, semis: int, prefer_flats: bool | None = None) -> str:
+        if not name: return name
+        i = self.NOTE_INDEX.get(name) or self.NOTE_INDEX.get(name[:1].upper()+name[1:])
+        if i is None: return name
+        j = (i + int(semis)) % 12
+        ring = self.NOTE_RING_FLATS if prefer_flats else self.NOTE_RING_SHARPS
+        return ring[j]
+
+    def transpose_chord_label(self, label: str, semis: int, prefer_flats: bool | None = None) -> str:
+        if not label: return label
+        lab = str(label).strip()
+        if "/" in lab: main, bass = lab.split("/", 1)
+        else: main, bass = lab, None
+        root, qual = self._parse_root(main)
+        if not root: return label
+        new_root = self._transpose_note_name(root, semis, prefer_flats)
+        if bass:
+            b_root, b_rest = self._parse_root(bass.strip())
+            bass = self._transpose_note_name(b_root, semis, prefer_flats) + b_rest
+        return new_root + qual + ("/"+bass if bass else "")
+
+    def transpose_chords_list(self, chords_list: list[dict], semis: int, prefer_flats: bool | None = None) -> list[dict]:
+        out = []
+        for s in chords_list or []:
+            try:
+                a = float(s.get("start")); b = float(s.get("end"))
+                lab = str(s.get("label",""))
+            except Exception:
+                continue
+            if b <= a: continue
+            out.append({"start": a, "end": b, "label": self.transpose_chord_label(lab, semis, prefer_flats)})
+        return out
+
+    def transpose_key_dict(self, key_info: dict, semis: int, prefer_flats: bool | None = None) -> dict:
+        if not isinstance(key_info, dict): return key_info or {}
+        name = key_info.get("pretty") or key_info.get("name") or ""
+        tok = name.split()
+        if not tok: return dict(key_info)
+        root, rest = tok[0], " ".join(tok[1:])
+        new_root = self._transpose_note_name(root, semis, prefer_flats)
+        new_name = (new_root + (" "+rest if rest else "")).strip()
+        out = dict(key_info); out["name"] = new_name; out["pretty"] = new_name
+        return out
+
+    def _update_transposed_display(self, semitones: int):
+        """Update key label and chord display with transposed values."""
+        try:
+            # Update key display using the comprehensive transposition function
+            if hasattr(self, 'last_key') and self.last_key:
+                transposed_key_dict = self.transpose_key_dict(self.last_key, semitones)
+                transposed_key_name = transposed_key_dict.get('pretty') or transposed_key_dict.get('name') or ""
+                if transposed_key_name and hasattr(self, 'key_header_label') and self.key_header_label:
+                    self.key_header_label.setText(f"Key: {transposed_key_name}")
+
+            # Update chord display using the comprehensive transposition function
+            if hasattr(self, 'last_chords') and self.last_chords:
+                transposed_chords = self.transpose_chords_list(self.last_chords, semitones)
+
+                # Update the waveform display with a delay to ensure other operations complete first
+                if hasattr(self, 'wave') and self.wave:
+                    # Use QTimer to delay the chord setting to ensure it happens after other operations
+                    QtCore.QTimer.singleShot(200, lambda: self._delayed_set_transposed_chords(transposed_chords))
+
+        except Exception as e:
+            # Don't show error to user for display updates, just log it
+            try:
+                print(f"Error updating transposed display: {e}")
+            except Exception:
+                pass
+
+    def _delayed_set_transposed_chords(self, transposed_chords):
+        """Delayed method to set transposed chords on waveform display after other operations complete."""
+        try:
+            if hasattr(self, 'wave') and self.wave:
+                self.wave.set_chords(transposed_chords)
+                # Force a repaint to ensure the display is updated
+                self.wave.repaint()
+        except Exception as e:
+            print(f"Error in delayed chord display update: {e}")
 
     def render_rate(self):
         """Render a pitch-preserving stretched WAV using the current rate (if available)."""

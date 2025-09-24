@@ -176,6 +176,7 @@ class LoopPlayer:
         self._load(path)
         # === Time‑stretch / playback state ===
         self._rate = 1.0                    # original speed by default
+        self._pitch_semitones = 0.0         # pitch shift in semitones
         self._y_base = self.y               # original audio (N, C)
         self._y_play = self.y               # buffer currently sent to the stream (stretched)
         self._frames_out = 0                # cursor into _y_play (output domain)
@@ -188,6 +189,7 @@ class LoopPlayer:
         self._playing = False
         self._pos_samples = 0
         self.last_rate_error = None
+        self.last_pitch_error = None
         self.stream = sd.OutputStream(
             samplerate=self.sr,
             channels=self.y.shape[1],
@@ -205,6 +207,8 @@ class LoopPlayer:
         self._y_base = self.y
         self._y_play = self.y
         self._frames_out = 0
+        self._rate = 1.0
+        self._pitch_semitones = 0.0
         self._stems_base = {}
         self._stems_play = {}
         self._stem_gains = {}
@@ -364,6 +368,59 @@ class LoopPlayer:
                 # On any failure, fall back to base for this stem
                 self._stems_play[k] = a
 
+    def _rebuild_stems_for_pitch(self, progress_callback=None):
+        """Apply pitch shift to stems (uses librosa if available)."""
+        self._stems_play = {}
+        if not self._stems_base:
+            return
+
+        # Get current pitch shift amount
+        pitch_semitones = getattr(self, '_pitch_semitones', 0.0)
+
+        if abs(pitch_semitones) < 0.01 or librosa is None:
+            # No pitch shift needed or no librosa; use base stems
+            for k, a in self._stems_base.items():
+                self._stems_play[k] = a
+            return
+
+        stem_names = list(self._stems_base.keys())
+        total_stems = len(stem_names)
+
+        for i, (k, a) in enumerate(self._stems_base.items()):
+            # Notify progress
+            if progress_callback:
+                message = f"Pitch shifting stem {i+1}/{total_stems}: {k}"
+                progress_callback(message)
+                # Small delay to make progress visible
+                import time
+                time.sleep(0.1)
+
+            try:
+                if a.ndim == 1 or a.shape[1] == 1:
+                    # Mono stem
+                    mono = a[:, 0] if a.ndim == 2 else a
+                    shifted = librosa.effects.pitch_shift(mono, sr=self.sr, n_steps=pitch_semitones)
+                    self._stems_play[k] = shifted.reshape(-1, 1)
+                else:
+                    # Multi-channel stem - process each channel separately
+                    chans = []
+                    for c in range(a.shape[1]):
+                        ch = librosa.effects.pitch_shift(a[:, c], sr=self.sr, n_steps=pitch_semitones)
+                        chans.append(ch)
+                    # Ensure all channels have the same length
+                    L = max(len(ch) for ch in chans)
+                    chans = [np.pad(ch, (0, L - len(ch))) for ch in chans]
+                    shifted = np.stack(chans, axis=1).astype(np.float32, copy=False)
+                    self._stems_play[k] = shifted
+            except Exception:
+                # On any failure, fall back to base for this stem
+                self._stems_play[k] = a
+
+        # Notify completion
+        if progress_callback:
+            completion_message = f"Pitch shifting complete: {total_stems} stems processed"
+            progress_callback(completion_message)
+
     def _rebuild_rate(self, rate: float) -> bool:
         """Rebuild the playback buffer for a new rate, preserving pitch.
         Keeps UI on original timeline by mapping output frames ⇄ original seconds.
@@ -423,9 +480,84 @@ class LoopPlayer:
         self._rebuild_stems_for_rate()
         return True
 
+    def _rebuild_pitch_shift(self, semitones: float, progress_callback=None) -> bool:
+        """Rebuild the playback buffer with pitch shift, preserving tempo.
+        Uses librosa.effects.pitch_shift for tempo-preserving pitch shifting.
+        """
+        self.last_pitch_error = None
+        semitones = float(max(-12.0, min(12.0, semitones)))
+
+        # If no pitch shift, use original audio
+        if abs(semitones) < 0.01:
+            self._y_play = self._y_base
+            self._pitch_semitones = 0.0
+            return True
+
+        # Check if librosa is available
+        if librosa is None:
+            if '_LIBROSA_IMPORT_ERROR' in globals() and _LIBROSA_IMPORT_ERROR is not None:
+                self.last_pitch_error = f"librosa import failed: {type(_LIBROSA_IMPORT_ERROR).__name__}: {_LIBROSA_IMPORT_ERROR}"
+            else:
+                self.last_pitch_error = "librosa not available for pitch shifting"
+            try:
+                print(f"[pitch] rebuild failed → {self.last_pitch_error}")
+            except Exception:
+                pass
+            return False
+
+        try:
+            y = self._y_base
+            if y.ndim == 1 or y.shape[1] == 1:
+                # Mono audio
+                mono = y[:, 0] if y.ndim == 2 else y
+                y_shifted = librosa.effects.pitch_shift(mono, sr=self.sr, n_steps=semitones)
+                self._y_play = np.column_stack([y_shifted, y_shifted]) if (y.ndim == 2 and y.shape[1] == 2) else y_shifted.reshape(-1, 1)
+            else:
+                # Multi-channel audio - process each channel separately
+                chans = []
+                for c in range(y.shape[1]):
+                    ch = librosa.effects.pitch_shift(y[:, c], sr=self.sr, n_steps=semitones)
+                    chans.append(ch)
+                # Ensure all channels have the same length
+                L = max(len(ch) for ch in chans)
+                chans = [np.pad(ch, (0, L - len(ch))) for ch in chans]
+                y_shifted = np.stack(chans, axis=1).astype(np.float32, copy=False)
+                self._y_play = y_shifted
+
+            self._pitch_semitones = semitones
+
+            # Update loop frames if needed (pitch shift doesn't change timing)
+            if self._loop_seconds is not None:
+                a, b = self._loop_seconds
+                self._loop_frames_out = (int(a * self.sr / max(self._rate, 1e-6)),
+                                       int(b * self.sr / max(self._rate, 1e-6)))
+            else:
+                self._loop_frames_out = None
+
+            # Keep transport position stable
+            t_orig = self.position_seconds()
+            self._frames_out = int(t_orig * self.sr / max(self._rate, 1e-6))
+
+            # Rebuild stems with pitch shift
+            self._rebuild_stems_for_pitch(progress_callback)
+
+        except Exception as e:
+            self.last_pitch_error = f"pitch_shift failed: {type(e).__name__}: {e}"
+            try:
+                print(f"[pitch] rebuild failed → {self.last_pitch_error}")
+            except Exception:
+                pass
+            return False
+
+        return True
+
     def set_rate(self, rate: float) -> bool:
         """Set playback rate (0.5–1.5x), pitch‑preserving."""
         return bool(self._rebuild_rate(rate))
+
+    def set_pitch_shift(self, semitones: float, progress_callback=None) -> bool:
+        """Set pitch shift in semitones (-12 to +12), tempo-preserving."""
+        return bool(self._rebuild_pitch_shift(semitones, progress_callback))
 
     def _cb(self, outdata, frames, time, status):
         if status:
