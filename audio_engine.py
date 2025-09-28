@@ -16,6 +16,7 @@ import tempfile
 import subprocess
 import os
 from pathlib import Path
+from utils import get_output_root_for_track
 
 # --- Per-file decode serialization to avoid concurrent opens of the same file ---
 _DECODE_LOCKS: dict[str, threading.Lock] = {}
@@ -580,17 +581,12 @@ class LoopPlayer:
 
         return True
 
-    def _get_pitch_cache_dir(self, pitch_semitones: float) -> Path:
+    def _get_pitch_cache_dir(self, audio_path: Path, semitones: float) -> Path:
         """Get the cache directory for a specific pitch shift."""
-        # Use the original stems directory, not the current source directory
-        original_dir = getattr(self, '_stems_original_dir', None)
-        if not original_dir:
-            return None
-
-        # Create directory name like "pitch+1" or "pitch-2"
-        pitch_dir_name = f"pitch{int(pitch_semitones):+d}"
-        cache_dir = original_dir / pitch_dir_name
-        return cache_dir
+        root = get_output_root_for_track(Path(audio_path))
+        d = root / f"pitch{semitones:+d}"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
 
     def _find_original_stems_dir(self, current_dir: Path) -> Path:
         """Find the original stems directory by walking up from current directory."""
@@ -611,7 +607,7 @@ class LoopPlayer:
     def _load_cached_pitch_stems(self, pitch_semitones: float) -> dict:
         """Load pitch-shifted stems from cache if available."""
         try:
-            cache_dir = self._get_pitch_cache_dir(pitch_semitones)
+            cache_dir = self._get_pitch_cache_dir(Path(self.path), pitch_semitones)
             if not cache_dir or not cache_dir.exists():
                 return None
 
@@ -636,7 +632,7 @@ class LoopPlayer:
     def _save_cached_pitch_stems(self, pitch_semitones: float, stems_arrays: dict):
         """Save pitch-shifted stems to cache."""
         try:
-            cache_dir = self._get_pitch_cache_dir(pitch_semitones)
+            cache_dir = self._get_pitch_cache_dir(Path(self.path), pitch_semitones)
             if not cache_dir:
                 return
 

@@ -22,8 +22,8 @@ try:
     HAS_STRETCH = True
 except Exception:
     HAS_STRETCH = False
-from utils import temp_wav_path
-from stems import separate_stems, load_stem_arrays, order_stem_names
+from utils import temp_wav_path, load_settings, save_settings, get_output_root_for_track
+from stems import separate_stems, load_stem_arrays, order_stem_names, stems_dir_for
 
 import os
 from pathlib import Path
@@ -2107,6 +2107,9 @@ class ChordWorker(QThread):
 
     def _song_cache_dir(self, audio_path: str) -> Path:
         """Match Main._song_cache_dir layout so Demucs cache location is identical."""
+        root = get_output_root_for_track(Path(audio_path))
+        d = root / "stems"
+
         p = Path(audio_path)
         try:
             st = p.stat()
@@ -2114,18 +2117,26 @@ class ChordWorker(QThread):
         except Exception:
             meta = "0_0"
         safe = p.stem.replace(os.sep, "_")
-        root = p.parent / ".musicpractice" / "stems" / f"{safe}__{meta}"
-        root.mkdir(parents=True, exist_ok=True)
-        return root
+        d = d / f"{safe}__{meta}"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
 
     def _stem_leaf_dir(self, audio_path: str, out_dir: Path, model: str) -> Path:
+        # Normalize Demucs output *root* and return <root>/<model>/<track>
+        # If caller passed .../stems/<track_slug> as out_dir, Demucs actually writes
+        # to the parent .../stems. Mirror that here so our wait/load paths match.
         src = Path(audio_path)
-        return out_dir / model / src.stem
+        demucs_root = Path(out_dir)
+        if demucs_root.name != "stems" and demucs_root.parent.name == "stems":
+            demucs_root = demucs_root.parent
+        d = demucs_root / model / src.stem
+        d.mkdir(parents=True, exist_ok=True)
+        return d
 
     def _wait_for_stems(self, audio_path: str, out_dir: Path, model: str = "htdemucs_6s", timeout_s: int = 900):
         """
         Block until htdemucs_6s outputs exist and are size-stable under
-        out_dir/<model>/<track>/ for the given audio file.
+        demucs_root/<model>/<track>/ for the given audio file.
         Returns dict from load_stem_arrays(leaf_dir) or {} on timeout.
         """
         from PySide6 import QtCore
@@ -2609,6 +2620,16 @@ class Main(QtWidgets.QMainWindow):
             if hasattr(self, 'log_dock') and self.log_dock is not None:
                 self.log_dock.write(f"Failed to load stems: {e}\n")
 
+    def _stem_leaf_dir(self, audio_path: str, out_dir: Path, model: str) -> Path:
+        # Normalize Demucs output *root* and return <root>/<model>/<track>
+        src = Path(audio_path)
+        demucs_root = Path(out_dir)
+        if demucs_root.name != "stems" and demucs_root.parent.name == "stems":
+            demucs_root = demucs_root.parent
+        d = demucs_root / model / src.stem
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
     def _find_existing_stem_leaf(self, audio_path: str, model: str = "htdemucs_6s") -> Path | None:
         """Return a Demucs leaf directory containing wavs if present, else None."""
         root = self._song_cache_dir(audio_path)
@@ -2915,6 +2936,17 @@ class Main(QtWidgets.QMainWindow):
 
             view_menu.addAction(self.act_view_stems)
             view_menu.addAction(self.act_view_combined)
+
+            # after building other menus…
+            settings_menu = mb.addMenu("&Settings")
+
+            act_set_output = QtGui.QAction("Set &Output Folder…", self)
+            act_set_output.triggered.connect(self.action_set_output_folder)
+            settings_menu.addAction(act_set_output)
+
+            act_clear_output = QtGui.QAction("&Clear Output Folder (revert to .musicpractice)", self)
+            act_clear_output.triggered.connect(self.action_clear_output_folder)
+            settings_menu.addAction(act_clear_output)
 
             # ---- Analysis menu (after File) ----
             analysis_menu = None
@@ -3283,10 +3315,10 @@ class Main(QtWidgets.QMainWindow):
         self.populate_key_async(self.current_path)
 
     def _session_sidecar_path(self, audio_path: str) -> Path:
-        p = Path(audio_path)
-        folder = p.parent / ".musicpractice"
-        folder.mkdir(parents=True, exist_ok=True)
-        return folder / f"{p.stem}.musicpractice.json"
+        out_root = get_output_root_for_track(Path(audio_path))
+        out_root.mkdir(parents=True, exist_ok=True)
+        session_path = out_root / f"{Path(audio_path).stem}.musicpractice.json"
+        return session_path
 
     def _dock_transport_next_to_load(self):
         """Place transport controls (icon-only buttons) to the RIGHT of the Load/Open action
@@ -3552,6 +3584,33 @@ class Main(QtWidgets.QMainWindow):
             if hasattr(self, 'wave') and self.wave: self.wave.unfreeze_and_center()
         except Exception:
             pass
+
+    def action_set_output_folder(self):
+        dlg = QtWidgets.QFileDialog(self, "Choose output folder")
+        dlg.setFileMode(QtWidgets.QFileDialog.Directory)
+        dlg.setOption(QtWidgets.QFileDialog.ShowDirsOnly, True)
+        if dlg.exec():
+            dirs = dlg.selectedFiles()
+            if dirs:
+                chosen = dirs[0]
+                s = load_settings()
+                s["output_root"] = chosen
+                save_settings(s)
+                QtWidgets.QMessageBox.information(
+                    self, "Output Folder",
+                    f"Output folder set to:\n{chosen}\n\n"
+                    "Each track will get its own subfolder inside this location."
+                )
+
+    def action_clear_output_folder(self):
+        s = load_settings()
+        if "output_root" in s:
+            del s["output_root"]
+            save_settings(s)
+        QtWidgets.QMessageBox.information(
+            self, "Output Folder",
+            "Output folder cleared.\nThe app will save under <audio_dir>/.musicpractice again."
+        )
 
     def _set_waveform_view_mode(self, show_stems: bool):
         try:
@@ -3826,8 +3885,7 @@ class Main(QtWidgets.QMainWindow):
         except Exception:
             meta = "0_0"
         safe = p.stem.replace(os.sep, "_")
-        root = p.parent / ".musicpractice" / "stems" / f"{safe}__{meta}"
-        root.mkdir(parents=True, exist_ok=True)
+        root = stems_dir_for(Path(audio_path)) / f"{safe}__{meta}"
         return root
 
     def _bar_index_at_time(self, t: float) -> int | None:
@@ -4447,37 +4505,6 @@ class Main(QtWidgets.QMainWindow):
         self.statusBar().showMessage("Loop deleted" if len(self.saved_loops) < before else "No loop deleted")
         self.save_session()
 
-    def _sidecar_path(self, audio_path: str) -> Path:
-        p = Path(audio_path)
-        return p.parent / ".musicpractice" / f"{p.stem}.musicpractice.json"
-
-    def _stem_leaf_dir(self, audio_path: str, out_dir_or_model=None, model: str = "htdemucs_6s") -> Path:
-        """
-        Backward-compatible helper that accepts either:
-        - (audio_path) → uses cache dir + default model
-        - (audio_path, model_str) → uses cache dir + given model
-        - (audio_path, out_dir: PathLike, model_str) → explicit out_dir and model
-        - Keyword args out_dir=..., model=...
-        """
-        p = Path(audio_path)
-        # Resolve out_dir based on the 2nd arg's type/shape
-        if out_dir_or_model is None:
-            out_dir = self._song_cache_dir(audio_path)
-        elif isinstance(out_dir_or_model, (Path, os.PathLike)):
-            out_dir = Path(out_dir_or_model)
-        elif isinstance(out_dir_or_model, str):
-            # If it's clearly a path-like string (has separator or exists), treat as out_dir; else it's a model
-            looks_path = (os.sep in out_dir_or_model) or out_dir_or_model.startswith(".") \
-                        or out_dir_or_model.startswith("/") or Path(out_dir_or_model).exists()
-            if looks_path:
-                out_dir = Path(out_dir_or_model)
-            else:
-                out_dir = self._song_cache_dir(audio_path)
-                model = out_dir_or_model
-        else:
-            out_dir = self._song_cache_dir(audio_path)
-        return Path(out_dir) / model / p.stem
-
     def _clear_cached_analysis(self, keep_stems: bool = True):
         """Clear computed analysis so recompute truly recalculates beats, key, chords.
         If keep_stems is False, also forget any cached stems metadata (not files)."""
@@ -4518,9 +4545,9 @@ class Main(QtWidgets.QMainWindow):
                 for base in ("chords", "beats", "analysis", "session"):
                     candidates.append(p.parent / f"{p.stem}.{base}.json")
                 # Also look under .musicpractice next to the audio
-                dot = p.parent / ".musicpractice"
+                root = get_output_root_for_track(p)
                 for name in ("chords.json", "beats.json", "analysis.json", f"{p.stem}.json"):
-                    candidates.append(dot / name)
+                    candidates.append(root / name)
                 # Delete any that exist
                 for f in candidates:
                     try:
@@ -4741,6 +4768,8 @@ class Main(QtWidgets.QMainWindow):
 
         # Update current path ASAP
         self.current_path = fn
+        out_root = get_output_root_for_track(Path(self.current_path))
+        self.statusBar().showMessage(f"Save destination: {out_root}")
 
         # Respect "Always recompute on open" toggle by forcing stems/chords recompute
         try:
