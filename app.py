@@ -22,7 +22,7 @@ try:
     HAS_STRETCH = True
 except Exception:
     HAS_STRETCH = False
-from utils import temp_wav_path, load_settings, save_settings, get_output_root_for_track
+from utils import temp_wav_path, load_settings, save_settings, get_output_root_for_track, get_stems_cache_dir
 from stems import separate_stems, load_stem_arrays, order_stem_names, stems_dir_for
 
 import os
@@ -2330,7 +2330,8 @@ class WaveformView(QtWidgets.QWidget):
                 x0 = int((a_rel - rel_t0) / (rel_t1 - rel_t0) * w)
                 x1 = int((b_rel - rel_t0) / (rel_t1 - rel_t0) * w)
                 # Position chord rectangles below spectrum band in focus mode (use real child height)
-                chord_top = wf_h
+                sections_h = getattr(self, 'SECTIONS_BAND_H', 40)
+                chord_top = sections_h + wf_h
                 if self._visual_focus_stem():
                     ph = 0
                     try:
@@ -2340,7 +2341,7 @@ class WaveformView(QtWidgets.QWidget):
                         ph = 0
                     if ph <= 0:
                         ph = int(getattr(self, 'spectrum_band_height', 60))
-                    chord_top = wf_h + ph
+                    chord_top = sections_h + wf_h + ph
                 rect = QtCore.QRect(x0, chord_top, max(1, x1 - x0), ch_h)
                 p.setBrush(QtGui.QColor(50, 80, 110))   # fill color
                 p.setPen(QtGui.QPen(QtGui.QColor(20, 20, 20)))  # outline
@@ -2445,30 +2446,14 @@ class ChordWorker(QThread):
             pass
 
     def _song_cache_dir(self, audio_path: str) -> Path:
-        """Match Main._song_cache_dir layout so Demucs cache location is identical."""
-        root = get_output_root_for_track(Path(audio_path))
-        d = root / "stems"
-
-        p = Path(audio_path)
-        try:
-            st = p.stat()
-            meta = f"{st.st_size}_{int(st.st_mtime)}"
-        except Exception:
-            meta = "0_0"
-        safe = p.stem.replace(os.sep, "_")
-        d = d / f"{safe}__{meta}"
-        d.mkdir(parents=True, exist_ok=True)
-        return d
+        """Return the stems cache directory for this audio file in app private data."""
+        return get_stems_cache_dir(Path(audio_path))
 
     def _stem_leaf_dir(self, audio_path: str, out_dir: Path, model: str) -> Path:
-        # Normalize Demucs output *root* and return <root>/<model>/<track>
-        # If caller passed .../stems/<track_slug> as out_dir, Demucs actually writes
-        # to the parent .../stems. Mirror that here so our wait/load paths match.
+        # Return the leaf directory where Demucs writes stem WAVs
+        # Structure: <out_dir>/<model>/<track_name>/
         src = Path(audio_path)
-        demucs_root = Path(out_dir)
-        if demucs_root.name != "stems" and demucs_root.parent.name == "stems":
-            demucs_root = demucs_root.parent
-        d = demucs_root / model / src.stem
+        d = Path(out_dir) / model / src.stem
         d.mkdir(parents=True, exist_ok=True)
         return d
 
@@ -2877,6 +2862,57 @@ class Main(QtWidgets.QMainWindow):
         if hasattr(self, 'log_dock') and self.log_dock is not None:
             self.log_dock.write(text)
 
+    def _extract_stems_only(self, audio_path: str):
+        """Extract stems without running chord analysis (preserves existing chords)."""
+        if not audio_path:
+            return
+
+        # Cancel any existing stem extraction worker
+        if hasattr(self, '_stem_worker') and self._stem_worker and self._stem_worker.isRunning():
+            try:
+                self._stem_worker.requestInterruption()
+                self._stem_worker.quit()
+                self._stem_worker.wait()
+            except Exception:
+                pass
+
+        model = "htdemucs_6s"
+        out_dir = self._song_cache_dir(audio_path)
+
+        # Make sure Demucs log dock is visible
+        try:
+            if not hasattr(self, 'log_dock') or self.log_dock is None:
+                self.log_dock = LogDock(parent=self)
+                self.addDockWidget(Qt.BottomDockWidgetArea, self.log_dock)
+            self.log_dock.setWindowTitle('Demucs Log')
+            self.log_dock.show()
+            self.log_dock.raise_()
+            self.log_dock.clear()
+        except Exception:
+            pass
+
+        # Run Demucs worker (keep reference to prevent garbage collection)
+        try:
+            self._stem_worker = DemucsWorker(audio_path, str(out_dir), model)
+            self._stem_worker.setParent(self)
+            self._stem_worker.line.connect(self._demucs_log)
+            self._stem_worker.done.connect(self._on_stems_ready)
+            self._stem_worker.failed.connect(self._on_stem_extraction_failed)
+            self._stem_worker.finished.connect(self._on_stem_extraction_finished)
+            self._stem_worker.start()
+            self.statusBar().showMessage("Extracting stems...", 0)
+        except Exception as e:
+            self.statusBar().showMessage(f"Failed to start stem extraction: {e}", 3000)
+
+    def _on_stem_extraction_failed(self, error: str):
+        """Handle stem extraction failure."""
+        self.statusBar().showMessage(f"Stem extraction failed: {error}", 3000)
+        self._stem_worker = None
+
+    def _on_stem_extraction_finished(self):
+        """Handle stem extraction completion."""
+        self.statusBar().showMessage("Stems extracted successfully", 2000)
+        self._stem_worker = None
 
     def _action_reextract_stems(self):
         """Force Demucs re-extraction, then recompute beats+chords using new stems."""
@@ -2960,12 +2996,10 @@ class Main(QtWidgets.QMainWindow):
                 self.log_dock.write(f"Failed to load stems: {e}\n")
 
     def _stem_leaf_dir(self, audio_path: str, out_dir: Path, model: str) -> Path:
-        # Normalize Demucs output *root* and return <root>/<model>/<track>
+        # Return the leaf directory where Demucs writes stem WAVs
+        # Structure: <out_dir>/<model>/<track_name>/
         src = Path(audio_path)
-        demucs_root = Path(out_dir)
-        if demucs_root.name != "stems" and demucs_root.parent.name == "stems":
-            demucs_root = demucs_root.parent
-        d = demucs_root / model / src.stem
+        d = Path(out_dir) / model / src.stem
         d.mkdir(parents=True, exist_ok=True)
         return d
 
@@ -4234,15 +4268,8 @@ class Main(QtWidgets.QMainWindow):
             self.statusBar().showMessage(f"Save failed: {e}")
 
     def _song_cache_dir(self, audio_path: str) -> Path:
-        p = Path(audio_path)
-        try:
-            st = p.stat()
-            meta = f"{st.st_size}_{int(st.st_mtime)}"
-        except Exception:
-            meta = "0_0"
-        safe = p.stem.replace(os.sep, "_")
-        root = stems_dir_for(Path(audio_path)) / f"{safe}__{meta}"
-        return root
+        """Return the stems cache directory for this audio file in app private data."""
+        return get_stems_cache_dir(Path(audio_path))
 
     def _bar_index_at_time(self, t: float) -> int | None:
         if not self.last_bars:
@@ -5296,6 +5323,12 @@ class Main(QtWidgets.QMainWindow):
             self.populate_beats_async(self.current_path)
         if not self.last_chords:
             self.populate_chords_async(self.current_path, force=False)
+        else:
+            # Even if we have chords, ensure stems are extracted for the mixer
+            # (needed when session is loaded on a different machine)
+            # Extract stems only, without re-analyzing chords
+            if not self._find_existing_stem_leaf(self.current_path):
+                self._extract_stems_only(self.current_path)
         if not (self.last_key and self.last_key.get("pretty")):
             self.populate_key_async(self.current_path)
 

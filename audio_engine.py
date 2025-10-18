@@ -16,7 +16,7 @@ import tempfile
 import subprocess
 import os
 from pathlib import Path
-from utils import get_output_root_for_track
+from utils import get_stems_cache_dir
 
 # --- Per-file decode serialization to avoid concurrent opens of the same file ---
 _DECODE_LOCKS: dict[str, threading.Lock] = {}
@@ -587,7 +587,7 @@ class LoopPlayer:
 
     def _get_pitch_cache_dir(self, audio_path: Path, semitones: float) -> Path:
         """Get the cache directory for a specific pitch shift."""
-        root = get_output_root_for_track(Path(audio_path))
+        root = get_stems_cache_dir(Path(audio_path))
         d = root / f"pitch{semitones:+d}"
         d.mkdir(parents=True, exist_ok=True)
         return d
