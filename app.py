@@ -99,9 +99,15 @@ class WaveformView(QtWidgets.QWidget):
         self.saved_loops = []                # optional: list of dicts {id,a,b,label}
         self.selected_loop_id = None
 
+        # Song sections UI state
+        self.sections = []                   # list of dicts {id, start, end, label, text}
+        self.selected_section_id = None
+        self.SECTIONS_BAND_H = 40            # px height for sections band
+
         # Mouse tracking state
-        self._press_kind = None              # 'new' | 'edgeA' | 'edgeB' | None
+        self._press_kind = None              # 'new' | 'edgeA' | 'edgeB' | 'sectionNew' | 'sectionEdgeStart' | 'sectionEdgeEnd' | None
         self._press_loop_id = None
+        self._press_section_id = None
         self._press_dx = 0.0
         self._press_x = None
         self._drag_started = False
@@ -252,6 +258,14 @@ class WaveformView(QtWidgets.QWidget):
     requestSplitChordAt = QtCore.Signal(float)      # time (sec) to split chord at that point
     requestJoinChordForward = QtCore.Signal(float)  # time (sec) to join this chord with the next (same bar)
 
+    # Section signals
+    requestAddSection = QtCore.Signal(float, float)                    # create a new section [start, end]
+    requestUpdateSection = QtCore.Signal(int, float, float)            # update section id → [start, end]
+    requestSelectSection = QtCore.Signal(int)                          # select a section by id
+    requestDeleteSection = QtCore.Signal(int)                          # delete section by id
+    requestEditSectionLabel = QtCore.Signal(int)                       # edit section label
+    requestEditSectionText = QtCore.Signal(int)                        # edit section text/notes
+
     def set_saved_loops(self, loops: list[dict] | None):
         self.saved_loops = list(loops or [])
         # Clear stale selection if the id no longer exists
@@ -259,6 +273,16 @@ class WaveformView(QtWidgets.QWidget):
             existing_ids = {int(L.get('id')) for L in self.saved_loops if 'id' in L}
             if int(self.selected_loop_id) not in existing_ids:
                 self.selected_loop_id = None
+        self.update()
+
+    def set_sections(self, sections: list[dict] | None):
+        """Set the list of song sections [{id, start, end, label, text}]"""
+        self.sections = list(sections or [])
+        # Clear stale selection if the id no longer exists
+        if hasattr(self, 'selected_section_id') and self.selected_section_id is not None:
+            existing_ids = {int(s.get('id')) for s in self.sections if 'id' in s}
+            if int(self.selected_section_id) not in existing_ids:
+                self.selected_section_id = None
         self.update()
 
 
@@ -549,10 +573,11 @@ class WaveformView(QtWidgets.QWidget):
         return int(max(0, min(w - 1, (t - t0) / (t1 - t0) * w)))
 
     def _wf_geom(self):
-        """Return (wf_h, ch_h) matching paintEvent's layout."""
+        """Return (wf_h, ch_h, sections_h) matching paintEvent's layout."""
         h = self.height()
         CHORD_LANE_H = 32
         ch_h = CHORD_LANE_H
+        sections_h = getattr(self, 'SECTIONS_BAND_H', 40)
 
         # In visual focus (Focus or Solo), reserve space for spectrum/piano band
         if self._visual_focus_stem():
@@ -564,10 +589,10 @@ class WaveformView(QtWidgets.QWidget):
                 ph = 0
             if ph <= 0:
                 ph = int(getattr(self, 'spectrum_band_height', 60))
-            wf_h = max(10, h - ch_h - ph)
+            wf_h = max(10, h - ch_h - ph - sections_h)
         else:
-            wf_h = max(10, h - ch_h)
-        return wf_h, ch_h
+            wf_h = max(10, h - ch_h - sections_h)
+        return wf_h, ch_h, sections_h
 
     def _layout_children(self):
         """Place child widgets (e.g., piano_roll_widget) based on current size/state.
@@ -578,7 +603,7 @@ class WaveformView(QtWidgets.QWidget):
                 return
 
             # Use same layout math as paintEvent
-            wf_h, ch_h = self._wf_geom()
+            wf_h, ch_h, sections_h = self._wf_geom()
             # Pick a practical height: use configured height or minHeight, whichever is larger
             desired_h = getattr(self, "spectrum_band_height", 90)
             min_h = int(self.piano_roll_widget.minimumHeight()) if hasattr(self.piano_roll_widget, "minimumHeight") else 0
@@ -628,7 +653,7 @@ class WaveformView(QtWidgets.QWidget):
     def _open_chord_context_at(self, pos: QtCore.QPoint, global_pos: QtCore.QPoint):
         """Try to open the chord context menu for a widget-relative pos; return True if handled."""
         t0, t1 = self._current_window()
-        w = self.width(); h = self.height(); wf_h, _ = self._wf_geom()
+        w = self.width(); h = self.height(); wf_h, _, _ = self._wf_geom()
         t_ch = self._time_in_chord_lane(pos, t0, t1, w, wf_h)
         if t_ch is None:
             return False
@@ -675,24 +700,29 @@ class WaveformView(QtWidgets.QWidget):
 
     def _hit_test(self, pos: QtCore.QPoint, t0: float, t1: float, w: int, wf_h: int):
         """Return (kind, loop_id) if hit on a flag or edge."""
+        sections_h = getattr(self, 'SECTIONS_BAND_H', 40)
         x = pos.x()
         y = pos.y()
-        flag_top = 0
-        flag_bottom = min(wf_h, self.FLAG_STRIP)
+        # Adjust for sections band offset
+        flag_top = sections_h
+        flag_bottom = sections_h + min(wf_h, self.FLAG_STRIP)
+        wf_top = sections_h
+        wf_bottom = sections_h + wf_h
+
         if hasattr(self, 'saved_loops'):
             for L in self.saved_loops:
                 a = float(L['a'])
                 b = float(L['b'])
                 fx = self._x_from_time(a, t0, t1, w)
                 # START flag hit-test → resize A
-                if abs(x - fx) <= self.FLAG_W and (0 <= y <= wf_h) and (flag_top <= y <= flag_bottom):
+                if abs(x - fx) <= self.FLAG_W and (wf_top <= y <= wf_bottom) and (flag_top <= y <= flag_bottom):
                     return ("edgeA", int(L['id']))
                 # END flag hit-test (acts like grabbing edgeB for resize)
                 fxb = self._x_from_time(b, t0, t1, w)
-                if abs(x - fxb) <= self.FLAG_W and (0 <= y <= wf_h) and (flag_top <= y <= flag_bottom):
+                if abs(x - fxb) <= self.FLAG_W and (wf_top <= y <= wf_bottom) and (flag_top <= y <= flag_bottom):
                     return ("edgeB", int(L['id']))
                 # edge hit zones (within waveform)
-                if 0 <= y <= wf_h:
+                if wf_top <= y <= wf_bottom:
                     xa = self._x_from_time(a, t0, t1, w)
                     xb = self._x_from_time(b, t0, t1, w)
                     if abs(x - xa) <= self.HANDLE_PX:
@@ -704,14 +734,14 @@ class WaveformView(QtWidgets.QWidget):
             a = float(min(self.loopA, self.loopB)); b = float(max(self.loopA, self.loopB))
             fx = self._x_from_time(a, t0, t1, w)
             # START flag → resize A on active loop
-            if abs(x - fx) <= self.FLAG_W and (0 <= y <= wf_h) and (flag_top <= y <= flag_bottom):
+            if abs(x - fx) <= self.FLAG_W and (wf_top <= y <= wf_bottom) and (flag_top <= y <= flag_bottom):
                 return ("edgeA", -1)
             # END flag (treat like edgeB resize)
             fxb = self._x_from_time(b, t0, t1, w)
-            if abs(x - fxb) <= self.FLAG_W and (0 <= y <= wf_h) and (flag_top <= y <= flag_bottom):
+            if abs(x - fxb) <= self.FLAG_W and (wf_top <= y <= wf_bottom) and (flag_top <= y <= flag_bottom):
                 return ("edgeB", -1)
             # edges within waveform
-            if 0 <= y <= wf_h:
+            if wf_top <= y <= wf_bottom:
                 xa = self._x_from_time(a, t0, t1, w)
                 xb = self._x_from_time(b, t0, t1, w)
                 if abs(x - xa) <= self.HANDLE_PX:
@@ -719,6 +749,53 @@ class WaveformView(QtWidgets.QWidget):
                 if abs(x - xb) <= self.HANDLE_PX:
                     return ("edgeB", -1)
         return (None, None)
+
+    def _section_hit_test(self, pos: QtCore.QPoint, t0: float, t1: float, w: int, sections_h: int):
+        """Return (kind, section_id) if hit on a section or its edges.
+        kind can be: 'sectionBody', 'sectionEdgeStart', 'sectionEdgeEnd', or None
+        """
+        x = pos.x()
+        y = pos.y()
+
+        # Check if click is in sections band area
+        if y < 0 or y > sections_h:
+            return (None, None)
+
+        if not hasattr(self, 'sections') or not self.sections:
+            # Click in empty sections band → allow creating new section
+            return ('sectionEmpty', None)
+
+        EDGE_THRESHOLD = 8  # pixels near edge to trigger resize
+
+        # Check all sections (from front to back so we hit topmost/selected first)
+        for section in reversed(self.sections):
+            try:
+                start = float(section.get('start', 0))
+                end = float(section.get('end', 0))
+                section_id = section.get('id')
+            except Exception:
+                continue
+
+            if end <= start:
+                continue
+
+            # Calculate pixel positions
+            x0 = self._x_from_time(start, t0, t1, w)
+            x1 = self._x_from_time(end, t0, t1, w)
+
+            # Check if click is within this section's horizontal span
+            if x0 <= x <= x1:
+                # Check for edge hits first (prioritize resizing)
+                if abs(x - x0) <= EDGE_THRESHOLD:
+                    return ('sectionEdgeStart', section_id)
+                elif abs(x - x1) <= EDGE_THRESHOLD:
+                    return ('sectionEdgeEnd', section_id)
+                else:
+                    # Hit the body of the section
+                    return ('sectionBody', section_id)
+
+        # Click in sections band but not on any section
+        return ('sectionEmpty', None)
 
     def _time_at_x(self, x: int, t0: float, t1: float, w: int) -> float:
         x = max(0, min(w - 1, x))
@@ -1073,15 +1150,41 @@ class WaveformView(QtWidgets.QWidget):
             pos_global = e.globalPos()
         except Exception:
             pos_global = QtGui.QCursor.pos()
+
+        # First check if we're in the sections band
+        t0, t1 = self._current_window()
+        w = self.width(); h = self.height(); wf_h, _, sections_h = self._wf_geom()
+        section_kind, section_id = self._section_hit_test(pos_local, t0, t1, w, sections_h)
+
+        if section_kind in ('sectionBody', 'sectionEdgeStart', 'sectionEdgeEnd'):
+            # Select it for visual feedback
+            self.selected_section_id = int(section_id)
+            self.requestSelectSection.emit(int(section_id))
+            # Build section menu
+            menu = QtWidgets.QMenu(self)
+            actEditLabel = menu.addAction("Edit label…")
+            actEditText = menu.addAction("Edit text/notes…")
+            menu.addSeparator()
+            actDelete = menu.addAction("Delete section")
+            chosen = menu.exec(pos_global)
+            if chosen == actEditLabel:
+                self.requestEditSectionLabel.emit(int(section_id))
+            elif chosen == actEditText:
+                self.requestEditSectionText.emit(int(section_id))
+            elif chosen == actDelete:
+                self.requestDeleteSection.emit(int(section_id))
+            e.accept()
+            return
+
+        # Check for chord context menu
         if self._open_chord_context_at(pos_local, pos_global):
             e.accept()
             return
+
         # Right-click → offer a small menu if we're over a loop flag/edge
         if not hasattr(self, 'saved_loops') or not self.saved_loops:
             e.ignore()
             return
-        t0, t1 = self._current_window()
-        w = self.width(); h = self.height(); wf_h, _ = self._wf_geom()
         pos = e.pos()
         kind, lid = self._hit_test(pos, t0, t1, w, wf_h)
         if lid is None or lid == -1:
@@ -1113,8 +1216,31 @@ class WaveformView(QtWidgets.QWidget):
             e.ignore()
             return
         t0, t1 = self._current_window()
-        w = self.width(); h = self.height(); wf_h, _ = self._wf_geom()
-        kind, lid = self._hit_test(e.position().toPoint(), t0, t1, w, wf_h)
+        w = self.width(); h = self.height(); wf_h, _, sections_h = self._wf_geom()
+
+        # First check if we clicked in the sections band
+        pos = e.position().toPoint()
+        section_kind, section_id = self._section_hit_test(pos, t0, t1, w, sections_h)
+
+        if section_kind is not None:
+            # Handle section interaction
+            t = self._time_at_x(int(e.position().x()), t0, t1, w)
+            self._press_t = t
+            self._press_x = int(e.position().x())
+            self._drag_started = False
+            self._press_kind = section_kind
+            self._press_section_id = section_id
+
+            if section_kind in ('sectionBody', 'sectionEdgeStart', 'sectionEdgeEnd'):
+                # Select this section
+                self.selected_section_id = section_id
+                self.requestSelectSection.emit(int(section_id))
+
+            e.accept()
+            return
+
+        # Otherwise, handle normal waveform interaction
+        kind, lid = self._hit_test(pos, t0, t1, w, wf_h)
         t = self._time_at_x(int(e.position().x()), t0, t1, w)
         self._press_t = t
         self._press_x = int(e.position().x())
@@ -1123,10 +1249,12 @@ class WaveformView(QtWidgets.QWidget):
             # empty space: may become seek (click) or new loop (drag)
             self._press_kind = 'empty'
             self._press_loop_id = None
+            self._press_section_id = None
         else:
             # grabbed an existing loop edge; prepare to resize
             self._press_kind = kind
             self._press_loop_id = lid
+            self._press_section_id = None
             # preview extents for feedback
             L = next((x for x in self.saved_loops if x.get('id') == lid), None)
             if L is None and lid == -1 and self.loopA is not None and self.loopB is not None:
@@ -1147,7 +1275,32 @@ class WaveformView(QtWidgets.QWidget):
             return
         t0, t1 = self._current_window(); w = self.width(); h = self.height()
         t = self._time_at_x(int(e.position().x()), t0, t1, w)
-        if self._press_kind == 'empty':
+
+        # Handle section interactions
+        if self._press_kind == 'sectionEmpty':
+            dx = abs(int(e.position().x()) - int(self._press_x))
+            if not self._drag_started and dx >= self._click_thresh_px:
+                # Begin creating a new section
+                self._drag_started = True
+            if self._drag_started:
+                # Update visual feedback (we'll create the section on mouse release)
+                self.update()
+        elif self._press_kind in ('sectionEdgeStart', 'sectionEdgeEnd') and self._press_section_id is not None:
+            # Resize an existing section
+            section = next((s for s in self.sections if s.get('id') == self._press_section_id), None)
+            if section:
+                start = float(section.get('start', 0))
+                end = float(section.get('end', 0))
+                if self._press_kind == 'sectionEdgeStart':
+                    start = min(t, end - 0.1)  # Minimum 0.1s section
+                elif self._press_kind == 'sectionEdgeEnd':
+                    end = max(t, start + 0.1)
+                # Emit update signal
+                self._drag_started = True
+                self.requestUpdateSection.emit(int(self._press_section_id), float(start), float(end))
+
+        # Handle loop interactions
+        elif self._press_kind == 'empty':
             dx = abs(int(e.position().x()) - int(self._press_x))
             if not self._drag_started and dx >= self._click_thresh_px:
                 # begin creating a new loop
@@ -1180,18 +1333,44 @@ class WaveformView(QtWidgets.QWidget):
         if e.button() != Qt.LeftButton:
             e.ignore()
             return
+
+        # Handle section creation
+        if self._press_kind == 'sectionEmpty' and self._drag_started and self._press_t is not None:
+            t0, t1 = self._current_window(); w = self.width()
+            t_end = self._time_at_x(int(e.position().x()), t0, t1, w)
+            start = min(self._press_t, t_end)
+            end = max(self._press_t, t_end)
+            if end - start < 0.1:  # Minimum section length
+                end = start + 0.1
+            self.requestAddSection.emit(float(start), float(end))
+            # reset
+            self._press_kind = None; self._press_loop_id = None; self._press_section_id = None
+            self._press_t = None; self._press_x = None; self._drag_started = False
+            e.accept()
+            return
+
+        # Handle section edge dragging (already emitted updates in mouseMoveEvent, just cleanup)
+        if self._press_kind in ('sectionEdgeStart', 'sectionEdgeEnd', 'sectionBody'):
+            # reset
+            self._press_kind = None; self._press_loop_id = None; self._press_section_id = None
+            self._press_t = None; self._press_x = None; self._drag_started = False
+            e.accept()
+            return
+
         # Click (no drag) in empty space → seek to that time
         if self._press_kind == 'empty' and not self._drag_started and self._press_t is not None:
             self.freeze_window_now()
             self.requestSeek.emit(float(self._press_t))
             # reset
-            self._press_kind = None; self._press_loop_id = None; self._press_t = None; self._press_x = None; self._drag_started = False
+            self._press_kind = None; self._press_loop_id = None; self._press_section_id = None
+            self._press_t = None; self._press_x = None; self._drag_started = False
             e.accept();
             return
 
         if self._press_t is None or self.loopA is None or self.loopB is None:
             # reset
-            self._press_kind = None; self._press_loop_id = None; self._press_t = None; self._press_x = None; self._drag_started = False
+            self._press_kind = None; self._press_loop_id = None; self._press_section_id = None
+            self._press_t = None; self._press_x = None; self._drag_started = False
             return
         a = float(min(self.loopA, self.loopB)); b = float(max(self.loopA, self.loopB))
         # Optional snap to beats
@@ -1212,7 +1391,8 @@ class WaveformView(QtWidgets.QWidget):
         else:
             self.requestSetLoop.emit(a, b)
         # reset
-        self._press_kind = None; self._press_loop_id = None; self._press_t = None; self._press_x = None; self._drag_started = False
+        self._press_kind = None; self._press_loop_id = None; self._press_section_id = None
+        self._press_t = None; self._press_x = None; self._drag_started = False
         e.accept()
 
     def wheelEvent(self, e: QtGui.QWheelEvent):
@@ -1557,8 +1737,9 @@ class WaveformView(QtWidgets.QWidget):
                 pass
 
     def _get_chord_area_top(self, wf_h: int) -> int:
-        """Calculate the top position of the chord area, accounting for spectrum band in focus mode."""
-        chord_top = wf_h
+        """Calculate the top position of the chord area, accounting for sections band and spectrum band in focus mode."""
+        sections_h = getattr(self, 'SECTIONS_BAND_H', 40)
+        chord_top = sections_h + wf_h
         if self._visual_focus_stem():
             ph = 0
             try:
@@ -1568,19 +1749,20 @@ class WaveformView(QtWidgets.QWidget):
                 ph = 0
             if ph <= 0:
                 ph = int(getattr(self, 'spectrum_band_height', 60))
-            chord_top = wf_h + ph
+            chord_top = sections_h + wf_h + ph
         return chord_top
 
     def _draw_waveforms(self, p: QtGui.QPainter, w: int, wf_h: int, t0: float, t1: float, rel_t0: float, rel_t1: float):
         """Draw waveforms, grids, loops, and playhead in the waveform area."""
         # Constrain subsequent waveform drawings (grid, beats, flags, loop fills, waveform, playhead)
+        sections_h = getattr(self, 'SECTIONS_BAND_H', 40)
         p.save()
-        p.setClipRect(0, 0, w, wf_h)
+        p.setClipRect(0, sections_h, w, wf_h)
 
         try:
             # Draw waveform(s) and playhead below the top strip
-            body_top = min(wf_h, self.FLAG_STRIP)
-            body_h = max(1, wf_h - body_top)
+            body_top = sections_h + min(wf_h, self.FLAG_STRIP)
+            body_h = max(1, wf_h - self.FLAG_STRIP)
             have_beats = bool(self.beats)
             have_bars = bool(self.bars)
             long_len = min(12, wf_h)
@@ -1669,16 +1851,38 @@ class WaveformView(QtWidgets.QWidget):
 
     def _draw_stem_waveforms(self, p: QtGui.QPainter, stems: list, w: int, body_top: int, body_h: int, t0: float, t1: float, sr: int):
         """Draw individual stem waveforms in rows."""
+        # Calculate loop region in pixels (if applicable)
+        loop_x0, loop_x1 = None, None
+        if self.loopA is not None and self.loopB is not None:
+            a = max(t0, min(t1, float(self.loopA)))
+            b = max(t0, min(t1, float(self.loopB)))
+            if b < a:
+                a, b = b, a
+            loop_x0 = int((a - t0) / (t1 - t0) * w)
+            loop_x1 = int((b - t0) / (t1 - t0) * w)
+
         # Divide body area into rows for each stem
         rows = len(stems)
         row_gap = 2
         row_h = max(14, int((body_h - (rows-1)*row_gap) / max(1, rows)))
         y_cursor = body_top
         for (stem_name, arr) in stems:
-            # Background (dim if muted)
+            # Background (dim if muted) - draw in regions NOT covered by loop
             muted = self._is_stem_muted(stem_name)
             bg = QtGui.QColor(40, 40, 40) if muted else QtGui.QColor(28, 28, 28)
-            p.fillRect(0, y_cursor, w, row_h, bg)
+
+            if loop_x0 is not None and loop_x1 is not None:
+                # Draw background in three parts: before loop, loop (use loop color), after loop
+                if loop_x0 > 0:
+                    p.fillRect(0, y_cursor, loop_x0, row_h, bg)
+                # Loop region gets the teal overlay color
+                loop_bg = QtGui.QColor(0, 200, 180, 48)  # semi-transparent teal
+                p.fillRect(loop_x0, y_cursor, max(1, loop_x1 - loop_x0), row_h, loop_bg)
+                if loop_x1 < w:
+                    p.fillRect(loop_x1, y_cursor, w - loop_x1, row_h, bg)
+            else:
+                # No loop, just draw the normal background
+                p.fillRect(0, y_cursor, w, row_h, bg)
             # Border
             p.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0)))
             p.drawRect(0, y_cursor, max(1, w-1), max(1, row_h-1))
@@ -1751,6 +1955,8 @@ class WaveformView(QtWidgets.QWidget):
                                have_bars: bool, have_beats: bool, long_len: int, short_len: int,
                                rel_t0: float, rel_t1: float):
         """Draw grids, loops, and other overlays on the waveform."""
+        sections_h = getattr(self, 'SECTIONS_BAND_H', 40)
+
         # Draw dashed bar grid lines across the waveform area
         if have_bars and self.bars:
             pen_bar = QtGui.QPen(QtGui.QColor(120, 130, 150, 110))  # light, subtle
@@ -1762,12 +1968,12 @@ class WaveformView(QtWidgets.QWidget):
                 if bt < t0 or bt > t1:
                     continue
                 x = int((bt - t0) / (t1 - t0) * w)
-                p.drawLine(x, 0, x, wf_h)  # full height of waveform area
+                p.drawLine(x, sections_h, x, sections_h + wf_h)  # full height of waveform area
             # Also draw a dashed line at the origin as bar 0
             try:
                 x0 = int(((float(self.origin or 0.0)) - t0) / (t1 - t0) * w)
                 if 0 <= x0 <= w - 1:
-                    p.drawLine(x0, 0, x0, wf_h)
+                    p.drawLine(x0, sections_h, x0, sections_h + wf_h)
             except Exception:
                 pass
 
@@ -1779,14 +1985,21 @@ class WaveformView(QtWidgets.QWidget):
                 a, b = b, a
             x0 = int((a - t0) / (t1 - t0) * w)
             x1 = int((b - t0) / (t1 - t0) * w)
-            # Overlay: greenish-blue fill, clipped to waveform area, more opacity
-            p.fillRect(QtCore.QRect(x0, 0, max(1, x1 - x0), wf_h), QtGui.QColor(0, 200, 180, 48))
+
+            # In combined waveform view (no stems), draw the loop overlay as a full fill
+            # In stems view, the overlay is drawn per-stem in _draw_stem_waveforms
+            stems_active = bool(self._get_stems_for_display() and getattr(self, "show_stems", True))
+            if not stems_active:
+                # Draw semi-transparent teal overlay for loop region in combined view
+                p.fillRect(QtCore.QRect(x0, sections_h, max(1, x1 - x0), wf_h), QtGui.QColor(0, 200, 180, 48))
+
+            # Draw edge lines for loop boundaries (in both views)
             p.setPen(QtGui.QPen(QtGui.QColor(210, 210, 210)))
-            p.drawLine(x0, 0, x0, wf_h)
-            p.drawLine(x1, 0, x1, wf_h)
+            p.drawLine(x0, sections_h, x0, sections_h + wf_h)
+            p.drawLine(x1, sections_h, x1, sections_h + wf_h)
             # Flags at top strip for the active loop
-            tip_y = 2
-            base_y = min(self.FLAG_STRIP - 2, tip_y + self.FLAG_H)
+            tip_y = sections_h + 2
+            base_y = min(sections_h + self.FLAG_STRIP - 2, tip_y + self.FLAG_H)
             flag_poly_a = QtGui.QPolygon([
                 QtCore.QPoint(x0, tip_y),
                 QtCore.QPoint(x0 - self.FLAG_W//2, base_y),
@@ -1805,8 +2018,8 @@ class WaveformView(QtWidgets.QWidget):
 
         # Draw saved loops' flags & labels in the top strip
         if hasattr(self, 'saved_loops') and self.saved_loops:
-            tip_y = 2
-            base_y = min(self.FLAG_STRIP - 2, tip_y + self.FLAG_H)
+            tip_y = sections_h + 2
+            base_y = min(sections_h + self.FLAG_STRIP - 2, tip_y + self.FLAG_H)
             # Yellow flags for saved loops
             p.setPen(QtGui.QPen(QtGui.QColor(255, 215, 0)))
             p.setBrush(QtGui.QColor(255, 215, 0))  # yellow
@@ -1957,6 +2170,7 @@ class WaveformView(QtWidgets.QWidget):
 
     def _draw_playhead(self, p: QtGui.QPainter, w: int, wf_h: int, t0: float, t1: float):
         """Draw the playhead."""
+        sections_h = getattr(self, 'SECTIONS_BAND_H', 40)
         p.setPen(QtGui.QPen(QtGui.QColor(255, 200, 0)))
         if self._freeze_window and self.player is not None:
             try:
@@ -1966,7 +2180,129 @@ class WaveformView(QtWidgets.QWidget):
             px = int(max(0, min(w - 1, (tpos - t0) / (t1 - t0) * w)))
         else:
             px = w // 2
-        p.drawLine(px, min(wf_h, self.FLAG_STRIP), px, wf_h)
+        p.drawLine(px, sections_h + min(wf_h, self.FLAG_STRIP), px, sections_h + wf_h)
+
+    def _draw_sections_band(self, p: QtGui.QPainter, w: int, sections_h: int, t0: float, t1: float):
+        """Draw the sections band at the top with section rectangles, labels, and text."""
+        if sections_h <= 0:
+            return
+
+        # Fill sections band background
+        p.fillRect(0, 0, w, sections_h, QtGui.QColor(35, 35, 40))
+
+        # Draw separator line at bottom
+        p.setPen(QtGui.QPen(QtGui.QColor(60, 60, 65), 1))
+        p.drawLine(0, sections_h - 1, w, sections_h - 1)
+
+        if not hasattr(self, 'sections') or not self.sections:
+            return
+
+        # Draw each section
+        for section in self.sections:
+            try:
+                start = float(section.get('start', 0))
+                end = float(section.get('end', 0))
+                label = str(section.get('label', ''))
+                text = str(section.get('text', ''))
+                section_id = section.get('id')
+            except Exception:
+                continue
+
+            if end <= start:
+                continue
+
+            # Skip sections completely outside the visible window
+            if end < t0 or start > t1:
+                continue
+
+            # Calculate pixel positions
+            x0 = self._x_from_time(start, t0, t1, w)
+            x1 = self._x_from_time(end, t0, t1, w)
+
+            # Clamp to visible area
+            x0 = max(0, x0)
+            x1 = min(w, x1)
+
+            if x1 <= x0:
+                continue
+
+            # Determine if this section is selected
+            is_selected = (hasattr(self, 'selected_section_id') and
+                          self.selected_section_id is not None and
+                          section_id == self.selected_section_id)
+
+            # Draw section rectangle
+            rect = QtCore.QRect(x0, 2, max(1, x1 - x0), sections_h - 4)
+
+            if is_selected:
+                p.setBrush(QtGui.QColor(80, 120, 160))  # Highlighted color
+                p.setPen(QtGui.QPen(QtGui.QColor(120, 160, 200), 2))
+            else:
+                p.setBrush(QtGui.QColor(60, 90, 120))   # Normal color
+                p.setPen(QtGui.QPen(QtGui.QColor(90, 120, 150), 1))
+
+            p.drawRoundedRect(rect, 4, 4)
+
+            # Draw label and text
+            text_rect = rect.adjusted(6, 2, -6, -2)
+            if text_rect.width() > 20:
+                p.setPen(QtGui.QPen(QtGui.QColor(240, 240, 240)))
+                font = p.font()
+                font.setPointSizeF(max(9.0, self.font().pointSizeF()))
+                font.setBold(True)
+                p.setFont(font)
+
+                # Draw label
+                if label:
+                    label_rect = QtCore.QRect(text_rect)
+                    label_rect.setHeight(text_rect.height() // 2)
+                    p.drawText(label_rect, Qt.AlignLeft | Qt.AlignVCenter, label)
+
+                # Draw text/notes below label (if there's room)
+                if text and text_rect.height() > 20:
+                    font.setBold(False)
+                    font.setPointSizeF(max(8.0, self.font().pointSizeF() - 1))
+                    p.setFont(font)
+                    p.setPen(QtGui.QPen(QtGui.QColor(200, 200, 200)))
+                    text_rect_bottom = QtCore.QRect(text_rect)
+                    text_rect_bottom.setTop(text_rect.top() + text_rect.height() // 2)
+                    p.drawText(text_rect_bottom, Qt.AlignLeft | Qt.AlignVCenter, text)
+
+            # Draw triangular edge handles for resizing (drawn INSIDE section, pointing outward)
+            # Start handle (left edge) - triangle inside section pointing left
+            handle_size = 8
+            handle_y_top = 4
+            handle_y_bottom = min(sections_h - 4, handle_y_top + handle_size)
+
+            start_handle = QtGui.QPolygon([
+                QtCore.QPoint(x0, handle_y_top),
+                QtCore.QPoint(x0 + handle_size, handle_y_top),
+                QtCore.QPoint(x0 + handle_size, handle_y_bottom),
+            ])
+
+            # End handle (right edge) - triangle inside section pointing right
+            end_handle = QtGui.QPolygon([
+                QtCore.QPoint(x1 - handle_size, handle_y_top),
+                QtCore.QPoint(x1, handle_y_top),
+                QtCore.QPoint(x1 - handle_size, handle_y_bottom),
+            ])
+
+            # Draw handles with appropriate colors
+            if is_selected:
+                # Brighter handles for selected section
+                p.setBrush(QtGui.QColor(150, 200, 255))
+                p.setPen(QtGui.QPen(QtGui.QColor(180, 220, 255), 1))
+            else:
+                # Subtle handles for unselected sections
+                p.setBrush(QtGui.QColor(100, 140, 180))
+                p.setPen(QtGui.QPen(QtGui.QColor(120, 160, 200), 1))
+
+            p.drawPolygon(start_handle)
+            p.drawPolygon(end_handle)
+
+        # Reset brush and pen to avoid bleeding into subsequent drawing
+        p.setBrush(QtCore.Qt.NoBrush)
+        p.setPen(QtCore.Qt.NoPen)
 
     def _draw_chord_lane(self, p: QtGui.QPainter, w: int, wf_h: int, ch_h: int, t0: float, t1: float, rel_t0: float, rel_t1: float):
         """Draw the chord lane with chord rectangles and labels."""
@@ -2044,13 +2380,16 @@ class WaveformView(QtWidgets.QWidget):
         if w < 10 or h < 10:
             return
 
-        wf_h, ch_h = self._wf_geom()
+        wf_h, ch_h, sections_h = self._wf_geom()
         t0, t1 = self._current_window()
         rel_t0 = t0 - self.origin
         rel_t1 = t1 - self.origin
 
-        # Fill background
-        p.fillRect(0, 0, w, wf_h, QtGui.QColor(20, 20, 20))
+        # Draw sections band at the top
+        self._draw_sections_band(p, w, sections_h, t0, t1)
+
+        # Fill waveform background
+        p.fillRect(0, sections_h, w, wf_h, QtGui.QColor(20, 20, 20))
 
         # Handle piano roll widget in focus mode
         self._handle_piano_roll_widget()
@@ -2835,6 +3174,9 @@ class Main(QtWidgets.QMainWindow):
         self.saved_loops: list[dict] = []   # {id:int, a:float, b:float, label:str}
         self._loop_id_seq = 1
         self._active_saved_loop_id: int | None = None
+        # Sections model
+        self.sections: list[dict] = []  # {id:int, start:float, end:float, label:str, text:str}
+        self._section_id_seq = 1
         self.beat_worker = None
         self.chord_worker = None
         self.key_worker = None
@@ -3156,6 +3498,13 @@ class Main(QtWidgets.QMainWindow):
         self.wave.requestEditChord.connect(self._edit_chord_at_time)
         self.wave.requestSplitChordAt.connect(self._split_chord_at_time)
         self.wave.requestJoinChordForward.connect(self._join_chord_forward_at_time)
+        # Section signals
+        self.wave.requestAddSection.connect(self._add_section_from_wave)
+        self.wave.requestUpdateSection.connect(self._update_section_from_wave)
+        self.wave.requestSelectSection.connect(self._select_section_from_wave)
+        self.wave.requestDeleteSection.connect(self._delete_section)
+        self.wave.requestEditSectionLabel.connect(self._edit_section_label)
+        self.wave.requestEditSectionText.connect(self._edit_section_text)
         try:
             self._set_waveform_view_mode(False)
         except Exception:
@@ -3765,6 +4114,14 @@ class Main(QtWidgets.QMainWindow):
             # No loops saved → clear any previous visual
             self.wave.clear_loop_visual()
 
+        # Sections
+        self.sections = list(data.get("sections", []))
+        self._sync_sections_to_view()
+        # Update section ID sequence to avoid conflicts
+        if self.sections:
+            max_id = max((s.get('id', 0) for s in self.sections), default=0)
+            self._section_id_seq = max_id + 1
+
         # Beats / bars / tempo
         self.last_tempo = float(data.get("tempo", 0.0)) or None
         self.last_beats = list(data.get("beats", []))
@@ -3833,10 +4190,8 @@ class Main(QtWidgets.QMainWindow):
 
                 ok = self.player.set_pitch_shift(semitones, progress_callback)
                 if ok:
-                    print(f"Applied pitch shift {semitones:+d} semitones from session")
                     self.statusBar().showMessage(f"Pitch shift {semitones:+d} semitones applied", 2000)
                 else:
-                    print(f"Failed to apply pitch shift {semitones:+d} semitones from session")
                     self.statusBar().showMessage("Pitch shifting failed", 3000)
 
             # Update key and chord display with transposed values
@@ -3848,7 +4203,7 @@ class Main(QtWidgets.QMainWindow):
                     self.wave.set_chords(self.last_chords)
 
         except Exception as e:
-            print(f"Error applying pitch from session: {e}")
+            self.statusBar().showMessage(f"Error applying pitch from session: {e}", 3000)
 
     def save_session(self):
         if not self.current_path:
@@ -3862,6 +4217,7 @@ class Main(QtWidgets.QMainWindow):
             "snap_enabled": bool(self.wave.snap_enabled),
             "saved_loops": self.saved_loops,
             "active_loop_id": self._active_saved_loop_id,
+            "sections": self.sections,
             "tempo": float(self.last_tempo or 0.0),
             "beats": list(self.last_beats or []),
             "bars": list(self.last_bars or []),
@@ -4097,16 +4453,6 @@ class Main(QtWidgets.QMainWindow):
                     self.player.set_stem_mute(stem_key, m)
             except Exception:
                 pass
-            # Update public mute map so WaveformView can dim the background
-            try:
-                if self.player is not None:
-                    mute_map = getattr(self.player, 'stem_mute', None)
-                    if not isinstance(mute_map, dict):
-                        mute_map = {}
-                    mute_map[stem_key] = m
-                    setattr(self.player, 'stem_mute', mute_map)
-            except Exception:
-                pass
             # Repaint the main waveform immediately
             try:
                 if hasattr(self, 'wave') and self.wave is not None:
@@ -4303,6 +4649,119 @@ class Main(QtWidgets.QMainWindow):
             self.statusBar().showMessage("No loop selected to delete")
             return
         self._delete_loop_id(int(lid))
+
+    # ========== Section Management ==========
+
+    def _sync_sections_to_view(self):
+        """Sync the current sections list to the waveform view."""
+        if hasattr(self, 'wave'):
+            self.wave.set_sections(self.sections)
+            self.wave.update()
+
+    def _next_section_label(self) -> str:
+        """Generate the next available section label (Intro, Verse, Chorus, Bridge, etc.)"""
+        used = {s.get('label', '').lower() for s in self.sections if s.get('label')}
+        common_labels = ['Intro', 'Verse 1', 'Chorus', 'Verse 2', 'Bridge', 'Outro']
+        for label in common_labels:
+            if label.lower() not in used:
+                return label
+        # Fall back to numbered sections
+        i = 1
+        while True:
+            label = f"Section {i}"
+            if label.lower() not in used:
+                return label
+            i += 1
+
+    def _add_section_from_wave(self, start: float, end: float):
+        """Add a new section with auto-generated label."""
+        section = {
+            "id": self._section_id_seq,
+            "start": float(start),
+            "end": float(end),
+            "label": self._next_section_label(),
+            "text": ""
+        }
+        self._section_id_seq += 1
+        self.sections.append(section)
+        self.sections.sort(key=lambda x: x.get('start', 0))
+        self._sync_sections_to_view()
+        self.statusBar().showMessage(f"Added section '{section['label']}': {start:.2f}s → {end:.2f}s")
+        self.save_session()
+
+    def _update_section_from_wave(self, section_id: int, start: float, end: float):
+        """Update section boundaries."""
+        for section in self.sections:
+            if section.get('id') == section_id:
+                section['start'] = float(start)
+                section['end'] = float(end)
+                break
+        self.sections.sort(key=lambda x: x.get('start', 0))
+        self._sync_sections_to_view()
+        self.save_session()
+
+    def _select_section_from_wave(self, section_id: int):
+        """Select a section (for visual feedback)."""
+        if hasattr(self, 'wave'):
+            self.wave.selected_section_id = int(section_id)
+            self.wave.update()
+
+    def _delete_section(self, section_id: int):
+        """Delete a section by ID."""
+        for i, section in enumerate(self.sections):
+            if section.get('id') == section_id:
+                label = section.get('label', 'Section')
+                self.sections.pop(i)
+                self._sync_sections_to_view()
+                self.statusBar().showMessage(f"Deleted section '{label}'")
+                self.save_session()
+                return
+
+    def _edit_section_label(self, section_id: int):
+        """Open dialog to edit section label."""
+        section = next((s for s in self.sections if s.get('id') == section_id), None)
+        if not section:
+            return
+        current_label = section.get('label', '')
+        new_label, ok = QtWidgets.QInputDialog.getText(
+            self,
+            "Edit Section Label",
+            "Label:",
+            QtWidgets.QLineEdit.Normal,
+            current_label
+        )
+        if ok and new_label:
+            section['label'] = new_label
+            self._sync_sections_to_view()
+            self.statusBar().showMessage(f"Updated section label to '{new_label}'")
+            self.save_session()
+
+    def _edit_section_text(self, section_id: int):
+        """Open dialog to edit section text/notes."""
+        section = next((s for s in self.sections if s.get('id') == section_id), None)
+        if not section:
+            return
+        current_text = section.get('text', '')
+        label = section.get('label', 'Section')
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle(f"Edit Section Text: {label}")
+        dialog.setMinimumWidth(400)
+        dialog.setMinimumHeight(200)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        text_edit = QtWidgets.QTextEdit()
+        text_edit.setPlainText(current_text)
+        layout.addWidget(text_edit)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() == QtWidgets.QDialog.Accepted:
+            section['text'] = text_edit.toPlainText()
+            self._sync_sections_to_view()
+            self.statusBar().showMessage(f"Updated text for section '{label}'")
+            self.save_session()
 
     def _find_chord_index_at_time(self, t: float) -> int | None:
         if not self.last_chords:
