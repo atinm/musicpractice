@@ -633,14 +633,15 @@ class WaveformView(QtWidgets.QWidget):
         """Return absolute time if pos is in the chord lane; else None."""
         x = int(pos.x())
         y = int(pos.y())
-        lane_top = wf_h
+        sections_h = getattr(self, 'SECTIONS_BAND_H', 40)
+        lane_top = sections_h + wf_h
         # Account for spectrum band in focus mode
         if self._visual_focus_stem():
             try:
                 ph = int(self.piano_roll_widget.height()) if hasattr(self, 'piano_roll_widget') and self.piano_roll_widget.isVisible() else int(getattr(self, 'spectrum_band_height', 60))
             except Exception:
                 ph = int(getattr(self, 'spectrum_band_height', 60))
-            lane_top = wf_h + ph
+            lane_top = sections_h + wf_h + ph
         # Chord lane is a fixed 32 px tall; set bottom regardless of solo state
         CHORD_LANE_H = 32
         lane_bottom = lane_top + CHORD_LANE_H
