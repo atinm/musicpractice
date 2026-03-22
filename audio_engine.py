@@ -16,7 +16,7 @@ import tempfile
 import subprocess
 import os
 from pathlib import Path
-from utils import get_output_root_for_track
+from utils import get_stems_cache_dir
 
 # --- Per-file decode serialization to avoid concurrent opens of the same file ---
 _DECODE_LOCKS: dict[str, threading.Lock] = {}
@@ -326,6 +326,10 @@ class LoopPlayer:
     def set_stem_mute(self, name: str, muted: bool):
         self._stem_mute[str(name)] = bool(muted)
 
+    def is_stem_muted(self, name: str) -> bool:
+        """Check if a stem is currently muted."""
+        return self._stem_mute.get(str(name), False)
+
     def set_stem_solo(self, name: str, soloed: bool):
         """Set solo state for a stem. When soloed, all other stems are muted."""
         name = str(name)
@@ -583,7 +587,7 @@ class LoopPlayer:
 
     def _get_pitch_cache_dir(self, audio_path: Path, semitones: float) -> Path:
         """Get the cache directory for a specific pitch shift."""
-        root = get_output_root_for_track(Path(audio_path))
+        root = get_stems_cache_dir(Path(audio_path))
         d = root / f"pitch{semitones:+d}"
         d.mkdir(parents=True, exist_ok=True)
         return d
@@ -713,6 +717,9 @@ class LoopPlayer:
                     else:
                         pad = np.zeros((mix.shape[0], ch_out - mix.shape[1]), dtype=mix.dtype)
                         block = np.concatenate([mix, pad], axis=1)
+                # Safety check: ensure block shape matches expected size
+                if block.shape[0] != take:
+                    block = np.zeros((take, ch_out), dtype=np.float32)
                 outdata[wrote:wrote+take, :] = block
                 wrote += take
                 pos += take
