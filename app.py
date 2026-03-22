@@ -4405,10 +4405,6 @@ class Main(QtWidgets.QMainWindow):
         except Exception as e:
             self.statusBar().showMessage(f"Save failed: {e}")
 
-    def _song_cache_dir(self, audio_path: str) -> Path:
-        """Return the stems cache directory for this audio file in app private data."""
-        return get_stems_cache_dir(Path(audio_path))
-
     def _bar_index_at_time(self, t: float) -> int | None:
         if not self.last_bars:
             return None
