@@ -33,6 +33,7 @@ import tempfile
 # Import piano widget and note detection
 from piano_widget import PianoRollWidget
 from note_detection import compute_note_confidence
+from notation import render_notation_bundle
 
 class WaveformView(QtWidgets.QWidget):
     def __init__(self, parent=None, window_s: float = 15.0):
@@ -2398,6 +2399,50 @@ class DemucsWorker(QtCore.QThread):
         finally:
             sys.stdout, sys.stderr = old_out, old_err
 
+
+class NotationWorker(QtCore.QThread):
+    status = QtCore.Signal(str)
+    log = QtCore.Signal(str)
+    done = QtCore.Signal(str)
+    failed = QtCore.Signal(str)
+
+    def __init__(
+        self,
+        stem_audio_path: str,
+        output_dir: str,
+        title: str,
+        stem_name: str,
+        beats: list[float] | None = None,
+        instrument: str = "guitar",
+    ):
+        super().__init__()
+        self.stem_audio_path = stem_audio_path
+        self.output_dir = output_dir
+        self.title = title
+        self.stem_name = stem_name
+        self.beats = list(beats or [])
+        self.instrument = instrument
+
+    def run(self):
+        try:
+            self.status.emit(f"Generating notation for {self.stem_name}…")
+            self.log.emit(f"\n[notation] Starting notation job for stem: {self.stem_name}\n")
+            pdf_path = render_notation_bundle(
+                stem_audio_path=Path(self.stem_audio_path),
+                output_dir=Path(self.output_dir),
+                title=self.title,
+                stem_name=self.stem_name,
+                beats=self.beats,
+                instrument=self.instrument,
+                log_fn=lambda msg: self.log.emit(str(msg).rstrip("\n") + "\n"),
+            )
+            self.log.emit(f"[notation] Completed successfully: {pdf_path}\n")
+            self.done.emit(str(pdf_path))
+        except Exception as e:
+            self.log.emit(f"[notation] ERROR: {e}\n")
+            self.log.emit(traceback.format_exc().rstrip("\n") + "\n")
+            self.failed.emit(str(e))
+
 class LogDock(QtWidgets.QDockWidget):
     """A dock that behaves like a file-like stream (write/flush) to show Demucs logs."""
     def __init__(self, title="Demucs Log", parent=None):
@@ -2678,9 +2723,11 @@ class Main(QtWidgets.QMainWindow):
             except Exception:
                 pass
             stem_dir = leaf
+        self._loaded_stems_leaf = Path(stem_dir)
         arrays = load_stem_arrays(stem_dir)
         if not arrays:
             raise RuntimeError("No stem WAVs found")
+        self._loaded_stems = dict(arrays)
         if self.player:
             try:
                 if hasattr(self.player, 'set_stems_arrays'):
@@ -2772,6 +2819,93 @@ class Main(QtWidgets.QMainWindow):
         if self.stems_dock:
             self.stems_dock.show()
 
+    def _find_stem_audio_path(self, stem_name: str) -> Path | None:
+        leaf = getattr(self, "_loaded_stems_leaf", None)
+        if not leaf:
+            return None
+        leaf = Path(leaf)
+        direct = leaf / f"{stem_name}.wav"
+        if direct.exists():
+            return direct
+        want = stem_name.strip().lower()
+        for wav in leaf.glob("*.wav"):
+            if wav.stem.strip().lower() == want:
+                return wav
+        return None
+
+    def _notation_output_dir(self, stem_name: str) -> Path:
+        if not self.current_path:
+            raise RuntimeError("No track loaded.")
+        root = get_output_root_for_track(Path(self.current_path))
+        stem_slug = stem_name.strip().lower().replace(" ", "-")
+        out_dir = root / "notation" / stem_slug
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return out_dir
+
+    def _notation_instrument_for_stem(self, stem_name: str) -> str:
+        name = stem_name.strip().lower()
+        if "bass" in name:
+            return "bass"
+        return "guitar"
+
+    def _open_notation_pdf(self, pdf_path: str):
+        path = Path(pdf_path)
+        if not path.exists():
+            self.statusBar().showMessage("Notation PDF was generated, but the file could not be found.", 4000)
+            return
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path)))
+        self.statusBar().showMessage(f"Opened notation PDF: {path.name}", 3000)
+
+    def _show_stem_notation(self, stem_name: str):
+        if not self.current_path:
+            self.statusBar().showMessage("Load a track before generating notation.", 3000)
+            return
+
+        stem_path = self._find_stem_audio_path(stem_name)
+        if stem_path is None:
+            self.statusBar().showMessage(f"Could not find the audio file for stem '{stem_name}'.", 4000)
+            return
+
+        if getattr(self, "notation_worker", None) and self.notation_worker.isRunning():
+            self.statusBar().showMessage("Notation generation is already running.", 3000)
+            return
+
+        out_dir = self._notation_output_dir(stem_name)
+        instrument = self._notation_instrument_for_stem(stem_name)
+        try:
+            if not hasattr(self, 'log_dock') or self.log_dock is None:
+                self.log_dock = LogDock(parent=self)
+                self.addDockWidget(Qt.BottomDockWidgetArea, self.log_dock)
+            self.log_dock.setWindowTitle("Notation Log")
+            self.log_dock.show()
+            self.log_dock.raise_()
+            self.log_dock.write(f"\n[notation] Requested notation for stem '{stem_name}'\n")
+        except Exception:
+            pass
+        worker = NotationWorker(
+            stem_audio_path=str(stem_path),
+            output_dir=str(out_dir),
+            title=Path(self.current_path).stem,
+            stem_name=stem_name,
+            beats=list(self.last_beats or []),
+            instrument=instrument,
+        )
+        worker.status.connect(lambda s: self.statusBar().showMessage(str(s)))
+        worker.log.connect(self._notation_log)
+        worker.done.connect(self._open_notation_pdf)
+        worker.failed.connect(self._notation_failed)
+        worker.finished.connect(lambda: setattr(self, "notation_worker", None))
+        self.notation_worker = worker
+        worker.start()
+
+    def _notation_log(self, text: str):
+        if hasattr(self, 'log_dock') and self.log_dock is not None:
+            self.log_dock.write(text)
+
+    def _notation_failed(self, err: str):
+        self._notation_log(f"[notation] Failed: {err}\n")
+        self.statusBar().showMessage(f"Notation failed: {err}", 7000)
+
     def _demucs_done(self, stem_dir_str: str):
         if hasattr(self, 'log_dock') and self.log_dock is not None:
             self.log_dock.write("\nSeparation complete.\n")
@@ -2838,9 +2972,12 @@ class Main(QtWidgets.QMainWindow):
         self.beat_worker = None
         self.chord_worker = None
         self.key_worker = None
+        self.notation_worker = None
         self.log_dock = None  # created on demand when separating stems
         self._force_stems_recompute = False
         self.stem_order = []  # ordered list of stem names as shown in the mixer
+        self._loaded_stems = {}
+        self._loaded_stems_leaf = None
 
         # === UI ===
         self.rate_spin = QtWidgets.QDoubleSpinBox()
@@ -4050,6 +4187,10 @@ class Main(QtWidgets.QMainWindow):
         top.addWidget(lbl, 0, Qt.AlignVCenter | Qt.AlignLeft)
         top.addStretch(1)
 
+        notation_btn = QtWidgets.QPushButton("Show Notation", row)
+        notation_btn.setToolTip("Transcribe this stem to MIDI and render a notation + tablature PDF.")
+        top.addWidget(notation_btn, 0, Qt.AlignVCenter | Qt.AlignRight)
+
         # Visual-only Focus (solo-style visuals without soloing audio)
         focus_btn = QtWidgets.QCheckBox("Focus", row)
         focus_btn.setChecked(False)
@@ -4215,6 +4356,7 @@ class Main(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
+        notation_btn.clicked.connect(lambda _checked=False: self._show_stem_notation(stem_key))
         chk.toggled.connect(_apply_mute)
         focus_btn.toggled.connect(_apply_focus)
         solo_btn.toggled.connect(_apply_solo)

@@ -16,6 +16,7 @@ A minimal music practice application for musicians to analyze, loop, and practic
 - **Time Stretching**: Pitch-preserving tempo adjustment (0.5x - 1.5x)
 - **Pitch Shifting**: Tempo-preserving pitch adjustment (±12 semitones) with automatic key and chord transposition
 - **Stem Separation**: AI-powered source separation using Demucs (vocals, drums, bass, etc.)
+- **Stem Notation Export**: Generate a hybrid standard-notation + tablature PDF from a separated stem
 - **Session Management**: Save and restore analysis data and loop configurations
 - **Cross-Platform**: Works on macOS, Windows, and Linux
 
@@ -119,7 +120,17 @@ The app automatically detects available plugins and uses them when present, fall
 - Automatically separates audio into vocals, drums, bass, guitar, piano, and other
 - Individual volume and mute controls for each stem
 - **Focus Button**: Click the focus button next to any stem to solo it and display a piano roll visualization
+- **Show Notation Button**: Transcribe a stem to MIDI and render a combined notation + tablature PDF
 - Uses Demucs AI model for high-quality separation
+
+The notation export keeps intermediate artifacts per stem in the track's `.musicpractice/notation/<stem>/` folder:
+
+- `*_raw.mid`: the direct Basic Pitch transcription
+- `*_clean.mid`: instrument-aware cleaned MIDI used as the editable source of truth for notation
+- `*_quantized.mid`: grid-snapped MIDI generated from the clean MIDI
+- `*.ly` and `*.pdf`: the LilyPond source and rendered notation/tab PDF
+
+If `clean.mid` or `quantized.mid` already exist, the app reuses them and only regenerates downstream artifacts when needed. This makes it easy to refine the clean or quantized MIDI in a DAW and reopen notation without retranscribing the audio.
 
 ![Stems View](StemsView.png)
 
@@ -214,6 +225,31 @@ The QM Key Detector plugin provides improved key estimation. To install:
 **Note for Apple Silicon Macs**: The QM Key Detector plugin must be built from source as pre-compiled ARM64 binaries are not available. Follow the build instructions in the QM Vamp Plugins repository. Alternatively, pre-built ARM64 binaries (`qm-vamp-plugins.dylib`) are available in the `third-party/` directory of this project, but building from source is recommended.
 
 **Note**: These plugins are automatically detected if installed. The application will fall back to built-in analysis methods if the plugins are not available.
+
+### Optional Notation Dependencies
+
+The stem notation export is effectively a second Python toolchain inside this repo:
+
+- The main MusicPractice app runs in the normal project environment from `requirements.txt`
+- The notation/transcription helper runs in its own `.venv-basic-pitch` environment
+
+The notation helper environment is separate on purpose so the Basic Pitch stack and MIDI tooling do not have to be installed into the main app environment.
+
+The stem notation export feature depends on:
+
+- **Spotify Basic Pitch** in a separate helper environment for audio-to-MIDI transcription:
+  `python3.11 -m venv .venv-basic-pitch && .venv-basic-pitch/bin/pip install -r requirements-basic-pitch.txt`
+- **LilyPond** for rendering the final standard-notation + tablature PDF
+
+The app looks for the helper interpreter at `.venv-basic-pitch/bin/python` by default.
+If you keep it somewhere else, set `BASIC_PITCH_PYTHON` before launching the app.
+The app will show a dependency message instead of failing if either tool is missing.
+
+### Notation Pipeline Notes
+
+- Bass stems get additional pre-quantization cleanup to suppress ghost notes and out-of-register artifacts.
+- Bass tablature uses phrase-aware fingering heuristics so the tab can favor more realistic string choices instead of only the lowest-fret spelling of each pitch.
+- The notation cache is incremental: newer `clean.mid` regenerates `quantized.mid`, `.ly`, and `.pdf`; newer `quantized.mid` regenerates `.ly` and `.pdf`.
 
 ## File Structure
 
